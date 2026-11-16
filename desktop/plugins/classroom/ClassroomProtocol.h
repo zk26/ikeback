@@ -135,6 +135,14 @@ inline Feature::Uid operationLogFeatureUid()
 	return Feature::Uid{ QStringLiteral("d3f1c0de-7a41-4b8e-9c12-000000000007") };
 }
 
+// winbase.h (pulled in transitively on Windows) defines `ReportEvent` as a
+// macro for the Win32 event-log API (ReportEventW). Neutralize it so the
+// enum member keeps its documented, macro-proof name regardless of whether
+// windows.h was included before or after this header.
+#ifdef ReportEvent
+#undef ReportEvent
+#endif
+
 enum class Command
 {
 	StartClient = 1,

@@ -63,6 +63,14 @@
 #include "IkebackServerInterface.h"
 #include "IkebackWorkerInterface.h"
 
+// windows.h may be pulled in transitively AFTER ClassroomProtocol.h, which
+// re-defines `ReportEvent` as ReportEventW (Win32 event-log API). Command::
+// ReportEvent is an enum member, not that API - drop the macro (see the same
+// guard at the enum declaration in ClassroomProtocol.h).
+#ifdef ReportEvent
+#undef ReportEvent
+#endif
+
 using namespace Classroom;
 
 //! Give up automatic worker restarts after this many consecutive failures.
