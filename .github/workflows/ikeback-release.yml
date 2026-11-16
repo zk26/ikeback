@@ -147,7 +147,7 @@ jobs:
           # vncEncodeZlibHex.h includes <lzo/minilzo.h>, which ships in the pinned
           # UltraVNC tree as lzo.orig/. Make it reachable as lzo/.
           cp -r desktop/3rdparty/ultravnc/lzo.orig desktop/3rdparty/ultravnc/lzo
-# MS-Logon support lives behind AUTH_MS_LOGON_SUPPORT, but the DSM code path
+          # MS-Logon support lives behind AUTH_MS_LOGON_SUPPORT, but the DSM code path
           # (DSM_SUPPORT) uses m_ms_logon / AuthMsLogon unconditionally. Drop those
           # references instead of pulling in the whole MS-Logon stack.
           find desktop/3rdparty/ultravnc/winvnc/winvnc -name 'vncclient.cpp' \
