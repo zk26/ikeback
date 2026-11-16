@@ -116,17 +116,31 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	header->addWidget( m_lockLabel );
 
 	m_seatEdit = new QLineEdit( this );
-	m_seatEdit->setPlaceholderText( tr( "座位号" ) );
 	m_seatEdit->setMaxLength( 16 );
 	m_nameEdit = new QLineEdit( this );
-	m_nameEdit->setPlaceholderText( tr( "姓名" ) );
 	m_nameEdit->setMaxLength( 32 );
+
+	// Persistent labels above the fields instead of vanishing placeholders
+	// (IKEBACK-UI.md: labels always visible).
+	auto* seatLabel = new QLabel( tr( "座位号" ), this );
+	auto* nameLabel = new QLabel( tr( "姓名" ), this );
+	const auto labelStyle = QStringLiteral("font-size: 9px; opacity: 0.8;");
+	seatLabel->setStyleSheet( labelStyle );
+	nameLabel->setStyleSheet( labelStyle );
 
 	// No key field on the card: the bridge key stays on the teacher machine
 	// and the teacher's phone. Students sign in with seat + name only.
+	auto* seatColumn = new QVBoxLayout;
+	seatColumn->setSpacing( 2 );
+	seatColumn->addWidget( seatLabel );
+	seatColumn->addWidget( m_seatEdit );
+	auto* nameColumn = new QVBoxLayout;
+	nameColumn->setSpacing( 2 );
+	nameColumn->addWidget( nameLabel );
+	nameColumn->addWidget( m_nameEdit );
 	auto* inputLayout = new QHBoxLayout;
-	inputLayout->addWidget( m_seatEdit );
-	inputLayout->addWidget( m_nameEdit );
+	inputLayout->addLayout( seatColumn );
+	inputLayout->addLayout( nameColumn );
 
 	m_loginButton = new QPushButton( tr( "签到登录" ), this );
 	m_aiButton = new QPushButton( tr( "AI 助手" ), this );
@@ -631,7 +645,6 @@ ClassroomCheckInDialog::ClassroomCheckInDialog( QWidget* parent ) :
 	m_info->setStyleSheet( QStringLiteral("color:#1f2d3d; font-size:15px; font-weight:bold;") );
 
 	m_nameEdit = new QLineEdit( this );
-	m_nameEdit->setPlaceholderText( tr( "请输入你的姓名" ) );
 	connect( m_nameEdit, &QLineEdit::returnPressed, this, &ClassroomCheckInDialog::submit );
 
 	auto* submitButton = new QPushButton( tr( "签到" ), this );
@@ -736,7 +749,9 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 
 	// The window is frameless, so it needs an explicit close button.
 	auto* closeButton = new QPushButton( QStringLiteral("✕"), this );
-	closeButton->setFixedSize( 24, 24 );
+	// 32 px gives the frameless window's only close affordance a usable
+	// click target (24 px was easy to miss).
+	closeButton->setFixedSize( 32, 32 );
 	closeButton->setStyleSheet( QStringLiteral("QPushButton { border: none; font-size: 14px; }"
 											   "QPushButton:hover { background: #e81123; color: white; }") );
 	closeButton->setToolTip( tr( "关闭" ) );

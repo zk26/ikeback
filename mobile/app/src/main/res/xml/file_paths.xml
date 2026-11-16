@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths for sharing exported files (term report etc.). -->
+<paths>
+    <external-files-path
+        name="documents"
+        path="Documents/" />
+</paths>

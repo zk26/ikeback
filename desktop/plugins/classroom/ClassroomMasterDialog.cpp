@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <memory>
 
 #include <QAbstractItemView>
 #include <QAbstractSocket>
@@ -25,6 +26,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QHostAddress>
@@ -58,6 +60,7 @@
 #include <QUuid>
 #include <QVariantMap>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 
 #include "ClassroomAiClient.h"
 #include "ClassroomBridge.h"
@@ -778,7 +781,13 @@ void ClassroomMasterDialog::saveImportTemplate()
 		QMessageBox::warning( this, windowTitle(), tr( "Could not write %1" ).arg( fileName ) );
 		return;
 	}
-	file.write( ClassroomRoster::importTemplate() );
+	const auto templ = ClassroomRoster::importTemplate();
+	if( file.write( templ ) != templ.size() )
+	{
+		file.close();
+		QMessageBox::warning( this, windowTitle(), tr( "Could not write %1" ).arg( fileName ) );
+		return;
+	}
 	file.close();
 	QMessageBox::information( this, windowTitle(),
 							  tr( "Template saved to %1. Fill it in with Excel/WPS, then use "
@@ -1642,44 +1651,65 @@ void ClassroomMasterDialog::runConnectivityCheck()
 	}
 
 	const auto serverPort = IkebackCore::config().ikebackServerPort() + int( IkebackCore::sessionId() );
-	QTcpSocket socket;
-	socket.connectToHost( QHostAddress::LocalHost, static_cast<quint16>( serverPort ) );
-	const auto serverReachable = socket.waitForConnected( 1500 );
-	socket.abort();
+	m_connectivityLabel->setText( tr( "Checking 127.0.0.1:%1 ..." ).arg( serverPort ) );
 
-	QStringList lines;
-	if( serverReachable )
+	const auto report = [this, serverPort]( bool serverReachable )
 	{
-		lines << tr( "This computer: ikeback Server is reachable on 127.0.0.1:%1 - the red icon should "
-					 "switch to green within a few seconds." ).arg( serverPort );
-	}
-	else
-	{
-		lines << tr( "This computer: NOTHING is listening on 127.0.0.1:%1. The ikeback service/server is not "
-					 "running, which is exactly why this computer shows the red icon and cannot be controlled. "
-					 "Press \"Restart ikeback service\"; if it still fails, read install.log in the ikeback "
-					 "install directory." ).arg( serverPort );
-	}
-
-	if( m_bridge != nullptr )
-	{
-		lines << m_bridge->status();
-		if( m_bridge->isRunning() )
+		QStringList lines;
+		if( serverReachable )
 		{
-			lines << tr( "Phone: enter IP %1 and port %2 (same Wi-Fi/LAN, no client isolation)." )
-					 .arg( m_teacherIp != nullptr ? m_teacherIp->text().trimmed() : QString{},
-						   QString::number( m_bridgePort != nullptr ? m_bridgePort->value() : 11880 ) );
+			lines << tr( "This computer: ikeback Server is reachable on 127.0.0.1:%1 - the red icon should "
+						 "switch to green within a few seconds." ).arg( serverPort );
 		}
 		else
 		{
-			lines << tr( "Mobile bridge is not running: tick \"Start mobile bridge\" and press \"Sync now\"." );
+			lines << tr( "This computer: NOTHING is listening on 127.0.0.1:%1. The ikeback service/server is not "
+						 "running, which is exactly why this computer shows the red icon and cannot be controlled. "
+						 "Press \"Restart ikeback service\"; if it still fails, read install.log in the ikeback "
+						 "install directory." ).arg( serverPort );
 		}
-	}
 
-	lines << tr( "If OTHER computers cannot connect: allow ikeback in Windows Firewall for the private "
-				 "network, and make sure teacher and students are on the same subnet." );
+		if( m_bridge != nullptr )
+		{
+			lines << m_bridge->status();
+			if( m_bridge->isRunning() )
+			{
+				lines << tr( "Phone: enter IP %1 and port %2 (same Wi-Fi/LAN, no client isolation)." )
+						 .arg( m_teacherIp != nullptr ? m_teacherIp->text().trimmed() : QString{},
+							   QString::number( m_bridgePort != nullptr ? m_bridgePort->value() : defaultBridgePort() ) );
+			}
+			else
+			{
+				lines << tr( "Mobile bridge is not running: tick \"Start mobile bridge\" and press \"Sync now\"." );
+			}
+		}
 
-	m_connectivityLabel->setText( lines.join( QLatin1Char('\n') ) );
+		lines << tr( "If OTHER computers cannot connect: allow ikeback in Windows Firewall for the private "
+					 "network, and make sure teacher and students are on the same subnet." );
+
+		m_connectivityLabel->setText( lines.join( QLatin1Char('\n') ) );
+	};
+
+	// Non-blocking probe: the old waitForConnected() froze the whole console
+	// for up to 1.5 s on every check. Signals + a timeout timer keep the UI
+	// responsive; the socket is parented to this dialog so a pending probe
+	// cannot outlive it.
+	auto* socket = new QTcpSocket( this );
+	auto* timeout = new QTimer( socket );
+	timeout->setSingleShot( true );
+	auto done = std::make_shared<bool>( false );
+	const auto finish = [report, done, socket]( bool serverReachable ) {
+		if( *done ) { return; }
+		*done = true;
+		socket->abort();
+		socket->deleteLater();
+		report( serverReachable );
+	};
+	connect( socket, &QTcpSocket::connected, this, [finish]() { finish( true ); } );
+	connect( socket, &QAbstractSocket::errorOccurred, this, [finish]() { finish( false ); } );
+	connect( timeout, &QTimer::timeout, this, [finish]() { finish( false ); } );
+	timeout->start( 1500 );
+	socket->connectToHost( QHostAddress::LocalHost, static_cast<quint16>( serverPort ) );
 }
 
 
@@ -1787,7 +1817,7 @@ void ClassroomMasterDialog::advanceDeploy()
 	{
 	case DeployPhase::DisableUwf:
 		setUwfFilter( false );
-		setToolStatus( tr( "正在关闭 UWF 写保护，随后学生机将自动重启..." ) );
+		setToolStatus( tr( "远程装软件 [1/7]：正在关闭 UWF 写保护，随后学生机将自动重启..." ) );
 		m_deployPhase = DeployPhase::RebootAfterDisable;
 		m_deployWaitTicks = 0;
 		break;
@@ -1797,7 +1827,7 @@ void ClassroomMasterDialog::advanceDeploy()
 		if( ++m_deployWaitTicks < 3 ) { break; }
 		sendToAll( Classroom::message( Command::UwfRestart ) );
 		appendTeacherEvent( EventType::uwf(), tr( "远程装软件：已发送重启命令（关闭还原后）" ) );
-		setToolStatus( tr( "学生机重启中，等待重新上线..." ) );
+		setToolStatus( tr( "远程装软件 [2/7]：学生机重启中，等待重新上线..." ) );
 		m_deployPhase = DeployPhase::WaitOnline;
 		m_deployWaitTicks = 0;
 		break;
@@ -1805,7 +1835,7 @@ void ClassroomMasterDialog::advanceDeploy()
 	case DeployPhase::WaitOnline:
 	{
 		const auto online = onlineIps().size();
-		setToolStatus( tr( "等待学生机上线（当前 %1 台在线）..." ).arg( online ) );
+		setToolStatus( tr( "远程装软件 [3/7]：等待学生机上线（当前 %1 台在线）..." ).arg( online ) );
 		++m_deployWaitTicks;
 		// At least 20s of settle time, then proceed as soon as somebody is
 		// back; hard cap of 150s so a dead machine cannot stall the class.
@@ -1819,7 +1849,7 @@ void ClassroomMasterDialog::advanceDeploy()
 			begin.addArgument( Argument::FileName, m_deploySource ? QFileInfo( m_deploySource->fileName() ).fileName() : QString{} )
 				 .addArgument( Argument::FileSize, m_deploySource ? m_deploySource->size() : 0 );
 			sendToTargets( begin );
-			setToolStatus( tr( "正在下发安装包到学生机..." ) );
+			setToolStatus( tr( "远程装软件 [4/7]：正在下发安装包到学生机..." ) );
 		}
 		break;
 	}
@@ -1833,6 +1863,9 @@ void ClassroomMasterDialog::advanceDeploy()
 			auto message = Classroom::message( Command::DeployFileChunk );
 			message.addArgument( Argument::FileData, chunk );
 			sendToTargets( message );
+			const auto percent = m_deploySource->size() > 0 ?
+									 int( m_deploySource->pos() * 100 / m_deploySource->size() ) : 100;
+			setToolStatus( tr( "远程装软件 [4/7]：正在下发安装包 %1%" ).arg( percent ) );
 			break;
 		}
 		m_deploySource->close();
@@ -1841,7 +1874,7 @@ void ClassroomMasterDialog::advanceDeploy()
 			   .addArgument( Argument::SoftwareArgs, m_deployArgs );
 		sendToTargets( install );
 		appendTeacherEvent( EventType::install(), tr( "远程装软件：安装包已下发，等待学生机执行安装" ) );
-		setToolStatus( tr( "安装包已下发，学生机正在静默安装..." ) );
+		setToolStatus( tr( "远程装软件 [5/7]：安装包已下发，学生机正在静默安装..." ) );
 		m_deployPhase = DeployPhase::WaitInstall;
 		m_deployWaitTicks = 0;
 		m_deployTimer->setInterval( 2000 );
@@ -1862,13 +1895,17 @@ void ClassroomMasterDialog::advanceDeploy()
 
 	case DeployPhase::EnableUwf:
 		setUwfFilter( true );
-		setToolStatus( tr( "正在恢复 UWF 写保护..." ) );
+		setToolStatus( tr( "远程装软件 [6/7]：正在恢复 UWF 写保护..." ) );
 		m_deployPhase = DeployPhase::RebootAfterEnable;
 		m_deployWaitTicks = 0;
 		break;
 
 	case DeployPhase::RebootAfterEnable:
-		if( ++m_deployWaitTicks < 3 ) { break; }
+		if( ++m_deployWaitTicks < 3 )
+		{
+			setToolStatus( tr( "远程装软件 [7/7]：等待 UWF 配置生效..." ) );
+			break;
+		}
 		sendToAll( Classroom::message( Command::UwfRestart ) );
 		finishDeploy( tr( "远程安装完成：软件已安装，UWF 还原已恢复，学生机将再次重启" ) );
 		break;
@@ -1987,7 +2024,7 @@ void ClassroomMasterDialog::syncNow()
 	m_bridge->setClassName( currentClassName() );
 
 	const auto address = QHostAddress( m_teacherIp ? m_teacherIp->text().trimmed() : QString{} );
-	const auto port = m_bridgePort ? m_bridgePort->value() : 11880;
+	const auto port = m_bridgePort ? m_bridgePort->value() : defaultBridgePort();
 	// Switching the adapter or the port in the UI must actually rebind, instead
 	// of leaving the bridge on the old address where no phone can reach it.
 	if( m_bridge->isRunning() &&
@@ -2895,7 +2932,7 @@ void ClassroomMasterDialog::setupSystemTab()
 	m_bridgeEnabled->setChecked( settingsJson().value( SettingKey::bridgeEnabled() ).toBool( true ) );
 	m_bridgePort = new QSpinBox( page );
 	m_bridgePort->setRange( 1024, 65535 );
-	m_bridgePort->setValue( settingsJson().value( SettingKey::bridgePort() ).toInt( 11880 ) );
+	m_bridgePort->setValue( settingsJson().value( SettingKey::bridgePort() ).toInt( defaultBridgePort() ) );
 	form->addRow( tr( "Teacher IP:" ), m_teacherIp );
 	form->addRow( tr( "Adapter:" ), m_teacherIpPicker );
 	form->addRow( tr( "Installer:" ), m_packagePath );
@@ -2976,10 +3013,18 @@ void ClassroomMasterDialog::setupSystemTab()
 	addRow( tr( "UWF:" ), {
 		{ tr( "Query" ), [this]() {
 			sendToAll( Classroom::message( Command::UwfQuery ) );
-			const auto state = ClassroomSystem::uwfState();
-			m_systemStatus->setText( tr( "Local UWF: supported=%1 enabled=%2; client results are in the activity log" )
-									 .arg( state.supported ? tr( "yes" ) : tr( "no" ),
-										   state.currentEnabled ? tr( "yes" ) : tr( "no" ) ) );
+			m_systemStatus->setText( tr( "Querying local UWF ..." ) );
+			// uwfmgr.exe may block for seconds; run it off the GUI thread and
+			// deliver the result through a watcher parented to this dialog.
+			auto* watcher = new QFutureWatcher<ClassroomSystem::UwfState>( this );
+			connect( watcher, &QFutureWatcherBase::finished, this, [this, watcher]() {
+				const auto state = watcher->result();
+				watcher->deleteLater();
+				m_systemStatus->setText( tr( "Local UWF: supported=%1 enabled=%2; client results are in the activity log" )
+										 .arg( state.supported ? tr( "yes" ) : tr( "no" ),
+											   state.currentEnabled ? tr( "yes" ) : tr( "no" ) ) );
+			} );
+			watcher->setFuture( QtConcurrent::run( &ClassroomSystem::uwfState ) );
 		} },
 		{ tr( "Disable + reboot" ), [this]() {
 			sendToAll( Classroom::message( Command::UwfSetFilter ) );

@@ -65,6 +65,14 @@ jobs:
             mingw-w64-ucrt-x86_64-nsis
             mingw-w64-ucrt-x86_64-python
 
+      # Restored trees are already patched (the cache is saved at job end);
+      # every patch below is idempotent so re-patching is safe.
+      - name: Cache Veyon 3rdparty sources
+        uses: actions/cache@v4
+        with:
+          path: desktop/3rdparty
+          key: veyon-3rdparty-win-v4.11.4-30860286-479a32b-2002b2c-f80feff-7ad8859
+
       - name: Fetch Veyon 3rdparty sources (pinned to v4.11.4)
         shell: bash
         run: |
@@ -101,7 +109,9 @@ jobs:
           find desktop/3rdparty/ultravnc/winvnc -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
             -exec perl -0pi -e 's/#define\s+VNCLOG\(s\)[^\n]*/#define VNCLOG(s) (s)/g' {} + || true
           # vncEncodeZlibHex.h includes <lzo/minilzo.h>, which ships in the pinned
-          # UltraVNC tree as lzo.orig/. Make it reachable as lzo/.
+          # UltraVNC tree as lzo.orig/. Make it reachable as lzo/. The rm keeps
+          # this step idempotent when the 3rdparty cache is restored.
+          rm -rf desktop/3rdparty/ultravnc/lzo
           cp -r desktop/3rdparty/ultravnc/lzo.orig desktop/3rdparty/ultravnc/lzo
           # NOTE: MS-Logon / DSM / keepalive / file-transfer code paths are cut
           # at the source level now: the plugin defines ULTRAVNC_VEYON_SUPPORT
@@ -127,7 +137,7 @@ jobs:
           # returning char*). The defines can only be cancelled before any
           # include, i.e. at the very top of the translation unit.
           k=desktop/3rdparty/ultravnc/winvnc/winvnc/vnckeymap.cpp
-          sed -i '1i #undef UNICODE\n#undef _UNICODE' "$k"
+          grep -q '#undef UNICODE' "$k" || sed -i '1i #undef UNICODE\n#undef _UNICODE' "$k"
           # vnckeymap.cpp logs through VNCLog and triggers vncCad, whose
           # implementations live in translators we do not build. Turning the
           # calls into void expressions keeps the surrounding statements (and
@@ -168,7 +178,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -o pipefail
-          if ! cmake --build build --parallel 4 --target \
+          if ! cmake --build build --parallel "$(nproc)" --target \
             classroom \
             ikeback-master ikeback-configurator ikeback-cli ikeback-wcli \
             ikeback-service ikeback-server ikeback-worker > build.log 2>&1; then
@@ -189,7 +199,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -o pipefail
-          if cmake --build build --parallel 4 --target windows-platform > windows-platform.log 2>&1; then
+          if cmake --build build --parallel "$(nproc)" --target windows-platform > windows-platform.log 2>&1; then
             cat windows-platform.log
             exit 0
           fi
@@ -219,7 +229,7 @@ jobs:
                         systemusergroups textmessage usersessioncontrol \
                         external-vnc-server headless-vnc-server \
                         builtin-ultravnc-server vnchooks; do
-            if cmake --build build --parallel 4 --target "$target" > /tmp/plugin-one.log 2>&1; then
+            if cmake --build build --parallel "$(nproc)" --target "$target" > /tmp/plugin-one.log 2>&1; then
               echo "built:   $target"
             else
               echo "skipped: $target"

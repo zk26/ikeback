@@ -76,6 +76,9 @@ private:
 		QString ip;
 		QString expectedName;
 		QString seat;
+		//! cacheKey() of the last frame rendered into the thumbnail; unchanged
+		//! frames skip the expensive pixmap rescale in refresh().
+		qint64 frameKey = 0;
 	};
 
 	void rebuild();

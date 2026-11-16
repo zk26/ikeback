@@ -30,7 +30,13 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.concurrent.Executors
 
-private data class Cmd(val name: String, val label: String, val enabled: Boolean = true)
+private data class Cmd(
+    val name: String,
+    val label: String,
+    val enabled: Boolean = true,
+    /** System-affecting commands need an explicit confirmation before dispatch. */
+    val dangerous: Boolean = false,
+)
 
 class MainActivity : AppCompatActivity() {
 
@@ -44,8 +50,12 @@ class MainActivity : AppCompatActivity() {
     private var cache = Cache()
     private var seats: List<SeatStudent> = emptyList()
     private var connected = false
-    private var busy = false
+    // Written from the executor thread in doSync's finally block.
+    @Volatile private var busy = false
     private var lastAutoSync = 0L
+    // Debounce for sendCommand: double-taps must not dispatch twice.
+    private var lastCommandName: String? = null
+    private var lastCommandAt = 0L
 
     private lateinit var contentHost: FrameLayout
     private lateinit var bottomBar: BottomBar
@@ -78,12 +88,12 @@ class MainActivity : AppCompatActivity() {
 
     private val commands = listOf(
         Cmd("mute", "静音"), Cmd("unmute", "取消静音", false),
-        Cmd("internet", "断网"), Cmd("internet", "恢复网络", false),
+        Cmd("internet", "断网", dangerous = true), Cmd("internet", "恢复网络", false),
         Cmd("silence", "肃静页"), Cmd("silence", "收起肃静", false),
-        Cmd("usb", "禁用 USB 输入"), Cmd("usb", "恢复 USB 输入", false),
-        Cmd("remote", "远程控制"), Cmd("demo", "分组投屏"),
-        Cmd("uwfQuery", "查询 UWF"), Cmd("uwfDisable", "关闭还原"),
-        Cmd("uwfEnable", "开启还原"),
+        Cmd("usb", "禁用 USB 输入", dangerous = true), Cmd("usb", "恢复 USB 输入", false),
+        Cmd("remote", "远程控制", dangerous = true), Cmd("demo", "分组投屏"),
+        Cmd("uwfQuery", "查询 UWF"), Cmd("uwfDisable", "关闭还原", dangerous = true),
+        Cmd("uwfEnable", "开启还原", dangerous = true),
     )
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -792,6 +802,25 @@ class MainActivity : AppCompatActivity() {
             showTab(3)
             return
         }
+        // Debounce: a double-tap must not dispatch the same command twice.
+        val now = System.currentTimeMillis()
+        if (cmd.name == lastCommandName && now - lastCommandAt < 1200) return
+        lastCommandName = cmd.name
+        lastCommandAt = now
+        if (cmd.dangerous) {
+            AlertDialog.Builder(this)
+                .setTitle("确认下发")
+                .setMessage("「${cmd.label}」会影响全部学生机，确定下发吗？")
+                .setPositiveButton("下发") { _, _ -> dispatchCommand(cmd, host, key) }
+                .setNegativeButton("取消") { _, _ -> lastCommandAt = 0L }
+                .setOnCancelListener { lastCommandAt = 0L }
+                .show()
+            return
+        }
+        dispatchCommand(cmd, host, key)
+    }
+
+    private fun dispatchCommand(cmd: Cmd, host: String, key: String) {
         bridge.port = currentPort()
         applyKey(key)
         // Immediate feedback on tap, before the network round-trip finishes.
@@ -1074,13 +1103,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun exportTimetable() {
-        try {
-            val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
-            val file = File(dir, "ikeback-课表.json")
-            file.writeText(TimetableStore.toJson(timetableStore.load()), Charsets.UTF_8)
-            message("课表已导出：${file.absolutePath}")
-        } catch (e: Exception) {
-            message("导出失败：${e.message ?: ""}")
+        val json = TimetableStore.toJson(timetableStore.load())
+        message("正在导出课表…")
+        background {
+            try {
+                val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+                val file = File(dir, "ikeback-课表.json")
+                file.writeText(json, Charsets.UTF_8)
+                ui { message("课表已导出：${file.absolutePath}") }
+            } catch (e: Exception) {
+                ui { message("导出失败：${e.message ?: ""}") }
+            }
         }
     }
 
@@ -1105,10 +1138,18 @@ class MainActivity : AppCompatActivity() {
                 )
             }
             obj.put("events", events)
-            val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
-            val file = File(dir, "ikeback-本地数据.json")
-            file.writeText(obj.toString(2), Charsets.UTF_8)
-            message("本地数据已导出：${file.absolutePath}")
+            val text = obj.toString(2)
+            message("正在导出本地数据…")
+            background {
+                try {
+                    val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+                    val file = File(dir, "ikeback-本地数据.json")
+                    file.writeText(text, Charsets.UTF_8)
+                    ui { message("本地数据已导出：${file.absolutePath}") }
+                } catch (e: Exception) {
+                    ui { message("导出失败：${e.message ?: ""}") }
+                }
+            }
         } catch (e: Exception) {
             message("导出失败：${e.message ?: ""}")
         }
@@ -1221,10 +1262,20 @@ class MainActivity : AppCompatActivity() {
             try {
                 bridge.connect(host)
                 val xml = bridge.report(host)
-                val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS)
+                val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
                 val file = File(dir, "ikeback-期末成绩表.xls")
                 file.writeText(xml, Charsets.UTF_8)
-                ui { message("期末表已保存：${file.absolutePath}") }
+                ui {
+                    message("期末表已保存：${file.absolutePath}")
+                    // Give the file away right here: an absolute path alone
+                    // leaves users unable to find or open the export.
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("期末成绩表已导出")
+                        .setMessage(file.name)
+                        .setPositiveButton("分享") { _, _ -> shareFile(file, "application/vnd.ms-excel") }
+                        .setNegativeButton("关闭", null)
+                        .show()
+                }
             } catch (e: Exception) {
                 ui { message("导出失败：${e.message ?: ""}") }
             }
@@ -1245,11 +1296,27 @@ class MainActivity : AppCompatActivity() {
                         settings.javaScriptEnabled = false
                         loadDataWithBaseURL(null, svg, "image/svg+xml", "utf-8", null)
                     }
-                    AlertDialog.Builder(this)
+                    // Fixed-size host: a bare WebView in a dialog collapses to a
+                    // tiny strip. Destroy it on dismiss or it leaks the Activity.
+                    val container = android.widget.FrameLayout(this).apply {
+                        setPadding(16, 8, 16, 0)
+                        addView(
+                            web,
+                            android.widget.FrameLayout.LayoutParams(
+                                android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                                (360 * resources.displayMetrics.density).toInt(),
+                            ),
+                        )
+                    }
+                    val dialog = AlertDialog.Builder(this)
                         .setTitle("班级兴趣词云")
-                        .setView(web)
+                        .setView(container)
                         .setPositiveButton("关闭", null)
                         .show()
+                    dialog.setOnDismissListener {
+                        (web.parent as? android.view.ViewGroup)?.removeView(web)
+                        web.destroy()
+                    }
                 }
             } catch (e: Exception) {
                 ui { message("词云获取失败：${e.message ?: ""}") }
@@ -1261,13 +1328,36 @@ class MainActivity : AppCompatActivity() {
 
     private fun background(block: () -> Unit) {
         executor.execute {
-            try { block() } catch (_: Exception) { }
+            try {
+                block()
+            } catch (e: Exception) {
+                // Never swallow silently: this wrapper hides every background
+                // failure, so at least leave a trace for logcat-based triage.
+                android.util.Log.e("ikeback", "background task failed", e)
+            }
         }
     }
 
     private fun ui(block: () -> Unit) {
         handler.post {
             if (!isFinishing && !isDestroyed) block()
+        }
+    }
+
+    /** Hand an exported file to other apps via FileProvider (no file:// URIs). */
+    private fun shareFile(file: File, mime: String) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                this, "$packageName.fileprovider", file,
+            )
+            val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(android.content.Intent.createChooser(intent, "分享文件"))
+        } catch (e: Exception) {
+            message("分享失败：${e.message ?: ""}")
         }
     }
 

@@ -73,28 +73,40 @@ find_package(Git)
 
 if(GIT_FOUND)
 	# determine build number to use in NSIS installer and resource files
+	# ("v5.2.1-42-gabc1234" -> 42). Pure CMake parsing: the old
+	# "git describe | cut" pipeline silently produced nothing on Windows,
+	# where cut does not exist.
 	execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags
-		COMMAND cut -d "-" -f2
 		WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 		OUTPUT_STRIP_TRAILING_WHITESPACE
-		OUTPUT_VARIABLE VERSION_BUILD)
+		OUTPUT_VARIABLE GIT_DESCRIBE)
+	string(REGEX REPLACE "^[^-]*-([0-9]+)-.*$" "\\1" VERSION_BUILD "${GIT_DESCRIBE}")
 	if(NOT VERSION_BUILD GREATER 0)
 		set(VERSION_BUILD 0)
 	endif()
 
 	# Get list of all committers from git history, ordered by number of commits.
 	# The CONTRIBUTORS file is used by AboutDialog. This information can be provided
-	# with -DCONTRIBUTORS=/path/to/CONTRIBUTORS instead. For instance, to generate
-	# this file for version 3.0.2, the command is:
-	#   git shortlog -sne v3.0.2 | cut -c8-
+	# with -DCONTRIBUTORS=/path/to/CONTRIBUTORS instead.
 	set(CONTRIBUTORS "${CMAKE_BINARY_DIR}/CONTRIBUTORS")
 	if(NOT EXISTS "${CONTRIBUTORS}")
 		execute_process(COMMAND "${GIT_EXECUTABLE}" shortlog -s d160d147165271516589c304cb1b8f5e48f8527d..HEAD
-			COMMAND cut -c8-
-			COMMAND sort -f
-			OUTPUT_FILE "${CONTRIBUTORS}"
+			OUTPUT_VARIABLE SHORTLOG
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			TIMEOUT 10)
+		# Drop the commit-count prefix (" 123\tName <mail>" -> "Name <mail>")
+		# and case-insensitively sort - again without relying on cut/sort.
+		string(REPLACE "\n" ";" SHORTLOG_LINES "${SHORTLOG}")
+		set(CONTRIBUTOR_NAMES "")
+		foreach(SHORTLOG_LINE IN LISTS SHORTLOG_LINES)
+			string(REGEX REPLACE "^[ \t]*[0-9]+[ \t]+" "" CONTRIBUTOR_NAME "${SHORTLOG_LINE}")
+			if(NOT CONTRIBUTOR_NAME STREQUAL "")
+				list(APPEND CONTRIBUTOR_NAMES "${CONTRIBUTOR_NAME}")
+			endif()
+		endforeach()
+		list(SORT CONTRIBUTOR_NAMES CASE INSENSITIVE)
+		string(REPLACE ";" "\n" CONTRIBUTORS_TEXT "${CONTRIBUTOR_NAMES}")
+		file(WRITE "${CONTRIBUTORS}" "${CONTRIBUTORS_TEXT}\n")
 	endif()
 endif()
 
@@ -157,7 +169,7 @@ endif()
 option(WITH_QT6 "Build for Qt 6" ON)
 if(WITH_QT6)
 	set(QT_MAJOR_VERSION 6)
-	find_package(Qt6 COMPONENTS
+	find_package(Qt6 6.2 COMPONENTS
 		Core
 		Core5Compat
 		Concurrent
@@ -301,9 +313,6 @@ else()
 	set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 	set(CMAKE_VISIBILITY_INLINES_HIDDEN 1)
 endif()
-
-add_definitions(
-	)
 
 file(GLOB_RECURSE IN_FILES RELATIVE ${CMAKE_SOURCE_DIR} "ikebackconfig.h.in" "*.desktop.in" "*.policy.in" "*.service.in" "*.nsi.in")
 configure_files(${IN_FILES})

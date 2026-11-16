@@ -302,7 +302,11 @@ void ClassroomScorePanel::setupCloudTab()
 														   tr( "SVG files (*.svg)" ) );
 		if( fileName.isEmpty() ) { return; }
 		QFile file( fileName );
-		if( file.open( QFile::WriteOnly | QFile::Truncate ) ) { file.write( m_lastCloudSvg ); }
+		const auto ok = file.open( QFile::WriteOnly | QFile::Truncate ) &&
+						file.write( m_lastCloudSvg ) == m_lastCloudSvg.size();
+		file.close();
+		QMessageBox::information( this, windowTitle(),
+								  ok ? tr( "Word cloud exported." ) : tr( "Could not write %1" ).arg( fileName ) );
 	} );
 	m_tabs->addTab( page, tr( "Word cloud" ) );
 }
@@ -414,7 +418,9 @@ void ClassroomScorePanel::exportReport( bool xls )
 			QFile detailsFile( detailsName );
 			if( detailsFile.open( QFile::WriteOnly | QFile::Truncate ) )
 			{
-				detailsFile.write( ClassroomTermReport::toDetailsCsv( m_book, options ) );
+				const auto details = ClassroomTermReport::toDetailsCsv( m_book, options );
+				ok = detailsFile.write( details ) == details.size();
+				if( ok == false ) { error = detailsFile.errorString(); }
 			}
 		}
 	}

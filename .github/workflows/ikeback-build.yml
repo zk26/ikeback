@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y \
-            build-essential cmake ninja-build git ca-certificates pkg-config \
+            build-essential cmake ninja-build ccache git ca-certificates pkg-config \
             qt6-base-dev qt6-5compat-dev qt6-l10n-tools qt6-tools-dev \
             qt6-declarative-dev qt6-httpserver-dev qt6-websockets-dev \
             libqca-qt6-dev libqca-qt6-plugins \
@@ -44,11 +44,28 @@ jobs:
             libpipewire-0.3-dev libspa-0.2-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
 
+      # Reuse compiler outputs across runs; keyed on the build config.
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-${{ hashFiles('desktop/CMakeLists.txt', 'desktop/cmake/**', 'desktop/plugins/classroom/**') }}
+          restore-keys: ccache-linux-
+
+      - name: Enable ccache
+        run: ccache --set-config=max_size=800M
+
       # The repository root has no .gitmodules (the desktop tree is a subdirectory),
       # so actions/checkout with submodules:recursive cannot fetch these.
       # Pin every 3rdparty checkout to the exact gitlink recorded in upstream
       # desktop/ikeback v4.11.4. Cloning HEAD pulls a different kldap revision and
       # breaks the build. Qt6 builds use `kldap`, Qt5 builds `kldap-qt5`.
+      - name: Cache Veyon 3rdparty sources
+        uses: actions/cache@v4
+        with:
+          path: desktop/3rdparty
+          key: veyon-3rdparty-v4.11.4-30860286-c1e3836-7ad8859-2002b2c
+
       - name: Fetch Veyon 3rdparty sources (pinned to v4.11.4)
         run: |
           set -e
@@ -73,6 +90,8 @@ jobs:
           set -o pipefail
           cmake -S desktop -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -DWITH_QT6=ON \
             -DWITH_BUNDLED_LIBVNC=ON \
             -DWITH_WEBAPI=OFF \
@@ -94,7 +113,7 @@ jobs:
       - name: Build the ikeback plugin
         run: |
           set -o pipefail
-          if ! cmake --build build --target classroom --parallel 4 2>&1 | tee build.log; then
+          if ! cmake --build build --target classroom --parallel "$(nproc)" 2>&1 | tee build.log; then
             # Surface the compiler errors as annotations so they are readable
             # without downloading the log artifacts.
             grep -E "error:|undefined reference" build.log | head -12 | while IFS= read -r line; do
@@ -132,6 +151,17 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+
+      # Reuse the Gradle dependency cache and the Android SDK packages AGP
+      # downloads between runs.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('mobile/**/*.gradle.kts', 'mobile/gradle/libs.versions.toml', 'mobile/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
 
       # ubuntu-latest ships an Android SDK already. Do NOT use setup-android@v3:
       # it tries to replace the preinstalled cmdline-tools with an older pinned

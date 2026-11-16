@@ -11,8 +11,10 @@ import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 
 /**
- * Finds the teacher machine on the LAN. Sends one plain-text probe and also
- * listens for the periodic announcement. "Found -> sync, not found -> do nothing".
+ * Finds the teacher machine on the LAN. Sends a plain-text probe and keeps
+ * listening for the periodic announcement until [stop] is called, so a teacher
+ * machine that comes online after app start is still discovered.
+ * "Found -> sync, not found -> keep listening".
  */
 class Discovery(
     context: Context,
@@ -25,7 +27,13 @@ class Discovery(
     private var running = false
     private var worker: Thread? = null
 
-    fun start(port: Int, timeoutMs: Long = 8_000) {
+    companion object {
+        // Re-probe interval while listening: a teacher machine that starts
+        // later answers within one interval instead of never.
+        private const val REPROBE_INTERVAL_MS = 8_000L
+    }
+
+    fun start(port: Int) {
         stop()
         running = true
         worker = Thread {
@@ -45,8 +53,8 @@ class Discovery(
                 socket.send(probe)
 
                 val buffer = ByteArray(1024)
-                val deadline = System.currentTimeMillis() + timeoutMs
-                while (running && System.currentTimeMillis() < deadline) {
+                var lastProbe = System.currentTimeMillis()
+                while (running) {
                     try {
                         val packet = DatagramPacket(buffer, buffer.size)
                         socket.receive(packet)
@@ -56,8 +64,12 @@ class Discovery(
                         if (ip.startsWith("0.") || ip == "255.255.255.255") continue
                         mainHandler.post { if (running) onFound(ip, state) }
                     } catch (_: SocketTimeoutException) {
-                        // Re-probe so a teacher machine that came online late still answers.
-                        if (running) socket.send(probe)
+                        // Re-probe periodically so a teacher machine that came
+                        // online after app start still answers.
+                        if (running && System.currentTimeMillis() - lastProbe >= REPROBE_INTERVAL_MS) {
+                            lastProbe = System.currentTimeMillis()
+                            socket.send(probe)
+                        }
                     }
                 }
             } catch (_: Exception) {

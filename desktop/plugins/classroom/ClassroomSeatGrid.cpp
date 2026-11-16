@@ -283,12 +283,20 @@ void ClassroomSeatGrid::refresh()
 			const auto image = m_thumbnailProvider( card.ip );
 			if( image.isNull() == false )
 			{
-				card.thumbnail->setPixmap( QPixmap::fromImage( image ).scaled(
-					ThumbWidth, ThumbHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation ) );
+				// Rescale only when a new frame arrived: QImage::cacheKey()
+				// changes with every framebuffer update, so idle screens skip
+				// the SmoothTransformation rescale entirely.
+				if( image.cacheKey() != card.frameKey )
+				{
+					card.frameKey = image.cacheKey();
+					card.thumbnail->setPixmap( QPixmap::fromImage( image ).scaled(
+						ThumbWidth, ThumbHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation ) );
+				}
 			}
 		}
 		else
 		{
+			card.frameKey = 0;
 			card.thumbnail->setPixmap( QPixmap() );
 			card.thumbnail->setText( tr( "offline" ) );
 		}

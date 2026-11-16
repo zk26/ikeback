@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <QtGlobal>
+
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -68,7 +70,13 @@ inline void saveSeatOrder( const QString& className, const QStringList& order )
 	QFile file( seatOrderPath( className ) );
 	if( file.open( QFile::WriteOnly | QFile::Truncate ) )
 	{
-		file.write( QJsonDocument( root ).toJson( QJsonDocument::Indented ) );
+		const auto data = QJsonDocument( root ).toJson( QJsonDocument::Indented );
+		if( file.write( data ) != data.size() )
+		{
+			// A silently lost seat order reappears as "everyone back at the
+			// default seat" on the next start - never fail silently here.
+			qWarning( "ikeback: could not persist seat order for %s", qPrintable( className ) );
+		}
 	}
 }
 

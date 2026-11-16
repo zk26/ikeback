@@ -53,6 +53,13 @@ inline quint16 studentBeaconPort()
 	return 11883;
 }
 
+//! Default TCP/UDP port of the mobile bridge (protocol constant, shared with
+//! the Android app and the installers).
+inline int defaultBridgePort()
+{
+	return 11880;
+}
+
 //! Validate anything that ends up in "remoteip=" (netsh) or in a listen()
 //! call. CIDR ranges, wildcards, loopback, multicast and broadcast are
 //! rejected. Returns a null QHostAddress for invalid input.

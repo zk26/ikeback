@@ -37,6 +37,21 @@ private object GridMetrics {
 
 private fun View.dp(value: Int): Float = value * resources.displayMetrics.density
 
+/** Parsed once: Color.parseColor per onDraw frame causes needless allocations. */
+private object GridColors {
+    val textPrimary = Color.parseColor("#1F2D3D")
+    val textSecondary = Color.parseColor("#5A6B7B")
+    val textMuted = Color.parseColor("#8A97A6")
+    val breakText = Color.parseColor("#7A7392")
+    val headerBg = Color.parseColor("#F7F9FC")
+    val breakBg = Color.parseColor("#EDEFF5")
+    val line = Color.parseColor("#E8ECF2")
+    val todayAxisBg = Color.parseColor("#F2EEFF")
+    val todayGridBg = Color.parseColor("#F4F0FF")
+    val todayChip = Color.parseColor("#7C5CFF")
+    val todayRowBg = Color.parseColor("#EDE8FF")
+}
+
 private fun weekDates(): List<Pair<String, Int>> {
     val c = Calendar.getInstance()
     c.set(Calendar.DAY_OF_WEEK, Calendar.MONDAY)
@@ -84,10 +99,12 @@ class TimetableAxisView(context: Context) : View(context) {
 
     private val density get() = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val labelPaint get() = textPaint(12f, Color.parseColor("#1F2D3D"), true)
-    private val timePaint get() = textPaint(9f, Color.parseColor("#5A6B7B"), false)
-    private val breakPaint get() = textPaint(11f, Color.parseColor("#5A6B7B"), true)
-    private val todayFill = Color.parseColor("#F2EEFF")
+    // Cached paints: a getter here would allocate a Paint on every access,
+    // i.e. dozens of times per onDraw frame.
+    private val labelPaint by lazy { textPaint(12f, GridColors.textPrimary, true) }
+    private val timePaint by lazy { textPaint(9f, GridColors.textSecondary, false) }
+    private val breakPaint by lazy { textPaint(11f, GridColors.textSecondary, true) }
+    private val todayFill = GridColors.todayAxisBg
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         setMeasuredDimension(
@@ -103,7 +120,7 @@ class TimetableAxisView(context: Context) : View(context) {
         val colW = w / cols
         val headerH = GridMetrics.HEADER_H * d
 
-        fill.color = Color.parseColor("#F7F9FC")
+        fill.color = GridColors.headerBg
         canvas.drawRect(0f, 0f, w, headerH, fill)
         if (cols == 2) {
             for (i in 0..1) {
@@ -123,7 +140,7 @@ class TimetableAxisView(context: Context) : View(context) {
                 canvas.drawRect(0f, top, w, bottom, fill)
             }
             if (period.isBreak) {
-                fill.color = Color.parseColor("#EDEFF5")
+                fill.color = GridColors.breakBg
                 canvas.drawRect(0f, top, w, bottom, fill)
                 canvas.drawText(period.label, w / 2f, (top + bottom) / 2f + 4f * d, breakPaint)
             } else {
@@ -131,14 +148,13 @@ class TimetableAxisView(context: Context) : View(context) {
                 if (cols == 2) {
                     for (i in 0..1) {
                         val t = period.times.getOrNull(i) ?: ""
-                        canvas.drawText(t, colW * (i + 0.5f), top + 44f * d, timePaint)
-                        canvas.drawText(t, colW * (i + 0.5f), top + 58f * d, timePaint)
+                        canvas.drawText(t, colW * (i + 0.5f), top + 48f * d, timePaint)
                     }
                 } else {
                     canvas.drawText(period.times.firstOrNull() ?: "", w / 2f, top + 48f * d, timePaint)
                 }
             }
-            fill.color = Color.parseColor("#E8ECF2")
+            fill.color = GridColors.line
             canvas.drawRect(0f, bottom - d, w, bottom, fill)
         }
     }
@@ -161,12 +177,26 @@ class TimetableCourseGridView(context: Context) : View(context) {
 
     private val density get() = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val dayPaint get() = textPaint(11f, Color.parseColor("#1F2D3D"), true)
-    private val datePaint get() = textPaint(9f, Color.parseColor("#8A97A6"), false)
-    private val todayTextPaint get() = textPaint(11f, Color.WHITE, true)
-    private val blockText get() = textPaint(11f, Color.WHITE, true)
-    private val blockSub get() = textPaint(9f, Color.WHITE, false)
-    private val breakPaint get() = textPaint(11f, Color.parseColor("#7A7392"), true)
+    // Cached paints (see TimetableAxisView): avoid per-frame allocations.
+    private val dayPaint by lazy { textPaint(11f, GridColors.textPrimary, true) }
+    private val datePaint by lazy { textPaint(9f, GridColors.textMuted, false) }
+    private val todayTextPaint by lazy { textPaint(11f, Color.WHITE, true) }
+    private val blockText by lazy { textPaint(11f, Color.WHITE, true) }
+    private val blockSub by lazy { textPaint(9f, Color.WHITE, false) }
+    private val breakPaint by lazy { textPaint(11f, GridColors.breakText, true) }
+
+    // weekDates() builds 8 Calendar instances; cache it and refresh once a day.
+    private var cachedDates: List<Pair<String, Int>>? = null
+    private var cachedDatesDay = -1
+    private fun dates(): List<Pair<String, Int>> {
+        val today = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        val cached = cachedDates
+        if (cached == null || cachedDatesDay != today) {
+            cachedDates = weekDates()
+            cachedDatesDay = today
+        }
+        return cachedDates!!
+    }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         setMeasuredDimension(
@@ -181,17 +211,17 @@ class TimetableCourseGridView(context: Context) : View(context) {
         val headerH = GridMetrics.HEADER_H * d
         val tops = rowTops(timetable, d)
         val today = todayDay()
-        val dates = weekDates()
+        val dates = dates()
 
         // Today column background.
-        fill.color = Color.parseColor("#F4F0FF")
+        fill.color = GridColors.todayGridBg
         canvas.drawRect(dayW * (today - 1), 0f, dayW * today, height.toFloat(), fill)
 
         // Header: weekday + date, today gets a filled rounded chip.
         for (i in 0..6) {
             val left = dayW * i
             if (i + 1 == today) {
-                fill.color = Color.parseColor("#7C5CFF")
+                fill.color = GridColors.todayChip
                 val chip = RectF(left + 5f * d, 6f * d, left + dayW - 5f * d, headerH - 6f * d)
                 canvas.drawRoundRect(chip, 12f * d, 12f * d, fill)
                 canvas.drawText(WEEKDAYS[i], left + dayW / 2f, headerH * 0.42f, todayTextPaint)
@@ -207,19 +237,19 @@ class TimetableCourseGridView(context: Context) : View(context) {
             val top = tops[index]
             val bottom = tops[index + 1]
             if (index == nowRow && !period.isBreak) {
-                fill.color = Color.parseColor("#EDE8FF")
+                fill.color = GridColors.todayRowBg
                 canvas.drawRect(0f, top, width.toFloat(), bottom, fill)
             }
             if (period.isBreak) {
-                fill.color = Color.parseColor("#EDEFF5")
+                fill.color = GridColors.breakBg
                 canvas.drawRect(0f, top, width.toFloat(), bottom, fill)
                 canvas.drawText(period.label, width / 2f, (top + bottom) / 2f + 4f * d, breakPaint)
             }
-            fill.color = Color.parseColor("#E8ECF2")
+            fill.color = GridColors.line
             canvas.drawRect(0f, bottom - d, width.toFloat(), bottom, fill)
         }
         for (i in 1..6) {
-            fill.color = Color.parseColor("#E8ECF2")
+            fill.color = GridColors.line
             canvas.drawRect(dayW * i - d, 0f, dayW * i, height.toFloat(), fill)
         }
 
