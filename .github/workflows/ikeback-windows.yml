@@ -100,6 +100,9 @@ jobs:
           # definition to a plain pass-through.
           find desktop/3rdparty/ultravnc/winvnc -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
             -exec perl -0pi -e 's/#define\s+VNCLOG\(s\)[^\n]*/#define VNCLOG(s) (s)/g' {} + || true
+          # vncEncodeZlibHex.h includes <lzo/minilzo.h>, which ships in the pinned
+          # UltraVNC tree as lzo.orig/. Make it reachable as lzo/.
+          cp -r desktop/3rdparty/ultravnc/lzo.orig desktop/3rdparty/ultravnc/lzo
           grep -rn 'define VNCLOG' desktop/3rdparty/ultravnc/winvnc/ | head -8 | while IFS= read -r line; do
             echo "::notice::VNCLOG ${line}"
           done || true

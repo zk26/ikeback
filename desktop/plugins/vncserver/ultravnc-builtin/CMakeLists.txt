@@ -68,6 +68,9 @@ set(ultravnc_CXX_SOURCES
 set(ultravnc_C_SOURCES
 	${ultravnc_DIR}/common/d3des.c
 	${ultravnc_DIR}/winvnc/winvnc/vncauth.c
+	# vncEncodeZlibHex uses LZO; the pinned tree ships minilzo as lzo.orig/
+	# (the build copies it to lzo/ so <lzo/minilzo.h> resolves).
+	${ultravnc_DIR}/lzo/minilzo.c
 	)
 
 set(WITH_PCH OFF)

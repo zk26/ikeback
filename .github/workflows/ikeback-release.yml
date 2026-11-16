@@ -144,6 +144,9 @@ jobs:
           # several UltraVNC files define their own copy, so rewrite them all.
           find desktop/3rdparty/ultravnc/winvnc -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
             -exec perl -0pi -e 's/#define\s+VNCLOG\(s\)[^\n]*/#define VNCLOG(s) (s)/g' {} + || true
+          # vncEncodeZlibHex.h includes <lzo/minilzo.h>, which ships in the pinned
+          # UltraVNC tree as lzo.orig/. Make it reachable as lzo/.
+          cp -r desktop/3rdparty/ultravnc/lzo.orig desktop/3rdparty/ultravnc/lzo
           grep -rn 'define VNCLOG' desktop/3rdparty/ultravnc/winvnc/ | head -8 || true
           # GWL_* accessors are only declared for WINVER < 0x0500; rewrite them.
           find desktop/3rdparty/ultravnc -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
