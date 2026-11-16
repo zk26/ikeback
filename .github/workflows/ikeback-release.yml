@@ -151,7 +151,7 @@ jobs:
           # (DSM_SUPPORT) uses m_ms_logon / AuthMsLogon unconditionally. Drop those
           # references instead of pulling in the whole MS-Logon stack.
           find desktop/3rdparty/ultravnc/winvnc/winvnc -name 'vncclient.cpp' \
-            -exec perl -pi -e 's/^([ \t]*)(.*\bm_ms_logon\b.*)$/$1\/\/ $2/; s/^([ \t]*)(.*\bAuthMsLogon\b.*)$/$1\/\/ $2/' {} + || true
+            -exec perl -pi -e 's/\bm_ms_logon\b/false/g; s/\bAuthMsLogon[A-Za-z]*\([^;]*\)/(FALSE)/g' {} + || true
           grep -rn 'define VNCLOG' desktop/3rdparty/ultravnc/winvnc/ | head -8 || true
           # GWL_* accessors are only declared for WINVER < 0x0500; rewrite them.
           find desktop/3rdparty/ultravnc -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
