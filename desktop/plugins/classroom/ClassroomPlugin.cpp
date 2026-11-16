@@ -54,6 +54,8 @@
 #include "FeatureWorkerManager.h"
 #include "Filesystem.h"
 #include "NetworkObject.h"
+#include "NetworkObjectDirectory.h"
+#include "NetworkObjectDirectoryManager.h"
 #include "PlatformCoreFunctions.h"
 #include "PlatformPluginInterface.h"
 #include "IkebackCore.h"
@@ -1139,6 +1141,19 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 
 	m_worker = &worker;
 	ensureClientUi( worker );
+
+	// Teacher-role machines have no floating card (Q2). Only the deployment
+	// commands - which never touch the card - still run there.
+	if( m_clientWidget == nullptr )
+	{
+		const auto commandWithoutUi = message.command<Command>();
+		if( commandWithoutUi != Command::DeployFileBegin &&
+			commandWithoutUi != Command::DeployFileChunk &&
+			commandWithoutUi != Command::UwfInstall )
+		{
+			return true;
+		}
+	}
 
 	const auto settingsFromJson = [&message]() {
 		return QJsonDocument::fromJson( message.argument( Argument::SettingsJson ).toString().toUtf8() ).object();
