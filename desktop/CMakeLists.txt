@@ -101,7 +101,10 @@ endif()
 # set up basic platform variables
 if(WIN32)
 	set(IKEBACK_BUILD_WINDOWS 1)
-	if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+	# MSYS2/MinGW reports "AMD64" instead of "x86_64", which silently produced
+	# a 32-bit build config on a 64-bit host (and then failed to compile the
+	# 64-bit code paths). Accept every spelling of x86-64.
+	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" OR CMAKE_SIZEOF_VOID_P EQUAL 8)
 		set(IKEBACK_BUILD_WIN64 1)
 		set(IKEBACK_WINDOWS_ARCH "win64")
 	else()
