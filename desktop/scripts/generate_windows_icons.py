@@ -19,7 +19,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOGO = os.path.join(REPO, "ikeback_logo.png")
-IKEBACK = os.path.join(REPO, "ikeback")
+IKEBACK = os.path.join(REPO, "desktop")
 
 ICO_TARGETS = [
     os.path.join(IKEBACK, "nsis", "installer.ico"),

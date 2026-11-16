@@ -475,6 +475,26 @@ QString IkebackCore::stringify( const QVariantMap& map )
 
 
 
+static std::function<QString( const QString&, const QString& )>& computerNameResolver()
+{
+	static std::function<QString( const QString&, const QString& )> resolver;
+	return resolver;
+}
+
+void IkebackCore::setComputerNameResolver( std::function<QString( const QString&, const QString& )> resolver )
+{
+	computerNameResolver() = std::move( resolver );
+}
+
+QString IkebackCore::resolveComputerName( const QString& hostName, const QString& hostAddress )
+{
+	const auto& resolver = computerNameResolver();
+	if( resolver ) { return resolver( hostName, hostAddress ); }
+	return {};
+}
+
+
+
 QString IkebackCore::screenName(const QScreen& screen, int index)
 {
 	auto screenName = tr("Screen %1").arg(index);

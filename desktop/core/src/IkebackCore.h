@@ -192,6 +192,13 @@ public:
 
 	static QString screenName( const QScreen& screen, int index );
 
+	//! Optional resolver mapping a computer (host name or IP address) to a
+	//! classroom student display name. Registered by the classroom plugin in
+	//! the Master so remote-access window titles show the student's roster
+	//! name instead of the raw computer name.
+	static void setComputerNameResolver( std::function<QString( const QString& hostName, const QString& hostAddress )> resolver );
+	static QString resolveComputerName( const QString& hostName, const QString& hostAddress );
+
 	static bool isAuthenticationKeyNameValid( const QString& authKeyName );
 
 	enum class AuthenticationMethod

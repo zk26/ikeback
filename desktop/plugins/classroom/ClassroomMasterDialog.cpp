@@ -9,7 +9,9 @@
 
 #include <QAbstractItemView>
 #include <QAbstractSocket>
+#include <QBrush>
 #include <QCheckBox>
+#include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDateEdit>
@@ -36,6 +38,7 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMainWindow>
 #include <QMessageBox>
 #include <QPair>
 #include <QPlainTextEdit>
@@ -46,6 +49,7 @@
 #include <QSet>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStatusBar>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -1496,6 +1500,9 @@ void ClassroomMasterDialog::setupMonitorTab()
 	m_exitRequiresAdmin = new QCheckBox( tr( "Exiting requires the administrator account" ), page );
 	m_allowSelfLogin = new QCheckBox( tr( "Students may sign in themselves (seat + name)" ), page );
 	m_exitAdminUsername = new QLineEdit( page );
+	m_adminKey = new QLineEdit( page );
+	m_adminKey->setEchoMode( QLineEdit::Password );
+	m_adminKey->setPlaceholderText( tr( "设置后学生机退出 / 打开配置器必须输入此密钥" ) );
 	m_captureInterval = new QSpinBox( page );
 	m_captureInterval->setRange( 1, 300 );
 	m_captureInterval->setSuffix( tr( " s" ) );
@@ -1510,6 +1517,7 @@ void ClassroomMasterDialog::setupMonitorTab()
 	form->addRow( m_exitProtection );
 	form->addRow( m_exitRequiresAdmin );
 	form->addRow( tr( "Administrator account:" ), m_exitAdminUsername );
+	form->addRow( tr( "超级管理员密钥:" ), m_adminKey );
 	form->addRow( m_allowSelfLogin );
 	form->addRow( tr( "Log retention:" ), m_retentionDays );
 	layout->addLayout( form );
@@ -1560,6 +1568,7 @@ void ClassroomMasterDialog::refreshSettingsWidgets()
 	m_exitRequiresAdmin->setChecked( object.value( SettingKey::exitRequiresAdmin() ).toBool( true ) );
 	m_allowSelfLogin->setChecked( object.value( SettingKey::allowSelfLogin() ).toBool( true ) );
 	m_exitAdminUsername->setText( object.value( SettingKey::exitAdminUsername() ).toString() );
+	m_adminKey->setText( object.value( SettingKey::adminKey() ).toString() );
 	m_captureInterval->setValue( object.value( SettingKey::captureInterval() ).toInt( 5 ) );
 	m_retentionDays->setValue( object.value( QStringLiteral("retentionDays") ).toInt( 180 ) );
 }
@@ -1583,6 +1592,7 @@ void ClassroomMasterDialog::saveSettingsFromWidgets()
 	object.insert( SettingKey::exitRequiresAdmin(), m_exitRequiresAdmin->isChecked() );
 	object.insert( SettingKey::allowSelfLogin(), m_allowSelfLogin->isChecked() );
 	object.insert( SettingKey::exitAdminUsername(), m_exitAdminUsername->text().trimmed() );
+	object.insert( SettingKey::adminKey(), m_adminKey->text() );
 	object.insert( SettingKey::captureInterval(), m_captureInterval->value() );
 	object.insert( QStringLiteral("retentionDays"), m_retentionDays->value() );
 	object.insert( SettingKey::bridgeEnabled(), m_bridgeEnabled->isChecked() );
@@ -1700,27 +1710,261 @@ void ClassroomMasterDialog::restartService()
 
 void ClassroomMasterDialog::deployInstaller()
 {
+	if( m_deployPhase != DeployPhase::Idle )
+	{
+		QMessageBox::information( this, windowTitle(), tr( "已有一次远程安装正在进行，请等待其完成。" ) );
+		return;
+	}
+
 	const auto path = QFileDialog::getOpenFileName(
 		this, tr( "选择要下发安装的软件包" ), QString{},
 		tr( "安装包 (*.exe *.msi);;所有文件 (*)" ) );
 	if( path.isEmpty() ) { return; }
 
-	const auto command = ClassroomSystem::softwareInstallCommand( path );
-	if( command.isEmpty() )
+	if( ClassroomSystem::softwareInstallCommand( path ).isEmpty() )
 	{
 		QMessageBox::warning( this, windowTitle(),
 							  tr( "只支持 .exe 与 .msi 安装包，且路径中不能包含引号。" ) );
 		return;
 	}
 
-	IkebackCore::featureManager().controlFeature(
-		Feature::Uid{ QStringLiteral("da9ca56a-b2ad-4fff-8f8a-929b2927b442") },
-		FeatureProviderInterface::Operation::Start,
-		QVariantMap{ { QStringLiteral("Applications"), QStringList{ command } } },
-		m_master.allComputerControlInterfaces() );
+	QDialog dialog( this );
+	dialog.setWindowTitle( tr( "远程装软件" ) );
+	auto* form = new QFormLayout( &dialog );
+	form->addRow( tr( "安装包:" ), new QLabel( QFileInfo( path ).fileName(), &dialog ) );
+	auto* argsEdit = new QLineEdit( &dialog );
+	argsEdit->setPlaceholderText( tr( "可选：额外静默参数，例如 /S 或 /quiet" ) );
+	form->addRow( tr( "静默参数:" ), argsEdit );
+	auto* uwfCheck = new QCheckBox(
+		tr( "自动处理 UWF 还原（关闭还原 → 重启 → 安装 → 恢复还原 → 重启）" ), &dialog );
+	uwfCheck->setChecked( true );
+	form->addRow( uwfCheck );
+	auto* scope = new QComboBox( &dialog );
+	scope->addItem( tr( "所有学生机" ) );
+	scope->addItem( tr( "仅选中的学生机" ) );
+	form->addRow( tr( "范围:" ), scope );
+	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
+	form->addRow( buttons );
+	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+	if( dialog.exec() != QDialog::Accepted ) { return; }
 
-	setToolStatus( tr( "已下发安装命令：%1" ).arg( command ) );
-	appendTeacherEvent( EventType::connection(), tr( "远程装软件：%1" ).arg( path ) );
+	if( m_deploySource ) { m_deploySource->close(); m_deploySource->deleteLater(); m_deploySource = nullptr; }
+	m_deploySource = new QFile( path, this );
+	if( m_deploySource->open( QFile::ReadOnly ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "无法读取安装包文件，请检查文件是否被占用。" ) );
+		m_deploySource->deleteLater();
+		m_deploySource = nullptr;
+		return;
+	}
+	m_deployArgs = argsEdit->text().trimmed();
+	m_deployUwfFlow = uwfCheck->isChecked();
+	m_deployWaitTicks = 0;
+	if( m_toolScope ) { m_toolScope->setCurrentIndex( scope->currentIndex() ); }
+
+	// The whole install runs through OUR feature channel (chunked file
+	// transfer + local silent install) instead of the old StartApp with a
+	// teacher-local path which never existed on the student machines.
+	m_deployPhase = m_deployUwfFlow ? DeployPhase::DisableUwf : DeployPhase::Transfer;
+	appendTeacherEvent( EventType::install(),
+						tr( "远程装软件开始：%1（%2）" ).arg( path, m_deployUwfFlow ? tr( "含 UWF 流程" ) : tr( "直接安装" ) ) );
+	setToolStatus( tr( "远程装软件已开始：%1" ).arg( QFileInfo( path ).fileName() ) );
+
+	if( m_deployTimer == nullptr )
+	{
+		m_deployTimer = new QTimer( this );
+		connect( m_deployTimer, &QTimer::timeout, this, &ClassroomMasterDialog::advanceDeploy );
+	}
+	m_deployTimer->setInterval( 2000 );
+	m_deployTimer->start();
+}
+
+
+void ClassroomMasterDialog::advanceDeploy()
+{
+	switch( m_deployPhase )
+	{
+	case DeployPhase::DisableUwf:
+		setUwfFilter( false );
+		setToolStatus( tr( "正在关闭 UWF 写保护，随后学生机将自动重启..." ) );
+		m_deployPhase = DeployPhase::RebootAfterDisable;
+		m_deployWaitTicks = 0;
+		break;
+
+	case DeployPhase::RebootAfterDisable:
+		// Give uwfmgr a moment to persist the configuration before rebooting.
+		if( ++m_deployWaitTicks < 3 ) { break; }
+		sendToAll( Classroom::message( Command::UwfRestart ) );
+		appendTeacherEvent( EventType::uwf(), tr( "远程装软件：已发送重启命令（关闭还原后）" ) );
+		setToolStatus( tr( "学生机重启中，等待重新上线..." ) );
+		m_deployPhase = DeployPhase::WaitOnline;
+		m_deployWaitTicks = 0;
+		break;
+
+	case DeployPhase::WaitOnline:
+	{
+		const auto online = onlineIps().size();
+		setToolStatus( tr( "等待学生机上线（当前 %1 台在线）..." ).arg( online ) );
+		++m_deployWaitTicks;
+		// At least 20s of settle time, then proceed as soon as somebody is
+		// back; hard cap of 150s so a dead machine cannot stall the class.
+		if( ( online > 0 && m_deployWaitTicks >= 10 ) || m_deployWaitTicks >= 75 )
+		{
+			m_deployPhase = DeployPhase::Transfer;
+			m_deployTimer->setInterval( 100 );
+			// Restart the source file in case a previous attempt read ahead.
+			if( m_deploySource ) { m_deploySource->seek( 0 ); }
+			auto begin = Classroom::message( Command::DeployFileBegin );
+			begin.addArgument( Argument::FileName, m_deploySource ? QFileInfo( m_deploySource->fileName() ).fileName() : QString{} )
+				 .addArgument( Argument::FileSize, m_deploySource ? m_deploySource->size() : 0 );
+			sendToTargets( begin );
+			setToolStatus( tr( "正在下发安装包到学生机..." ) );
+		}
+		break;
+	}
+
+	case DeployPhase::Transfer:
+	{
+		if( m_deploySource == nullptr ) { finishDeploy( tr( "安装包读取失败" ) ); break; }
+		const auto chunk = m_deploySource->read( 256 * 1024 );
+		if( chunk.isEmpty() == false )
+		{
+			auto message = Classroom::message( Command::DeployFileChunk );
+			message.addArgument( Argument::FileData, chunk );
+			sendToTargets( message );
+			break;
+		}
+		m_deploySource->close();
+		auto install = Classroom::message( Command::UwfInstall );
+		install.addArgument( Argument::SoftwarePath, QFileInfo( m_deploySource->fileName() ).fileName() )
+			   .addArgument( Argument::SoftwareArgs, m_deployArgs );
+		sendToTargets( install );
+		appendTeacherEvent( EventType::install(), tr( "远程装软件：安装包已下发，等待学生机执行安装" ) );
+		setToolStatus( tr( "安装包已下发，学生机正在静默安装..." ) );
+		m_deployPhase = DeployPhase::WaitInstall;
+		m_deployWaitTicks = 0;
+		m_deployTimer->setInterval( 2000 );
+		break;
+	}
+
+	case DeployPhase::WaitInstall:
+		if( ++m_deployWaitTicks < 15 ) { break; } // 30s for the installer to finish
+		if( m_deployUwfFlow )
+		{
+			m_deployPhase = DeployPhase::EnableUwf;
+		}
+		else
+		{
+			finishDeploy( tr( "安装命令已下发完成（未启用 UWF 流程）" ) );
+		}
+		break;
+
+	case DeployPhase::EnableUwf:
+		setUwfFilter( true );
+		setToolStatus( tr( "正在恢复 UWF 写保护..." ) );
+		m_deployPhase = DeployPhase::RebootAfterEnable;
+		m_deployWaitTicks = 0;
+		break;
+
+	case DeployPhase::RebootAfterEnable:
+		if( ++m_deployWaitTicks < 3 ) { break; }
+		sendToAll( Classroom::message( Command::UwfRestart ) );
+		finishDeploy( tr( "远程安装完成：软件已安装，UWF 还原已恢复，学生机将再次重启" ) );
+		break;
+
+	case DeployPhase::Idle:
+		break;
+	}
+}
+
+
+void ClassroomMasterDialog::finishDeploy( const QString& result )
+{
+	if( m_deployTimer ) { m_deployTimer->stop(); }
+	if( m_deploySource )
+	{
+		m_deploySource->close();
+		m_deploySource->deleteLater();
+		m_deploySource = nullptr;
+	}
+	m_deployPhase = DeployPhase::Idle;
+	setToolStatus( result );
+	appendTeacherEvent( EventType::install(), result );
+	QMessageBox::information( this, windowTitle(), result );
+}
+
+
+void ClassroomMasterDialog::showQuickToolsTab()
+{
+	m_tabs->setCurrentIndex( 0 );
+}
+
+
+void ClassroomMasterDialog::openOperationLog()
+{
+	auto* dialog = new QDialog( this );
+	dialog->setAttribute( Qt::WA_DeleteOnClose );
+	dialog->setWindowTitle( tr( "操作记录" ) );
+	dialog->resize( 860, 480 );
+
+	auto* layout = new QVBoxLayout( dialog );
+	layout->addWidget( new QLabel(
+		tr( "教师操作的执行结果（保护 / UWF / 静音 / 断网 / 远程安装 / 退出认证等）。"
+			"「FAILED」表示命令已发出但学生机回报执行失败。" ), dialog ) );
+
+	auto* table = new QTableWidget( 0, 4, dialog );
+	table->setHorizontalHeaderLabels( QStringList{ tr( "时间" ), tr( "机器" ), tr( "操作" ), tr( "结果" ) } );
+	table->horizontalHeader()->setSectionResizeMode( QHeaderView::Stretch );
+	table->setEditTriggers( QAbstractItemView::NoEditTriggers );
+	layout->addWidget( table, 1 );
+
+	auto* buttons = new QHBoxLayout;
+	auto* refreshButton = new QPushButton( tr( "刷新" ), dialog );
+	auto* closeButton = new QPushButton( tr( "关闭" ), dialog );
+	buttons->addWidget( refreshButton );
+	buttons->addStretch( 1 );
+	buttons->addWidget( closeButton );
+	layout->addLayout( buttons );
+	connect( closeButton, &QPushButton::clicked, dialog, &QWidget::hide );
+
+	// Only operation-type events - window titles and browsing noise stay in
+	// the full behaviour log.
+	static const QSet<QString> operationTypes{
+		EventType::protection(), EventType::uwf(), EventType::mute(), EventType::internet(),
+		EventType::usb(), EventType::install(), EventType::software(), EventType::quitAttempt(),
+		EventType::quitAllowed(), EventType::appBlock(), EventType::webBlock(), EventType::keyFailed()
+	};
+
+	const auto refresh = [this, table]() {
+		const auto events = m_store.load( QDate::currentDate().addDays( -7 ), QDate::currentDate() );
+		QVector<ClassroomEvent> operations;
+		for( const auto& event : events )
+		{
+			if( operationTypes.contains( event.type ) ) { operations.append( event ); }
+		}
+		table->setRowCount( operations.size() );
+		for( int row = 0; row < operations.size(); ++row )
+		{
+			const auto& event = operations.at( operations.size() - 1 - row );
+			table->setItem( row, 0, new QTableWidgetItem(
+				event.timestamp.toString( QStringLiteral("MM-dd HH:mm:ss") ) ) );
+			table->setItem( row, 1, new QTableWidgetItem(
+				event.host.isEmpty() ? event.ip : QStringLiteral("%1 (%2)").arg( event.host, event.ip ) ) );
+			table->setItem( row, 2, new QTableWidgetItem( event.type ) );
+			auto* detail = new QTableWidgetItem( event.detail );
+			if( event.detail.contains( QStringLiteral("FAILED"), Qt::CaseInsensitive ) ||
+				event.detail.contains( QStringLiteral("failed"), Qt::CaseInsensitive ) )
+			{
+				detail->setForeground( QBrush( QColor( QStringLiteral("#c62828") ) ) );
+			}
+			table->setItem( row, 3, detail );
+		}
+	};
+	refresh();
+	connect( refreshButton, &QPushButton::clicked, dialog, refresh );
+	dialog->show();
+	dialog->raise();
 }
 
 
@@ -1792,6 +2036,12 @@ void ClassroomMasterDialog::setToolStatus( const QString& text )
 {
 	if( m_toolsStatus ) { m_toolsStatus->setText( text ); }
 	if( m_systemStatus ) { m_systemStatus->setText( text ); }
+	// Quick action buttons run with the console hidden, so show the result on
+	// the Master's status bar - otherwise "nothing seems to happen" (Q3).
+	if( auto* mainWindow = qobject_cast<QMainWindow*>( m_master.mainWindow() ) )
+	{
+		mainWindow->statusBar()->showMessage( text, 8000 );
+	}
 }
 
 
@@ -2757,23 +3007,10 @@ void ClassroomMasterDialog::setupSystemTab()
 			m_systemStatus->setText( tr( "Student uninstall protection released." ) );
 		} } } );
 	addRow( tr( "Deploy:" ), {
-		{ tr( "Distribute and install" ), [this, feature]() {
-			const auto path = m_packagePath->text().trimmed();
-			if( path.isEmpty() )
-			{
-				QMessageBox::information( this, windowTitle(), tr( "Please choose an installer path first." ) );
-				return;
-			}
-			const auto command = ClassroomSystem::softwareInstallCommand( path );
-			if( command.isEmpty() )
-			{
-				QMessageBox::warning( this, windowTitle(),
-									  tr( "Only .exe and .msi installers can be deployed, and the path must not contain quotes." ) );
-				return;
-			}
-			feature( QStringLiteral("da9ca56a-b2ad-4fff-8f8a-929b2927b442"), true,
-					 QVariantMap{ { QStringLiteral("Applications"), QStringList{ command } } } );
-			m_systemStatus->setText( tr( "Install command sent: %1" ).arg( command ) );
+		{ tr( "Distribute and install" ), [this]() {
+			// 5.2.2: same guided flow as the tool-bar button - chunked transfer
+			// through the classroom channel plus optional UWF handling.
+			deployInstaller();
 		} },
 		{ tr( "Refresh status" ), [this]() { sendToAll( Classroom::message( Command::UwfQuery ) ); } } } );
 	addRow( tr( "Mobile:" ), {

@@ -10,7 +10,9 @@
 #include <memory>
 
 #include <QDockWidget>
+#include <QDateTime>
 #include <QJsonObject>
+#include <QMap>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -25,8 +27,10 @@
 #include "MessageContext.h"
 #include "PluginInterface.h"
 
+class QFile;
 class QSystemTrayIcon;
 class QTimer;
+class QUdpSocket;
 class ClassroomClientWidget;
 class ClassroomLogStore;
 class ClassroomMonitor;
@@ -83,6 +87,10 @@ private:
 	ClassroomSettings* settings();
 
 	void startClient( IkebackServerInterface& server );
+	//! Creates the teacher console on demand. Quick action buttons create it
+	//! HIDDEN (they only need the parameter widgets); `show` brings it up.
+	ClassroomMasterDialog* ensureConsoleDialog( IkebackMasterInterface& master,
+											   const ComputerControlInterfaceList& interfaces, bool show );
 	void registerContext( const MessageContext& context );
 	bool hasActiveContext() const;
 	void ensureClientUi( IkebackWorkerInterface& worker );
@@ -91,6 +99,17 @@ private:
 	void reportEvent( const QString& type, const QString& detail, const QString& app );
 	void applyWorkerSettings( const QJsonObject& settingsObject );
 	QString localIpAddress() const;
+
+	//! Install role marker written by the installer ("student"/"teacher") or
+	//! an empty string on unmarked machines. Teacher machines never show the
+	//! floating card or its tray icon.
+	static QString machineRole();
+	//! 5.2.2: student machines broadcast a UDP beacon so the teacher console
+	//! discovers them automatically; the Master listens and registers unknown
+	//! machines in the builtin directory.
+	void startStudentBeacon();
+	void startDiscoveryListener();
+	void registerDiscoveredHost( const QString& hostName, const QString& ip );
 
 	//! Builds one tool-bar Feature per quick-tool action in the white list, so
 	//! the actions sit next to "Screen demo"/"Remote control" instead of being
@@ -105,6 +124,7 @@ private:
 	const Feature m_signOutFeature;
 	const Feature m_quickToolsFeature;
 	const Feature m_checkInFeature;
+	const Feature m_operationLogFeature;
 	FeatureList m_features;
 	//! Same order as the white list in buildQuickActionFeatures(); the index is
 	//! also the UID suffix.
@@ -143,4 +163,13 @@ private:
 	QString m_sessionId;
 	//! Never holds the bridge key: only whether the teacher has started a lesson.
 	bool m_keyConfigured = false;
+
+	//! Student-side presence beacon (UDP broadcast).
+	QTimer* m_beaconTimer = nullptr;
+	//! Master-side discovery listener for student beacons.
+	QUdpSocket* m_discoverySocket = nullptr;
+	//! ip -> last beacon time; keeps the directory rewrite frequency low.
+	QMap<QString, QDateTime> m_discoveredHosts;
+	//! Worker-side staging file for remote software deployment.
+	QFile* m_deployFile = nullptr;
 };

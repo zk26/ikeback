@@ -23,7 +23,11 @@
  */
 
 #include <QApplication>
+#include <QCryptographicHash>
+#include <QInputDialog>
+#include <QLineEdit>
 #include <QMessageBox>
+#include <QSettings>
 
 #include "IkebackConfiguration.h"
 #include "IkebackCore.h"
@@ -69,6 +73,37 @@ int main( int argc, char **argv )
 											 "Configurator with higher privileges."));
 		return -1;
 	}
+
+#ifdef Q_OS_WIN
+	// Student machines: opening the configurator requires the super-admin key
+	// (Q6). The SHA-256 digest is written to HKLM by the classroom service
+	// whenever the teacher pushes the settings.
+	{
+		QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback"),
+						   QSettings::Registry64Format );
+		QSettings student( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
+						   QSettings::Registry64Format );
+		const auto role = machine.value( QStringLiteral("InstallRole") ).toString();
+		const auto keyHash = student.value( QStringLiteral("AdminKeyHash") ).toString().trimmed();
+		if( role == QStringLiteral("student") && keyHash.isEmpty() == false )
+		{
+			bool ok = false;
+			const auto key = QInputDialog::getText( nullptr,
+				MainWindow::tr( "iKeback 超级管理员验证" ),
+				MainWindow::tr( "此计算机为学生机。请输入超级管理员密钥以打开配置器：" ),
+				QLineEdit::Password, QString{}, &ok );
+			const auto digest = QString::fromLatin1(
+				QCryptographicHash::hash( key.toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+			if( ok == false || key.isEmpty() ||
+				digest.compare( keyHash, Qt::CaseInsensitive ) != 0 )
+			{
+				QMessageBox::warning( nullptr, MainWindow::tr( "验证失败" ),
+									  MainWindow::tr( "超级管理员密钥不正确，配置器将退出。本次尝试已记录。" ) );
+				return -1;
+			}
+		}
+	}
+#endif
 
 	// now create the main window
 	auto mainWindow = new MainWindow;

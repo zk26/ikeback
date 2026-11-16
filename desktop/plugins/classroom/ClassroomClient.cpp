@@ -49,6 +49,7 @@
 #include "ClassroomAiClient.h"
 #include "ClassroomClient.h"
 #include "ClassroomProtocol.h"
+#include "ClassroomSecrets.h"
 #include "CryptoCore.h"
 #include "PlatformCoreFunctions.h"
 #include "PlatformPluginInterface.h"
@@ -115,10 +116,10 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	header->addWidget( m_lockLabel );
 
 	m_seatEdit = new QLineEdit( this );
-	m_seatEdit->setPlaceholderText( tr( "Seat number" ) );
+	m_seatEdit->setPlaceholderText( tr( "座位号" ) );
 	m_seatEdit->setMaxLength( 16 );
 	m_nameEdit = new QLineEdit( this );
-	m_nameEdit->setPlaceholderText( tr( "Name" ) );
+	m_nameEdit->setPlaceholderText( tr( "姓名" ) );
 	m_nameEdit->setMaxLength( 32 );
 
 	// No key field on the card: the bridge key stays on the teacher machine
@@ -127,11 +128,11 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	inputLayout->addWidget( m_seatEdit );
 	inputLayout->addWidget( m_nameEdit );
 
-	m_loginButton = new QPushButton( tr( "Sign in" ), this );
-	m_aiButton = new QPushButton( tr( "AI assistant" ), this );
+	m_loginButton = new QPushButton( tr( "签到登录" ), this );
+	m_aiButton = new QPushButton( tr( "AI 助手" ), this );
 	m_aiButton->setEnabled( false );
-	m_scoreButton = new QPushButton( tr( "My score" ), this );
-	m_callButton = new QPushButton( tr( "Call teacher" ), this );
+	m_scoreButton = new QPushButton( tr( "我的成绩" ), this );
+	m_callButton = new QPushButton( tr( "呼叫老师" ), this );
 
 	// The card exposes exactly TWO action buttons: score query and AI. The
 	// sign-in and call-teacher controls stay available but are only shown while
@@ -142,7 +143,7 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	buttonLayout->addWidget( m_scoreButton );
 	buttonLayout->addWidget( m_aiButton );
 
-	auto* hint = new QLabel( tr( "Right-click: call the teacher / protected exit" ), this );
+	auto* hint = new QLabel( tr( "右键菜单：呼叫老师 / 受保护退出" ), this );
 	hint->setStyleSheet( QStringLiteral("font-size: 9px; opacity: 0.7;") );
 
 	auto* mainLayout = new QVBoxLayout( this );
@@ -198,7 +199,17 @@ void ClassroomClientWidget::placeOnScreen()
 	if( auto* screen = QGuiApplication::primaryScreen() )
 	{
 		const auto area = screen->availableGeometry();
-		move( area.right() - width() - 16, area.top() + 16 );
+		if( m_loggedIn )
+		{
+			// After sign-in the card moves to the top-right corner so it stays
+			// visible without covering the student's work.
+			move( area.right() - width() - 16, area.top() + 16 );
+		}
+		else
+		{
+			// Before sign-in the card is centered so every student sees it.
+			move( area.center().x() - width() / 2, area.center().y() - height() / 2 );
+		}
 	}
 }
 
@@ -210,6 +221,7 @@ void ClassroomClientWidget::setSettings( const QJsonObject& settings )
 	m_exitProtection = settings.value( Classroom::SettingKey::exitProtection() ).toBool( true );
 	m_exitRequiresAdmin = settings.value( Classroom::SettingKey::exitRequiresAdmin() ).toBool( true );
 	m_exitAdminUsername = settings.value( Classroom::SettingKey::exitAdminUsername() ).toString();
+	m_adminKeyHash = settings.value( Classroom::SettingKey::adminKeyHash() ).toString();
 
 	// The API key, endpoint, model and system prompt stay on the teacher
 	// machine. The student worker only submits a prompt through the bridge of
@@ -260,9 +272,10 @@ void ClassroomClientWidget::setIdentity( const QString& className, const QString
 
 	m_seatEdit->setText( seat );
 	m_nameEdit->setText( student );
-	m_loginButton->setText( tr( "Sign in" ) );
+	m_loginButton->setText( tr( "签到登录" ) );
 	updateVisibility();
 	updateStatus();
+	placeOnScreen();
 	Q_EMIT identityChanged( m_seat, m_student, true );
 }
 
@@ -274,9 +287,10 @@ void ClassroomClientWidget::clearIdentity()
 	m_loggedIn = false;
 	m_seatEdit->clear();
 	m_nameEdit->clear();
-	m_loginButton->setText( tr( "Sign in" ) );
+	m_loginButton->setText( tr( "签到登录" ) );
 	updateVisibility();
 	updateStatus();
+	placeOnScreen();
 	Q_EMIT identityChanged( {}, {}, false );
 }
 
@@ -290,16 +304,16 @@ void ClassroomClientWidget::setLocked( bool locked )
 
 void ClassroomClientWidget::updateStatus()
 {
-	m_statusLabel->setText( tr( "Class: %1  |  Lesson: %2" ).
-							arg( m_className.isEmpty() ? tr( "not selected" ) : m_className,
-								 m_keyConfigured ? tr( "started" ) : tr( "not started" ) ) );
-	m_lockLabel->setText( m_locked ? tr( "locked" ) : tr( "unlocked" ) );
+	m_statusLabel->setText( tr( "班级：%1  |  课堂：%2" ).
+							arg( m_className.isEmpty() ? tr( "未选择" ) : m_className,
+								 m_keyConfigured ? tr( "已开始" ) : tr( "未开始" ) ) );
+	m_lockLabel->setText( m_locked ? tr( "已锁定" ) : tr( "未锁定" ) );
 
 	// Prominent line: shield (client protection) + signed-in name + seat number.
 	const auto shield = QString::fromUtf8( "\xF0\x9F\x9B\xA1" );
 	m_identityLabel->setText( m_loggedIn ?
-		QStringLiteral("%1 %2  |  %3 %4").arg( shield ).arg( m_student ).arg( tr( "Seat" ) ).arg( m_seat ) :
-		QStringLiteral("%1 %2").arg( shield ).arg( tr( "Not signed in" ) ) );
+		QStringLiteral("%1 %2  |  %3 %4").arg( shield ).arg( m_student ).arg( tr( "座位" ) ).arg( m_seat ) :
+		QStringLiteral("%1 %2").arg( shield ).arg( tr( "未签到" ) ) );
 }
 
 
@@ -345,26 +359,26 @@ void ClassroomClientWidget::handleLogin()
 
 	if( seat.isEmpty() || name.isEmpty() )
 	{
-		QMessageBox::warning( this, windowTitle(), tr( "Please enter both the seat number and your name." ) );
+		QMessageBox::warning( this, windowTitle(), tr( "请同时输入座位号和姓名。" ) );
 		return;
 	}
 	// The bridge key never reaches this process. Self sign-in is gated by the
 	// teacher having started a lesson plus the roster check below.
 	if( m_keyConfigured == false )
 	{
-		Q_EMIT eventOccurred( Classroom::EventType::keyFailed(), tr( "no lesson started by the teacher" ), {} );
-		QMessageBox::warning( this, windowTitle(), tr( "The teacher has not started a lesson yet." ) );
+		Q_EMIT eventOccurred( Classroom::EventType::keyFailed(), tr( "教师尚未开始上课" ), {} );
+		QMessageBox::warning( this, windowTitle(), tr( "老师还没有开始上课，请稍候。" ) );
 		return;
 	}
 	if( m_allowSelfLogin == false )
 	{
-		QMessageBox::information( this, windowTitle(), tr( "Self sign-in is disabled. Please wait for the teacher to sign you in." ) );
+		QMessageBox::information( this, windowTitle(), tr( "自助签到已关闭，请等待老师为您签到。" ) );
 		return;
 	}
 	if( rosterAccepts( seat, name ) == false )
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::keyFailed(), tr( "seat/name mismatch for %1" ).arg( seat ), {} );
-		QMessageBox::warning( this, windowTitle(), tr( "The seat number and name do not match the class roster." ) );
+		QMessageBox::warning( this, windowTitle(), tr( "座位号与姓名和班级名册不匹配。" ) );
 		return;
 	}
 	if( m_loggedIn )
@@ -401,7 +415,7 @@ void ClassroomClientWidget::showAiChat()
 {
 	if( m_aiEnabled == false )
 	{
-		QMessageBox::information( this, windowTitle(), tr( "The teacher has disabled the AI assistant." ) );
+		QMessageBox::information( this, windowTitle(), tr( "老师已关闭 AI 助手。" ) );
 		return;
 	}
 
@@ -411,7 +425,7 @@ void ClassroomClientWidget::showAiChat()
 		connect( m_aiChat, &ClassroomAiChatWidget::eventOccurred,
 				 this, &ClassroomClientWidget::eventOccurred );
 	}
-	m_aiChat->setIdentityLabel( m_loggedIn ? QStringLiteral("%1 (%2)").arg( m_student, m_seat ) : tr( "not signed in" ) );
+	m_aiChat->setIdentityLabel( m_loggedIn ? QStringLiteral("%1 (%2)").arg( m_student, m_seat ) : tr( "未签到" ) );
 	m_aiChat->show();
 	m_aiChat->raise();
 	IkebackCore::platform().coreFunctions().raiseWindow( m_aiChat, true );
@@ -427,16 +441,35 @@ void ClassroomClientWidget::requestQuit()
 		return;
 	}
 
+	// 5.2.2: the super-admin key is the primary exit credential. The teacher
+	// configures it once; students only ever see its hash. Windows
+	// administrator credentials remain as a fallback for installs without a
+	// configured key.
 	QDialog dialog( this );
-	dialog.setWindowTitle( tr( "Exit classroom client" ) );
+	dialog.setWindowTitle( tr( "受保护退出" ) );
 	auto* form = new QFormLayout( &dialog );
-	auto* username = new QLineEdit( &dialog );
-	auto* password = new QLineEdit( &dialog );
-	username->setText( IkebackCore::platform().userFunctions().
-					   queryCurrentUserProperty( PlatformUserFunctions::UserProperty::LoginName ) );
-	password->setEchoMode( QLineEdit::Password );
-	form->addRow( tr( "Administrator account:" ), username );
-	form->addRow( tr( "Administrator password:" ), password );
+
+	QLineEdit* keyEdit = nullptr;
+	QLineEdit* username = nullptr;
+	QLineEdit* password = nullptr;
+	const auto useAdminKey = m_adminKeyHash.isEmpty() == false;
+	if( useAdminKey )
+	{
+		keyEdit = new QLineEdit( &dialog );
+		keyEdit->setEchoMode( QLineEdit::Password );
+		keyEdit->setPlaceholderText( tr( "超级管理员密钥" ) );
+		form->addRow( tr( "超级管理员密钥：" ), keyEdit );
+	}
+	else
+	{
+		username = new QLineEdit( &dialog );
+		password = new QLineEdit( &dialog );
+		username->setText( IkebackCore::platform().userFunctions().
+						   queryCurrentUserProperty( PlatformUserFunctions::UserProperty::LoginName ) );
+		password->setEchoMode( QLineEdit::Password );
+		form->addRow( tr( "管理员账户：" ), username );
+		form->addRow( tr( "管理员密码：" ), password );
+	}
 	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
 	form->addRow( buttons );
 	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
@@ -444,19 +477,25 @@ void ClassroomClientWidget::requestQuit()
 
 	if( dialog.exec() != QDialog::Accepted ) { return; }
 
-	// From 5.2.0 Windows administrator credentials are the ONLY exit
-	// credential. The bridge key is never present in this process, so the old
-	// "connection key" fallback is gone; exitRequiresAdmin is kept in the
-	// configuration for backwards compatibility but no longer weakens this.
-	Q_UNUSED( m_exitRequiresAdmin )
 	bool authorized = false;
-	const auto expectedUser = m_exitAdminUsername.trimmed();
-	const auto userMatches = expectedUser.isEmpty() ||
-							 username->text().trimmed().compare( expectedUser, Qt::CaseInsensitive ) == 0;
-	if( userMatches && password->text().isEmpty() == false )
+	if( useAdminKey )
 	{
-		const CryptoCore::PlaintextPassword plainPassword = password->text().toUtf8();
-		authorized = IkebackCore::platform().userFunctions().authenticate( username->text().trimmed(), plainPassword );
+		authorized = ClassroomSecrets::verifyAdminKey( keyEdit->text(), m_adminKeyHash );
+	}
+	else
+	{
+		// Fallback: Windows administrator credentials. exitRequiresAdmin is
+		// kept in the configuration for backwards compatibility but no longer
+		// weakens this.
+		Q_UNUSED( m_exitRequiresAdmin )
+		const auto expectedUser = m_exitAdminUsername.trimmed();
+		const auto userMatches = expectedUser.isEmpty() ||
+								 username->text().trimmed().compare( expectedUser, Qt::CaseInsensitive ) == 0;
+		if( userMatches && password->text().isEmpty() == false )
+		{
+			const CryptoCore::PlaintextPassword plainPassword = password->text().toUtf8();
+			authorized = IkebackCore::platform().userFunctions().authenticate( username->text().trimmed(), plainPassword );
+		}
 	}
 
 	if( authorized )
@@ -468,7 +507,8 @@ void ClassroomClientWidget::requestQuit()
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::quitAttempt(), tr( "rejected client exit" ), {} );
 		QMessageBox::warning( this, windowTitle(),
-							  tr( "Administrator credentials are not valid. This attempt has been logged." ) );
+							  useAdminKey ? tr( "超级管理员密钥不正确，本次尝试已记录。" )
+										  : tr( "管理员凭据无效，本次尝试已记录。" ) );
 	}
 }
 
@@ -492,11 +532,9 @@ void ClassroomClientWidget::reactivate()
 
 void ClassroomClientWidget::closeEvent( QCloseEvent* event )
 {
-	// The card cannot be closed while the ikeback service is running. Only
-	// the teacher's StopClient command (or an authorized protected exit) may
-	// stop it; a plain close/hide request is simply refused.
-	// With client protection OFF (teacher switched it off) the student may hide
-	// the card; the worker itself is still kept alive by the service watchdog.
+	// 5.2.2: closing the card requires the same authentication as exiting the
+	// program - a student must not be able to dismiss it. Only the teacher's
+	// StopClient command may hide it without credentials.
 	if( m_hideAllowed || m_exitProtection == false )
 	{
 		event->accept();
@@ -506,17 +544,18 @@ void ClassroomClientWidget::closeEvent( QCloseEvent* event )
 	event->ignore();
 	show();
 	raise();
+	requestQuit();
 }
 
 
 void ClassroomClientWidget::contextMenuEvent( QContextMenuEvent* event )
 {
 	QMenu menu( this );
-	menu.addAction( tr( "Show AI assistant" ), this, &ClassroomClientWidget::showAiChat );
-	menu.addAction( tr( "Show my score" ), this, [this]() { Q_EMIT scoreRequested(); } );
-	menu.addAction( tr( "Call the teacher" ), this, [this]() { Q_EMIT callTeacherRequested(); } );
+	menu.addAction( tr( "打开 AI 助手" ), this, &ClassroomClientWidget::showAiChat );
+	menu.addAction( tr( "查看我的成绩" ), this, [this]() { Q_EMIT scoreRequested(); } );
+	menu.addAction( tr( "呼叫老师" ), this, [this]() { Q_EMIT callTeacherRequested(); } );
 	menu.addSeparator();
-	menu.addAction( tr( "Exit client (protected)..." ), this, &ClassroomClientWidget::requestQuit );
+	menu.addAction( tr( "退出客户端（受保护）..." ), this, &ClassroomClientWidget::requestQuit );
 	menu.exec( event->globalPos() );
 }
 
@@ -582,7 +621,7 @@ void ClassroomClientWidget::showCheckIn()
 ClassroomCheckInDialog::ClassroomCheckInDialog( QWidget* parent ) :
 	QWidget( parent )
 {
-	setWindowTitle( tr( "Attendance check-in" ) );
+	setWindowTitle( tr( "课堂签到" ) );
 	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint );
 	resize( 460, 210 );
 	setStyleSheet( QStringLiteral("background:#ffffff;") );
@@ -592,14 +631,14 @@ ClassroomCheckInDialog::ClassroomCheckInDialog( QWidget* parent ) :
 	m_info->setStyleSheet( QStringLiteral("color:#1f2d3d; font-size:15px; font-weight:bold;") );
 
 	m_nameEdit = new QLineEdit( this );
-	m_nameEdit->setPlaceholderText( tr( "Type your full name" ) );
+	m_nameEdit->setPlaceholderText( tr( "请输入你的姓名" ) );
 	connect( m_nameEdit, &QLineEdit::returnPressed, this, &ClassroomCheckInDialog::submit );
 
-	auto* submitButton = new QPushButton( tr( "Check in" ), this );
+	auto* submitButton = new QPushButton( tr( "签到" ), this );
 	connect( submitButton, &QPushButton::clicked, this, &ClassroomCheckInDialog::submit );
 
 	auto* form = new QFormLayout;
-	form->addRow( tr( "Name:" ), m_nameEdit );
+	form->addRow( tr( "姓名：" ), m_nameEdit );
 
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_info );
@@ -610,8 +649,8 @@ ClassroomCheckInDialog::ClassroomCheckInDialog( QWidget* parent ) :
 
 void ClassroomCheckInDialog::prepare( const QString& className, const QString& seat )
 {
-	m_info->setText( tr( "%1 - seat %2: teacher started a check-in. Type your name to confirm." )
-					 .arg( className, seat.isEmpty() ? tr( "unknown" ) : seat ) );
+	m_info->setText( tr( "%1 - 座位 %2：老师发起了签到，请输入姓名确认。" )
+					 .arg( className, seat.isEmpty() ? tr( "未知" ) : seat ) );
 	m_nameEdit->clear();
 	m_nameEdit->setFocus();
 }
@@ -622,7 +661,7 @@ void ClassroomCheckInDialog::submit()
 	const auto name = m_nameEdit->text().trimmed();
 	if( name.isEmpty() )
 	{
-		QMessageBox::information( this, windowTitle(), tr( "Please type your name first." ) );
+		QMessageBox::information( this, windowTitle(), tr( "请先输入姓名。" ) );
 		return;
 	}
 	Q_EMIT submitted( name );
@@ -633,14 +672,14 @@ void ClassroomCheckInDialog::submit()
 ClassroomScoreView::ClassroomScoreView( QWidget* parent ) :
 	QWidget( parent )
 {
-	setWindowTitle( tr( "My score" ) );
+	setWindowTitle( tr( "我的成绩" ) );
 	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint );
 	resize( 620, 620 );
 	m_view = new QTextBrowser( this );
 	m_view->setOpenExternalLinks( false );
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_view );
-	auto* closeButton = new QPushButton( tr( "Close" ), this );
+	auto* closeButton = new QPushButton( tr( "关闭" ), this );
 	layout->addWidget( closeButton );
 	connect( closeButton, &QPushButton::clicked, this, &QWidget::hide );
 }
@@ -678,7 +717,7 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 	QWidget( parent ),
 	m_aiClient( client )
 {
-	setWindowTitle( tr( "AI assistant" ) );
+	setWindowTitle( tr( "AI 助手" ) );
 	setAttribute( Qt::WA_DeleteOnClose, false );
 	keepOnTop( this );
 	setFixedSize( 420, 460 );
@@ -692,14 +731,27 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 			 dark ? QStringLiteral("#f0f0f0") : QStringLiteral("#202020") ) );
 	setObjectName( QStringLiteral("classroomAi") );
 
-	auto* title = new QLabel( tr( "AI assistant (configured by the teacher)" ), this );
+	auto* title = new QLabel( tr( "AI 助手（由老师配置）" ), this );
 	title->setStyleSheet( QStringLiteral("font-weight: bold; padding: 4px;") );
+
+	// The window is frameless, so it needs an explicit close button.
+	auto* closeButton = new QPushButton( QStringLiteral("✕"), this );
+	closeButton->setFixedSize( 24, 24 );
+	closeButton->setStyleSheet( QStringLiteral("QPushButton { border: none; font-size: 14px; }"
+											   "QPushButton:hover { background: #e81123; color: white; }") );
+	closeButton->setToolTip( tr( "关闭" ) );
+	connect( closeButton, &QPushButton::clicked, this, &QWidget::hide );
+
+	auto* titleRow = new QHBoxLayout;
+	titleRow->addWidget( title, 1 );
+	titleRow->addWidget( closeButton );
+
 	m_view = new QTextBrowser( this );
 	m_view->setReadOnly( true );
 	m_view->setOpenExternalLinks( true );
 	m_input = new QLineEdit( this );
-	m_input->setPlaceholderText( tr( "Ask a question..." ) );
-	m_sendButton = new QPushButton( tr( "Send" ), this );
+	m_input->setPlaceholderText( tr( "输入你的问题..." ) );
+	m_sendButton = new QPushButton( tr( "发送" ), this );
 
 	auto* inputLayout = new QHBoxLayout;
 	inputLayout->addWidget( m_input, 1 );
@@ -707,11 +759,11 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 
 	auto* mainLayout = new QVBoxLayout( this );
 	mainLayout->setContentsMargins( 8, 8, 8, 8 );
-	mainLayout->addWidget( title );
+	mainLayout->addLayout( titleRow );
 	mainLayout->addWidget( m_view, 1 );
 	mainLayout->addLayout( inputLayout );
 
-	appendLine( tr( "Welcome! Your questions and this session are recorded in the classroom log." ) );
+	appendLine( tr( "欢迎使用！你的提问和本次会话会记录在课堂日志中。" ) );
 
 	connect( m_sendButton, &QPushButton::clicked, this, &ClassroomAiChatWidget::sendMessage );
 	connect( m_input, &QLineEdit::returnPressed, this, &ClassroomAiChatWidget::sendMessage );
@@ -736,7 +788,7 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 
 void ClassroomAiChatWidget::setIdentityLabel( const QString& label )
 {
-	setWindowTitle( tr( "AI assistant - %1" ).arg( label ) );
+	setWindowTitle( tr( "AI 助手 - %1" ).arg( label ) );
 }
 
 
@@ -755,7 +807,7 @@ void ClassroomAiChatWidget::sendMessage()
 	m_lastPrompt = prompt;
 	m_input->clear();
 	m_sendButton->setEnabled( false );
-	appendLine( QStringLiteral("<b>%1</b> %2").arg( tr( "Me:" ), prompt.toHtmlEscaped() ) );
+	appendLine( QStringLiteral("<b>%1</b> %2").arg( tr( "我：" ), prompt.toHtmlEscaped() ) );
 	Q_EMIT eventOccurred( Classroom::EventType::ai(), prompt.left( 200 ), QStringLiteral("AI") );
 	m_aiClient->chat( m_history, prompt );
 }
@@ -896,8 +948,9 @@ void ClassroomMonitor::sample()
 	const auto title = m_captureWindowTitle ? info.second : QString{};
 	const auto application = m_captureProcess ? info.first : QString{};
 	if( title.isEmpty() && application.isEmpty() ) { return; }
-	if( title.contains( Classroom::productName() ) || title.contains( tr( "AI assistant" ) ) ||
-		title.contains( tr( "My score" ) ) || title.contains( tr( "Attendance check-in" ) ) ) { return; }
+	if( title.contains( Classroom::productName() ) || title.contains( tr( "AI 助手" ) ) ||
+		title.contains( tr( "我的成绩" ) ) || title.contains( tr( "课堂签到" ) ) ||
+		title.contains( QStringLiteral("iKeback") ) ) { return; }
 
 	const QString key = application + QLatin1Char('|') + title;
 	if( key == m_lastSample ) { return; }

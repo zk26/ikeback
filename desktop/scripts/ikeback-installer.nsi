@@ -243,6 +243,11 @@ Section "ikeback Service (required)" SEC_SERVICE
   FileOpen $9 "$INSTDIR\install.log" w
   FileWrite $9 "ikeback ${VERSION} ${ROLE_EN} install log$\r$\n"
 
+  ; Machine role marker: the classroom card/tray only appears on student
+  ; installs and the configurator is key-gated there (see ClassroomPlugin).
+  SetRegView 64
+  WriteRegStr ${REG_ROOT} "SOFTWARE\ikeback" "InstallRole" "${ROLE}"
+
   nsExec::ExecToStack '"$INSTDIR\ikeback-wcli.exe" service register'
   Pop $R0
   Pop $1

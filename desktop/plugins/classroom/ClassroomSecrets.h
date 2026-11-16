@@ -31,4 +31,11 @@ public:
 									const QString& nonce, const QByteArray& body );
 
 	static bool constantTimeEquals( const QByteArray& left, const QByteArray& right );
+
+	//! SHA-256 (hex, lowercase) of the super-admin key. Students only ever see
+	//! this digest (settings.json / HKLM), never the plain key.
+	static QString adminKeyHash( const QString& key );
+	//! True when `key` matches the stored digest. An empty digest means "no key
+	//! configured" and fails closed.
+	static bool verifyAdminKey( const QString& key, const QString& storedHash );
 };

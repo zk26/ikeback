@@ -10,6 +10,8 @@
 #include <QAbstractSocket>
 #include <QAction>
 #include <QCursor>
+#include <QDir>
+#include <QFile>
 #include <QDockWidget>
 #include <QMainWindow>
 #include <QCoreApplication>
@@ -27,12 +29,16 @@
 #include <QNetworkInterface>
 #include <QMenu>
 #include <QProcess>
+#include <QSet>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QSystemTrayIcon>
 #include <QIcon>
 #include <QStringList>
 #include <QTimer>
+#include <QUdpSocket>
 #include <QUrl>
+#include <QUuid>
 
 #include "ClassroomAiClient.h"
 #include "ClassroomClient.h"
@@ -47,6 +53,7 @@
 #include "ComputerControlInterface.h"
 #include "FeatureWorkerManager.h"
 #include "Filesystem.h"
+#include "NetworkObject.h"
 #include "PlatformCoreFunctions.h"
 #include "PlatformPluginInterface.h"
 #include "IkebackCore.h"
@@ -58,6 +65,8 @@ using namespace Classroom;
 
 //! Give up automatic worker restarts after this many consecutive failures.
 static constexpr int MaxWorkerRestartFailures = 5;
+
+static void persistAdminKeyHash( const QJsonObject& settingsObject );
 
 IMPLEMENT_CONFIG_PROXY(ClassroomConfiguration)
 
@@ -97,7 +106,7 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 								  Feature::Flag::Action | Feature::Flag::Master,
 								  quickToolsFeatureUid(), Feature::Uid(),
 								  tr( "常用工具" ), {},
-								  tr( "广播、UWF、网关、肃静、禁用与评分等参数设置" ),
+								  tr( "打开工具参数页：广播、UWF、网关、肃静、禁用与评分等设置" ),
 								  QStringLiteral(":/core/icon22.png") ) ),
 								  m_checkInFeature( Feature( QStringLiteral("ClassroomCheckIn"),
 								   Feature::Flag::Action | Feature::Flag::Master,
@@ -105,12 +114,44 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 								   tr( "签到" ), {},
 								   tr( "在所有学生机上开始签到" ),
 								   QStringLiteral(":/core/user-group-new.png") ) ),
+	// 5.2.2: operation log button - answers "did my protection/UWF command
+	// actually succeed?" without digging through the behaviour log.
+	m_operationLogFeature( Feature( QStringLiteral("ClassroomOperationLog"),
+									Feature::Flag::Action | Feature::Flag::Master,
+									operationLogFeatureUid(), Feature::Uid(),
+									tr( "操作记录" ), {},
+									tr( "查看教师操作的执行结果（保护、UWF、静音、远程安装等）" ),
+									QStringLiteral(":/core/document-edit.png") ) ),
 	m_features( { m_consoleFeature, m_clientFeature, m_signInFeature, m_signOutFeature,
-				  m_quickToolsFeature, m_checkInFeature } ),
+				  m_quickToolsFeature, m_checkInFeature, m_operationLogFeature } ),
 	m_hostName( QHostInfo::localHostName() )
 {
 	m_ipAddress = localIpAddress();
 	buildQuickActionFeatures();
+
+	if( IkebackCore::component() == IkebackCore::Component::Master )
+	{
+		// Remote-access window titles show the roster name of the student who
+		// sits at the machine (Q4), not the raw computer directory entry.
+		IkebackCore::setComputerNameResolver(
+			[this]( const QString& hostName, const QString& hostAddress ) {
+				const auto ip = hostAddress.trimmed();
+				for( const auto& classValue : roster()->toJsonArray() )
+				{
+					for( const auto& studentValue : classValue.toObject().value( QStringLiteral("students") ).toArray() )
+					{
+						const auto student = studentValue.toObject();
+						const auto studentIp = student.value( QStringLiteral("ip") ).toString();
+						if( studentIp.isEmpty() || ( studentIp != ip && studentIp != hostName ) ) { continue; }
+						return QStringLiteral("%1 %2")
+							.arg( student.value( QStringLiteral("seat") ).toString(),
+								  student.value( QStringLiteral("name") ).toString() ).trimmed();
+					}
+				}
+				return QString{};
+			} );
+		startDiscoveryListener();
+	}
 }
 
 
@@ -219,17 +260,17 @@ void ClassroomPlugin::ensureTrayIcon()
 	m_trayIcon->setToolTip( Classroom::productName() );
 
 	auto* menu = new QMenu;
-	menu->addAction( tr( "Show ikeback card" ), this, [this]() {
+	menu->addAction( tr( "显示 iKeback 卡片" ), this, [this]() {
 		if( m_clientWidget ) { m_clientWidget->reactivate(); }
 	} );
-	menu->addAction( tr( "My score" ), this, [this]() {
+	menu->addAction( tr( "我的成绩" ), this, [this]() {
 		if( m_clientWidget ) { m_clientWidget->requestScore(); }
 	} );
-	menu->addAction( tr( "AI assistant" ), this, [this]() {
+	menu->addAction( tr( "AI 助手" ), this, [this]() {
 		if( m_clientWidget ) { m_clientWidget->openAiAssistant(); }
 	} );
 	menu->addSeparator();
-	menu->addAction( tr( "Exit (protected)" ), this, [this]() {
+	menu->addAction( tr( "退出（受保护）" ), this, [this]() {
 		if( m_clientWidget ) { m_clientWidget->requestProtectedQuit(); }
 	} );
 	m_trayIcon->setContextMenu( menu );
@@ -252,7 +293,7 @@ void ClassroomPlugin::updateTrayTooltip()
 	QString text = Classroom::productName();
 	if( m_student.isEmpty() == false )
 	{
-		text += QStringLiteral("\n%1 · %2 %3").arg( m_className, tr( "Seat" ), m_seat );
+		text += QStringLiteral("\n%1 · %2 %3").arg( m_className, tr( "座位" ), m_seat );
 		text += QStringLiteral("\n%1").arg( m_student );
 	}
 	m_trayIcon->setToolTip( text );
@@ -269,6 +310,137 @@ QString ClassroomPlugin::localIpAddress() const
 		}
 	}
 	return QHostAddress( QHostAddress::LocalHost ).toString();
+}
+
+
+QString ClassroomPlugin::machineRole()
+{
+#ifdef Q_OS_WIN
+	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback"),
+					   QSettings::Registry64Format );
+	return machine.value( QStringLiteral("InstallRole") ).toString();
+#else
+	return {};
+#endif
+}
+
+
+void ClassroomPlugin::startStudentBeacon()
+{
+	if( m_beaconTimer != nullptr ) { return; }
+
+	m_beaconTimer = new QTimer( this );
+	connect( m_beaconTimer, &QTimer::timeout, this, [this]() {
+		const auto payload = QStringLiteral("%1:%2:%3")
+								.arg( Classroom::studentBeaconMagic(), m_hostName, m_ipAddress ).toUtf8();
+		QUdpSocket socket;
+		socket.writeDatagram( payload, QHostAddress::Broadcast, Classroom::studentBeaconPort() );
+	} );
+	m_beaconTimer->start( 5000 );
+}
+
+
+void ClassroomPlugin::startDiscoveryListener()
+{
+	if( m_discoverySocket != nullptr ) { return; }
+
+	m_discoverySocket = new QUdpSocket( this );
+	if( m_discoverySocket->bind( QHostAddress::AnyIPv4, Classroom::studentBeaconPort(),
+								 QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint ) == false )
+	{
+		vWarning() << "ikeback: student discovery socket could not bind"
+				   << Classroom::studentBeaconPort() << m_discoverySocket->errorString();
+		m_discoverySocket->deleteLater();
+		m_discoverySocket = nullptr;
+		return;
+	}
+
+	connect( m_discoverySocket, &QUdpSocket::readyRead, this, [this]() {
+		while( m_discoverySocket->hasPendingDatagrams() )
+		{
+			QByteArray datagram;
+			datagram.resize( static_cast<int>( m_discoverySocket->pendingDatagramSize() ) );
+			QHostAddress sender;
+			m_discoverySocket->readDatagram( datagram.data(), datagram.size(), &sender );
+			const auto text = QString::fromUtf8( datagram );
+			if( text.startsWith( Classroom::studentBeaconMagic() + QLatin1Char(':') ) == false ) { continue; }
+			const auto parts = text.split( QLatin1Char(':') );
+			const auto hostName = parts.value( 2 );
+			const auto ip = parts.value( 3 ).isEmpty() ? sender.toString() : parts.value( 3 );
+			registerDiscoveredHost( hostName, ip );
+		}
+	} );
+}
+
+
+void ClassroomPlugin::registerDiscoveredHost( const QString& hostName, const QString& ip )
+{
+	const auto sanitizedIp = Classroom::sanitizeUnicastIp( ip );
+	if( sanitizedIp.isEmpty() ) { return; }
+
+	// Throttle: a machine that keeps beaconing must not rewrite the directory
+	// every five seconds.
+	const auto now = QDateTime::currentDateTime();
+	const auto lastSeen = m_discoveredHosts.value( sanitizedIp );
+	if( lastSeen.isValid() && lastSeen.secsTo( now ) < 60 ) { return; }
+	m_discoveredHosts.insert( sanitizedIp, now );
+
+	auto& configuration = IkebackCore::config();
+	if( configuration.isStoreWritable() == false ) { return; }
+
+	auto objects = configuration.value( QStringLiteral("NetworkObjects"), QStringLiteral("BuiltinDirectory"),
+										QJsonArray() ).toJsonArray();
+
+	for( const auto& value : objects )
+	{
+		const auto object = value.toObject();
+		if( object.value( QStringLiteral("Type") ).toInt() == static_cast<int>( NetworkObject::Type::Host ) &&
+			object.value( QStringLiteral("HostAddress") ).toString() == sanitizedIp )
+		{
+			return; // already known
+		}
+	}
+
+	// Collect all IPs so a rename does not duplicate entries.
+	QSet<QString> knownIps;
+	for( const auto& value : objects )
+	{
+		const auto object = value.toObject();
+		if( object.value( QStringLiteral("Type") ).toInt() == static_cast<int>( NetworkObject::Type::Host ) )
+		{
+			knownIps.insert( object.value( QStringLiteral("HostAddress") ).toString() );
+		}
+	}
+	if( knownIps.contains( sanitizedIp ) ) { return; }
+
+	static const auto locationName = QStringLiteral("自动发现");
+	QUuid locationUid;
+	for( const auto& value : objects )
+	{
+		const auto object = value.toObject();
+		if( object.value( QStringLiteral("Type") ).toInt() == static_cast<int>( NetworkObject::Type::Location ) &&
+			object.value( QStringLiteral("Name") ).toString() == locationName )
+		{
+			locationUid = QUuid( object.value( QStringLiteral("Uid") ).toString() );
+		}
+	}
+	if( locationUid.isNull() )
+	{
+		locationUid = QUuid::createUuid();
+		objects.append( NetworkObject( NetworkObject::Type::Location, locationName, {}, {}, {},
+									   locationUid, QUuid() ).toJson() );
+	}
+
+	const auto displayName = hostName.isEmpty() ? sanitizedIp : hostName;
+	objects.append( NetworkObject( NetworkObject::Type::Host, displayName, sanitizedIp, {}, {},
+								   QUuid::createUuid(), locationUid ).toJson() );
+	configuration.setValue( QStringLiteral("NetworkObjects"), objects, QStringLiteral("BuiltinDirectory") );
+	configuration.flushStore();
+	if( auto* directory = IkebackCore::networkObjectDirectoryManager().configuredDirectory() )
+	{
+		directory->update();
+	}
+	vDebug() << "ikeback: auto-discovered student machine" << displayName << sanitizedIp;
 }
 
 
@@ -386,23 +558,26 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 	{
 		if( feature.uid() != quickActionUid( index ) ) { continue; }
 		// The parameter widgets (silence text, blocked apps, ...) live in the
-		// console, so make sure it exists before running the action.
-		if( m_dialog.isNull() ) { startFeature( master, m_consoleFeature, computerControlInterfaces ); }
-		if( m_dialog.isNull() ) { return true; }
+		// console, so make sure it exists - but HIDDEN: a one-click action must
+		// not pop up the whole console window (5.2.2 UX fix).
+		if( ensureConsoleDialog( master, computerControlInterfaces, false ) == nullptr ) { return true; }
 		m_dialog->runQuickTool( m_quickActionIds.at( index ) );
+		return true;
+	}
+
+	// ------------------------------------------- operation log (5.2.2)
+	if( feature.uid() == operationLogFeatureUid() )
+	{
+		if( ensureConsoleDialog( master, computerControlInterfaces, false ) == nullptr ) { return true; }
+		m_dialog->openOperationLog();
 		return true;
 	}
 
 	// ------------------------------------------- tool bar quick tools / check-in
 	if( feature.uid() == quickToolsFeatureUid() || feature.uid() == checkInFeatureUid() )
 	{
-		// The parameter widgets (silence text, blocked apps, software path, ...)
-		// belong to the console, so make sure it has been created at least once.
-		if( m_dialog.isNull() )
-		{
-			startFeature( master, m_consoleFeature, computerControlInterfaces );
-		}
-		if( m_dialog.isNull() ) { return true; }
+		if( ensureConsoleDialog( master, computerControlInterfaces,
+								 feature.uid() == quickToolsFeatureUid() ) == nullptr ) { return true; }
 
 		if( feature.uid() == checkInFeatureUid() )
 		{
@@ -410,25 +585,23 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 			return true;
 		}
 
-		QMenu menu( master.mainWindow() );
-		menu.setToolTipsVisible( true );
-		for( const auto& group : m_dialog->quickToolGroups() )
-		{
-			auto* subMenu = menu.addMenu( group.icon.isEmpty() ? QIcon() : QIcon( group.icon ), group.label );
-			for( const auto& entry : group.actions )
-			{
-				auto* action = subMenu->addAction( entry.label );
-				connect( action, &QAction::triggered, &menu, [entry]() {
-					if( entry.run ) { entry.run(); }
-				} );
-			}
-		}
-		menu.exec();
+		// 5.2.2: "常用工具" opens the console on the Quick tools tab instead of
+		// the old nested drop-down menu which was impossible to operate.
+		m_dialog->showQuickToolsTab();
 		return true;
 	}
 
 	if( feature.uid() != consoleFeatureUid() ) { return false; }
 
+	ensureConsoleDialog( master, computerControlInterfaces, true );
+	return true;
+}
+
+
+ClassroomMasterDialog* ClassroomPlugin::ensureConsoleDialog( IkebackMasterInterface& master,
+															const ComputerControlInterfaceList& computerControlInterfaces,
+															bool show )
+{
 	// The console always opens as its own window (a pop-up) instead of being
 	// docked into the Master window: the monitoring view must stay usable while
 	// the console is open, and teachers expect a dialog they can move/close.
@@ -441,35 +614,42 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 			if( m_dialog ) { m_dialog->hide(); }
 		} );
 	}
-	m_dialog->show();
-	m_dialog->raise();
-	m_dialog->activateWindow();
 
-	// One message, one session-worker wake-up. The old three-message burst
-	// re-armed the watchdog and repeatedly called startUnmanagedSessionWorker()
-	// while the previous worker was still being torn down (5s kill timer),
-	// which is what produced a dozen ikeback-worker.exe processes.
-	auto stateMessage = Classroom::message( Command::ApplySession );
-	stateMessage.addArgument( Argument::SettingsJson,
-							  QString::fromUtf8( QJsonDocument( ClassroomSettings::forStudents( settings()->object() ) ).
-												 toJson( QJsonDocument::Compact ) ) );
-	stateMessage.addArgument( Argument::RosterJson, roster()->toJson() );
-	stateMessage.addArgument( Argument::KeyConfigured,
-							  settings()->object().value( QStringLiteral("sessionKey") ).toString().isEmpty() == false );
-	stateMessage.addArgument( Argument::SessionId,
-							  QDateTime::currentDateTime().toString( QStringLiteral("yyyyMMdd-HHmmss") ) );
-	sendFeatureMessage( stateMessage, computerControlInterfaces );
+	if( show )
+	{
+		m_dialog->show();
+		m_dialog->raise();
+		m_dialog->activateWindow();
 
-	return true;
+		// One message, one session-worker wake-up. The old three-message burst
+		// re-armed the watchdog and repeatedly called startUnmanagedSessionWorker()
+		// while the previous worker was still being torn down (5s kill timer),
+		// which is what produced a dozen ikeback-worker.exe processes.
+		auto stateMessage = Classroom::message( Command::ApplySession );
+		stateMessage.addArgument( Argument::SettingsJson,
+								  QString::fromUtf8( QJsonDocument( ClassroomSettings::forStudents( settings()->object() ) ).
+													 toJson( QJsonDocument::Compact ) ) );
+		stateMessage.addArgument( Argument::RosterJson, roster()->toJson() );
+		stateMessage.addArgument( Argument::KeyConfigured,
+								  settings()->object().value( QStringLiteral("sessionKey") ).toString().isEmpty() == false );
+		stateMessage.addArgument( Argument::SessionId,
+								  QDateTime::currentDateTime().toString( QStringLiteral("yyyyMMdd-HHmmss") ) );
+		sendFeatureMessage( stateMessage, computerControlInterfaces );
+	}
+
+	return m_dialog.data();
 }
 
 
 void ClassroomPlugin::startClient( IkebackServerInterface& server )
 {
+	const auto settingsObject = ClassroomSettings::forStudents(
+		ClassroomSettings::fromConfiguration( m_configuration ) );
+	persistAdminKeyHash( settingsObject );
+
 	auto message = Classroom::message( Command::StartClient );
 	message.addArgument( Argument::SettingsJson,
-						 QString::fromUtf8( QJsonDocument( ClassroomSettings::forStudents(
-							 ClassroomSettings::fromConfiguration( m_configuration ) ) ).
+						 QString::fromUtf8( QJsonDocument( settingsObject ).
 											toJson( QJsonDocument::Compact ) ) );
 	message.addArgument( Argument::KeyConfigured, m_configuration.sessionKey().isEmpty() == false );
 	message.addArgument( Argument::SessionId,
@@ -485,7 +665,16 @@ void ClassroomPlugin::startSessionFeature( IkebackServerInterface& server )
 		return;
 	}
 
+	// Teacher machines run the service for their own monitoring but never show
+	// the student card. The install-role marker is written by the installer.
+	const auto role = machineRole();
+	if( role == QStringLiteral("teacher") )
+	{
+		return;
+	}
+
 	m_server = &server;
+	startStudentBeacon();
 	startClient( server );
 
 	m_watchdog = new QTimer( this );
@@ -583,6 +772,13 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackServerInterface& server, cons
 	}
 
 	const auto command = message.command<Command>();
+	// Server-side (SYSTEM): persist the super-admin key digest so the
+	// configurator can gate itself on student machines (Q6).
+	if( command == Command::StartClient || command == Command::SetSettings || command == Command::ApplySession )
+	{
+		persistAdminKeyHash( QJsonDocument::fromJson(
+			message.argument( Argument::SettingsJson ).toString().toUtf8() ).object() );
+	}
 	if( command == Command::StopClient )
 	{
 		m_stopAllowed = true;
@@ -781,6 +977,9 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 {
 	if( m_clientWidget ) { return; }
+	// The floating card is student-only (Q2): teacher installs carry the
+	// "teacher" role marker written by the installer.
+	if( machineRole() == QStringLiteral("teacher") ) { return; }
 
 	m_worker = &worker;
 	m_clientWidget = new ClassroomClientWidget;
@@ -876,6 +1075,23 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 				 }
 #endif
 			 } );
+}
+
+
+//! Mirror the super-admin key digest into HKLM (machine-readable, writable
+//! only with elevation) so the configurator can gate itself on student
+//! machines. Called in the server process which runs as SYSTEM.
+static void persistAdminKeyHash( const QJsonObject& settingsObject )
+{
+#ifdef Q_OS_WIN
+	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
+					   QSettings::Registry64Format );
+	machine.setValue( QStringLiteral("AdminKeyHash"),
+					  settingsObject.value( Classroom::SettingKey::adminKeyHash() ).toString() );
+	machine.sync();
+#else
+	Q_UNUSED(settingsObject)
+#endif
 }
 
 
@@ -1110,6 +1326,81 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 	case Command::UwfRestart:
 		ClassroomSystem::restartSystem();
 		break;
+
+	// ------------------------------------------- 5.2.2 remote software deployment
+	case Command::DeployFileBegin:
+	{
+		if( m_deployFile )
+		{
+			m_deployFile->close();
+			m_deployFile->deleteLater();
+			m_deployFile = nullptr;
+		}
+		// Only the bare file name is ever used as a path component.
+		const auto fileName = QFileInfo( message.argument( Argument::FileName ).toString() ).fileName();
+		const auto stagingDir = QStandardPaths::writableLocation( QStandardPaths::TempLocation ) +
+								QStringLiteral("/ikeback-deploy");
+		QDir().mkpath( stagingDir );
+		m_deployFile = new QFile( stagingDir + QLatin1Char('/') + fileName, this );
+		if( m_deployFile->open( QFile::WriteOnly | QFile::Truncate ) == false )
+		{
+			qWarning( "ikeback: could not stage installer %s", qPrintable( fileName ) );
+			m_deployFile->deleteLater();
+			m_deployFile = nullptr;
+		}
+		break;
+	}
+
+	case Command::DeployFileChunk:
+		if( m_deployFile )
+		{
+			m_deployFile->write( message.argument( Argument::FileData ).toByteArray() );
+		}
+		break;
+
+	case Command::UwfInstall:
+	{
+		QString stagedPath;
+		if( m_deployFile )
+		{
+			stagedPath = m_deployFile->fileName();
+			m_deployFile->close();
+			m_deployFile->deleteLater();
+			m_deployFile = nullptr;
+		}
+		if( stagedPath.isEmpty() || QFileInfo::exists( stagedPath ) == false )
+		{
+			reportEvent( EventType::install(), QStringLiteral("install failed: no staged installer"), {} );
+			break;
+		}
+
+		QStringList extraArgs;
+#if QT_VERSION >= QT_VERSION_CHECK(5, 15, 0)
+		extraArgs = QProcess::splitCommand( message.argument( Argument::SoftwareArgs ).toString() );
+#else
+		extraArgs = message.argument( Argument::SoftwareArgs ).toString().split(
+			QLatin1Char(' '), QString::SkipEmptyParts );
+#endif
+		bool started = false;
+		if( stagedPath.endsWith( QStringLiteral(".msi"), Qt::CaseInsensitive ) )
+		{
+			QStringList args{ QStringLiteral("/i"), stagedPath, QStringLiteral("/quiet"),
+							  QStringLiteral("/norestart") };
+			args.append( extraArgs );
+			started = QProcess::startDetached( QStringLiteral("msiexec.exe"), args );
+		}
+		else
+		{
+			QStringList args{ QStringLiteral("/VERYSILENT"), QStringLiteral("/SUPPRESSMSGBOXES"),
+							  QStringLiteral("/NORESTART"), QStringLiteral("/S") };
+			args.append( extraArgs );
+			started = QProcess::startDetached( stagedPath, args );
+		}
+		reportEvent( EventType::install(),
+					 started ? QStringLiteral("installer launched: %1").arg( stagedPath )
+							 : QStringLiteral("installer FAILED to launch: %1").arg( stagedPath ), {} );
+		break;
+	}
 
 	// ---------------------------------------------------------- 5.2.0 quick tools
 	case Command::SetExitProtection:

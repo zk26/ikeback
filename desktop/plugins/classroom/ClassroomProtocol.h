@@ -40,6 +40,19 @@ inline QString discoveryMagic()
 	return QStringLiteral("IKEBACK_DISCOVER");
 }
 
+//! UDP beacon emitted by every student machine so the teacher console can
+//! discover installed clients automatically. Payload:
+//! "IKEBACK_STUDENT:<hostName>:<ip>" on port studentBeaconPort().
+inline QString studentBeaconMagic()
+{
+	return QStringLiteral("IKEBACK_STUDENT");
+}
+
+inline quint16 studentBeaconPort()
+{
+	return 11883;
+}
+
 //! Validate anything that ends up in "remoteip=" (netsh) or in a listen()
 //! call. CIDR ranges, wildcards, loopback, multicast and broadcast are
 //! rejected. Returns a null QHostAddress for invalid input.
@@ -106,6 +119,13 @@ inline Feature::Uid quickToolsFeatureUid()
 inline Feature::Uid checkInFeatureUid()
 {
 	return Feature::Uid{ QStringLiteral("d3f1c0de-7a41-4b8e-9c12-000000000006") };
+}
+
+//! 5.2.2: "操作记录" tool-bar button - a compact view of teacher operations
+//! and their per-machine results (protection/UWF/mute/install ...).
+inline Feature::Uid operationLogFeatureUid()
+{
+	return Feature::Uid{ QStringLiteral("d3f1c0de-7a41-4b8e-9c12-000000000007") };
 }
 
 enum class Command
@@ -188,7 +208,13 @@ enum class Command
 	// 5.2.0: students no longer hold the AI API key. They submit a prompt and
 	// the teacher machine calls the model provider on their behalf.
 	AiPrompt,
-	AiReply
+	AiReply,
+
+	// 5.2.2 remote software deployment: chunked transfer of the installer to
+	// the student machine, then UwfInstall runs it locally. ALWAYS append:
+	// numeric values are the wire protocol.
+	DeployFileBegin,
+	DeployFileChunk
 };
 
 enum class Argument
@@ -261,7 +287,12 @@ enum class Argument
 	// teacher-machine AI proxy (prompt JSON, reply)
 	AiPayload,
 	AiSuccess,
-	AiAnswer
+	AiAnswer,
+
+	// 5.2.2 remote software deployment (installer chunk transfer)
+	FileName,
+	FileData,
+	FileSize
 };
 
 inline FeatureMessage message( Command command )
@@ -337,6 +368,11 @@ inline QString wordCloudStopWords() { return QStringLiteral("wordCloudStopWords"
 //! Fuzzy (case-insensitive substring) rules persisted on the teacher machine.
 inline QString blockedApps()        { return QStringLiteral("blockedApps"); }
 inline QString blockedWebsites()    { return QStringLiteral("blockedWebsites"); }
+//! "超级管理员密钥": gates protected exit on student cards and opening the
+//! configurator on student machines. The PLAIN key is a teacher-side secret;
+//! students receive only its SHA-256 hex digest via forStudents().
+inline QString adminKey()          { return QStringLiteral("adminKey"); }
+inline QString adminKeyHash()      { return QStringLiteral("adminKeyHash"); }
 }
 
 }

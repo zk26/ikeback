@@ -106,6 +106,8 @@ private:
 	QString m_seat;
 	QString m_student;
 	QJsonObject m_roster;
+	//! SHA-256 hex of the super-admin key (never the key itself).
+	QString m_adminKeyHash;
 
 	bool m_loggedIn = false;
 	bool m_locked = false;

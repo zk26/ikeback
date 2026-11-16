@@ -24,6 +24,7 @@
 class QCheckBox;
 class QComboBox;
 class QDateEdit;
+class QFile;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
@@ -89,6 +90,11 @@ public:
 	void restartService();
 	//! Asks for an installer and pushes it to the students (remote install).
 	void deployInstaller();
+	//! 5.2.2: compact dialog with teacher operations and their results
+	//! ("did my protection command actually succeed?").
+	void openOperationLog();
+	//! Switches to the Quick tools tab ("常用工具" button).
+	void showQuickToolsTab();
 
 	// Toggle state kept by the tool-bar buttons, so one click flips the
 	// behaviour instead of offering a separate "on" and "off" button.
@@ -133,6 +139,22 @@ private:
 	void scoreWholeClass( int delta );
 	void startCheckIn();
 	void refreshCheckIn();
+
+	//! Remote deployment state machine (UWFTool-style flow):
+	//! disable UWF -> reboot -> wait online -> transfer -> install -> re-enable.
+	enum class DeployPhase
+	{
+		Idle,
+		DisableUwf,
+		RebootAfterDisable,
+		WaitOnline,
+		Transfer,
+		WaitInstall,
+		EnableUwf,
+		RebootAfterEnable
+	};
+	void advanceDeploy();
+	void finishDeploy( const QString& result );
 
 	QString dataDirectory() const;
 	QString currentClassName() const;
@@ -250,6 +272,8 @@ private:
 	QCheckBox* m_exitRequiresAdmin = nullptr;
 	QCheckBox* m_allowSelfLogin = nullptr;
 	QLineEdit* m_exitAdminUsername = nullptr;
+	//! Super-admin key (超级管理员密钥) gating protected exit on students.
+	QLineEdit* m_adminKey = nullptr;
 	QSpinBox* m_captureInterval = nullptr;
 	QSpinBox* m_retentionDays = nullptr;
 	QLineEdit* m_dataDirectory = nullptr;
@@ -284,4 +308,12 @@ private:
 	QMap<QString, QString> m_checkInNames;
 	QMap<QString, QDateTime> m_checkInTimes;
 	QDateTime m_checkInStarted;
+
+	//! Remote deployment state (see DeployPhase).
+	QTimer* m_deployTimer = nullptr;
+	QFile* m_deploySource = nullptr;
+	QString m_deployArgs;
+	bool m_deployUwfFlow = false;
+	DeployPhase m_deployPhase = DeployPhase::Idle;
+	int m_deployWaitTicks = 0;
 };

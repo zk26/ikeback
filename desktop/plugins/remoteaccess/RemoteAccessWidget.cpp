@@ -503,13 +503,20 @@ void RemoteAccessWidget::updateRemoteAccessTitle()
 							:
 							  m_computerControlInterface->userFullName();
 
+	// Prefer the classroom roster name (e.g. "01 小可") over the raw computer
+	// name so the teacher sees who sits at the machine, not the directory entry.
+	const auto studentName = IkebackCore::resolveComputerName(
+		m_computerControlInterface->computer().hostName(),
+		m_computerControlInterface->computer().hostAddress().toString() );
+	const auto name = studentName.isEmpty() ? m_computerControlInterface->computerName() : studentName;
+
 	if (username.isEmpty() )
 	{
-		setWindowTitle(tr("%1 - Ikeback Remote Access").arg(m_computerControlInterface->computerName()));
+		setWindowTitle(tr("%1 - Ikeback Remote Access").arg(name));
 	}
 	else
 	{
 		setWindowTitle(tr("%1 - %2 - Ikeback Remote Access").arg(username,
-															m_computerControlInterface->computerName()));
+															name));
 	}
 }

@@ -170,3 +170,18 @@ bool ClassroomSecrets::constantTimeEquals( const QByteArray& left, const QByteAr
 	}
 	return difference == 0;
 }
+
+
+QString ClassroomSecrets::adminKeyHash( const QString& key )
+{
+	if( key.isEmpty() ) { return {}; }
+	return QString::fromLatin1(
+		QCryptographicHash::hash( key.toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+}
+
+
+bool ClassroomSecrets::verifyAdminKey( const QString& key, const QString& storedHash )
+{
+	if( storedHash.isEmpty() || key.isEmpty() ) { return false; }
+	return constantTimeEquals( adminKeyHash( key ).toLatin1(), storedHash.trimmed().toLatin1() );
+}

@@ -26,6 +26,7 @@
 #include <QMessageBox>
 #include <QPainter>
 #include <QPixmap>
+#include <QSettings>
 #include <QSystemTrayIcon>
 #include <QTimer>
 
@@ -37,6 +38,26 @@
 #include "IkebackServerInterface.h"
 
 
+//! Student installs run the classroom plugin's own tray icon (card menu).
+//! Showing the built-in tray icon as well produces two identical icons in the
+//! notification area, so the built-in one steps aside on student machines.
+static bool hideTrayIconOnStudentInstall()
+{
+#ifdef Q_OS_WIN
+	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback"),
+					   QSettings::Registry64Format );
+	if( machine.value( QStringLiteral("InstallRole") ).toString() == QStringLiteral("student") )
+	{
+		// Only when the classroom client is active - otherwise there would be
+		// no tray icon at all.
+		return IkebackCore::config().value( QStringLiteral("Enabled"),
+											QStringLiteral("Classroom"), true ).toBool();
+	}
+#endif
+	return false;
+}
+
+
 SystemTrayIcon::SystemTrayIcon( QObject* parent ) :
 	QObject( parent ),
 	m_systemTrayIconFeature( Feature( QLatin1String( staticMetaObject.className() ),
@@ -44,7 +65,7 @@ SystemTrayIcon::SystemTrayIcon( QObject* parent ) :
 									  Feature::Uid( "8e997d84-ebb9-430f-8f72-d45d9821963d" ),
 									  Feature::Uid(),
 									  tr( "System tray icon"), {}, {} ) ),
-	m_hidden(IkebackCore::config().isTrayIconHidden())
+	m_hidden(IkebackCore::config().isTrayIconHidden() || hideTrayIconOnStudentInstall())
 {
 }
 

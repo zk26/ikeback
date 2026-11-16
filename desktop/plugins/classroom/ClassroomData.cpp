@@ -27,7 +27,8 @@
 
 static QStringList classroomSecretKeys()
 {
-	return { QStringLiteral("sessionKey"), Classroom::SettingKey::aiApiKey() };
+	return { QStringLiteral("sessionKey"), Classroom::SettingKey::aiApiKey(),
+			 Classroom::SettingKey::adminKey() };
 }
 
 
@@ -111,6 +112,18 @@ QJsonObject ClassroomSettings::forStudents( const QJsonObject& object )
 	result.remove( SettingKey::aiModel() );
 	result.remove( SettingKey::aiSystemPrompt() );
 	result.remove( SettingKey::aiTimeout() );
+	// Students never see the super-admin key itself - only its SHA-256 digest
+	// which gates the protected exit and the configurator on student machines.
+	const auto adminKey = object.value( SettingKey::adminKey() ).toString();
+	result.remove( SettingKey::adminKey() );
+	if( adminKey.isEmpty() == false )
+	{
+		result.insert( SettingKey::adminKeyHash(), ClassroomSecrets::adminKeyHash( adminKey ) );
+	}
+	else
+	{
+		result.remove( SettingKey::adminKeyHash() );
+	}
 	result.insert( QStringLiteral("keyConfigured"),
 				   object.value( QStringLiteral("sessionKey") ).toString().isEmpty() == false );
 	return result;
