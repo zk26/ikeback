@@ -103,11 +103,10 @@ jobs:
           # vncEncodeZlibHex.h includes <lzo/minilzo.h>, which ships in the pinned
           # UltraVNC tree as lzo.orig/. Make it reachable as lzo/.
           cp -r desktop/3rdparty/ultravnc/lzo.orig desktop/3rdparty/ultravnc/lzo
-          # MS-Logon support lives behind AUTH_MS_LOGON_SUPPORT, but the DSM code path
-          # (DSM_SUPPORT) uses m_ms_logon / AuthMsLogon unconditionally. Drop those
-          # references instead of pulling in the whole MS-Logon stack.
-          find desktop/3rdparty/ultravnc/winvnc/winvnc -name 'vncclient.cpp' \
-            -exec perl -pi -e 's/\bm_ms_logon\b/false/g; s/\bAuthMsLogon[A-Za-z]*\([^;]*\)/(FALSE)/g' {} + || true
+          # NOTE: MS-Logon / DSM / keepalive / file-transfer code paths are cut
+          # at the source level now: the plugin defines ULTRAVNC_VEYON_SUPPORT
+          # (the exact macro set of the upstream v4.11.4 build), so no source
+          # patching for m_ms_logon / AuthMsLogon / m_pref_* is needed anymore.
           grep -rn 'define VNCLOG' desktop/3rdparty/ultravnc/winvnc/ | head -8 | while IFS= read -r line; do
             echo "::notice::VNCLOG ${line}"
           done || true

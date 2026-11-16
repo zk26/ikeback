@@ -102,7 +102,16 @@ target_include_directories(builtin-ultravnc-server PRIVATE
 	)
 
 target_compile_definitions(builtin-ultravnc-server PRIVATE
-	ULTRAVNC_IKEBACK_SUPPORT
+	# The cloned UltraVNC sources gate every Veyon-integration change behind
+	# ULTRAVNC_VEYON_SUPPORT (the upstream macro name, kept verbatim in the
+	# third-party sources). Without it the standalone-winvnc code paths are
+	# compiled instead: MS-Logon, DSM, keepalive, file transfer (with MSVC-only
+	# __try/__except) and the ini persistence of undeclared m_pref_* members -
+	# exactly the errors every previous build died of. This is the exact macro
+	# set of the upstream v4.11.4 ultravnc-builtin plugin; do not add
+	# DSM_SUPPORT / FILETRANSFER_SUPPORT / KEEP_ALIVE_SUPPORT / _CLOUD:
+	# they only enable code whose declarations do not exist in this tree.
+	ULTRAVNC_VEYON_SUPPORT
 	_VCPKG
 	_INTERNALLIB
 	_USE_DESKTOPDUPLICATION
@@ -112,13 +121,6 @@ target_compile_definitions(builtin-ultravnc-server PRIVATE
 	GWL_HINSTANCE=GWLP_HINSTANCE
 	GWL_ID=GWLP_ID
 	GWL_USERDATA=GWLP_USERDATA
-	# SettingsManager.cpp uses these members unconditionally while its header
-	# only declares them behind feature guards. Define the guards so the class
-	# matches its implementation (Veyon's own Windows build does the same).
-	DSM_SUPPORT
-	FILETRANSFER_SUPPORT
-	KEEP_ALIVE_SUPPORT
-	_CLOUD
 )
 
 if(IKEBACK_BUILD_WIN64)
