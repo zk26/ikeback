@@ -2004,6 +2004,7 @@ void ClassroomMasterDialog::advanceDeploy()
 		break;
 
 	case DeployPhase::RebootAfterEnable:
+	{
 		if( ++m_deployWaitTicks < 3 )
 		{
 			setToolStatus( tr( "远程装软件 [7/7]：等待 UWF 配置生效..." ) );
@@ -2013,6 +2014,7 @@ void ClassroomMasterDialog::advanceDeploy()
 		const auto summary = m_deployInstallSummary.isEmpty() ? installSummaryText() : m_deployInstallSummary;
 		finishDeploy( summary + tr( "；UWF 还原已恢复，学生机将再次重启。" ) );
 		break;
+	}
 
 	case DeployPhase::Idle:
 		break;
