@@ -18,6 +18,7 @@
 #include "ClassroomConfiguration.h"
 #include "ClassroomData.h"
 #include "ClassroomConfigurationPage.h"
+#include "Filesystem.h"
 #include "IkebackCore.h"
 #include "Configuration/UiMapping.h"
 
