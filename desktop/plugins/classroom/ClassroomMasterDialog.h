@@ -12,6 +12,7 @@
 #include <QJsonObject>
 #include <QMap>
 #include <QPair>
+#include <QSet>
 #include <QSharedPointer>
 #include <QString>
 #include <QStringList>
@@ -24,8 +25,10 @@
 class QCheckBox;
 class QComboBox;
 class QDateEdit;
+class QDialog;
 class QFile;
 class QLabel;
+class QProgressBar;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
@@ -81,6 +84,11 @@ public:
 	void startCheckInFromToolBar() { startCheckIn(); }
 
 	void showCall( const QString& ip, const QString& seat, const QString& student );
+	//! 名册文件被配置器更新后重新加载并同步到所有界面。
+	void reloadRoster();
+	//! 学生自助签到后刷新教师端座位表/状态。
+	void recordStudentIdentity( const QString& className, const QString& seat,
+								const QString& student, bool loggedIn );
 	void syncNow();
 	//! Probes the local ikeback server port and the mobile bridge so "the
 	//! computer cannot be reached" turns into an actionable message instead of
@@ -90,6 +98,8 @@ public:
 	void restartService();
 	//! Asks for an installer and pushes it to the students (remote install).
 	void deployInstaller();
+	//! 学生机真实安装回执，用于替代定时器误报完成。
+	void recordInstallResult( const QString& ip, bool success, const QString& detail );
 	//! 5.2.2: compact dialog with teacher operations and their results
 	//! ("did my protection command actually succeed?").
 	void openOperationLog();
@@ -120,6 +130,7 @@ private:
 	void setupMonitorTab();
 	void setupSystemTab();
 	void setupSeatTab();
+	void replayIdentityEvents();
 	void refreshSeatGrid();
 	void refreshUwfStatus();
 	//! 5.2.0 teacher-side parity with the phone: timetable + per-lesson scoring.
@@ -136,7 +147,14 @@ private:
 	void setUwfFilter( bool enabled );
 	void applyFuzzyRules( const QString& key, const QString& text );
 	void openOnTargets( bool website, const QString& target );
-	void scoreWholeClass( int delta );
+	//! 弹出关键字编辑框：命中关键字即拦截应用/网址。
+	void showKeywordDialog( bool websites );
+	//! 多行批量下发程序/网址。
+	void showBatchOpenDialog( bool websites );
+	//! 全部加分/减分：先选分数并填写原因，再下发。
+	void showWholeClassScoreDialog( bool add );
+	void scoreWholeClass( int delta, const QString& reason = QString{} );
+	void setDeployProgress( const QString& stage, int percent );
 	void startCheckIn();
 	void refreshCheckIn();
 
@@ -154,6 +172,7 @@ private:
 		RebootAfterEnable
 	};
 	void advanceDeploy();
+	QString installSummaryText() const;
 	void finishDeploy( const QString& result );
 
 	QString dataDirectory() const;
@@ -316,4 +335,13 @@ private:
 	bool m_deployUwfFlow = false;
 	DeployPhase m_deployPhase = DeployPhase::Idle;
 	int m_deployWaitTicks = 0;
+	int m_deployExpected = 0;
+	int m_deploySuccess = 0;
+	int m_deployFailure = 0;
+	QSet<QString> m_deployReported;
+	QString m_deployInstallSummary;
+	//! 安装期间显示的进度弹窗：窗口模态，禁止教师误操作其他设置。
+	QDialog* m_deployProgressDialog = nullptr;
+	QLabel* m_deployProgressLabel = nullptr;
+	QProgressBar* m_deployProgressBar = nullptr;
 };

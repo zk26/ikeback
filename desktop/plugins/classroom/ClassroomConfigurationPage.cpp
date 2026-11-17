@@ -5,14 +5,20 @@
  */
 
 #include <QCheckBox>
+#include <QDir>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QSpinBox>
 
 #include "ClassroomConfiguration.h"
+#include "ClassroomData.h"
 #include "ClassroomConfigurationPage.h"
+#include "IkebackCore.h"
 #include "Configuration/UiMapping.h"
 
 
@@ -20,7 +26,7 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 	ConfigurationPage( parent ),
 	m_configuration( configuration )
 {
-	setWindowTitle( QStringLiteral("ikeback") );
+	setWindowTitle( Classroom::productName() );
 	setWindowIcon( QIcon( QStringLiteral(":/core/icon32.png") ) );
 
 	auto* form = new QFormLayout( this );
@@ -35,44 +41,68 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 		return widget;
 	};
 
-	m_enabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable classroom features" ), this ) ) );
-	m_dataDirectory = qobject_cast<QLineEdit*>( addRow( tr( "Data directory:" ), new QLineEdit( this ) ) );
-	m_sessionKey = qobject_cast<QLineEdit*>( addRow( tr( "Connection key:" ), new QLineEdit( this ) ) );
+	m_enabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用班级管理功能" ), this ) ) );
+	m_dataDirectory = qobject_cast<QLineEdit*>( addRow( tr( "数据目录：" ), new QLineEdit( this ) ) );
+	m_sessionKey = qobject_cast<QLineEdit*>( addRow( tr( "课堂密钥（开始上课用）：" ), new QLineEdit( this ) ) );
 	m_sessionKey->setEchoMode( QLineEdit::Password );
-	m_exitProtection = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Protect the client against being closed" ), this ) ) );
-	m_exitRequiresAdmin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Require administrator credentials to exit" ), this ) ) );
-	m_exitAdminUsername = qobject_cast<QLineEdit*>( addRow( tr( "Administrator account:" ), new QLineEdit( this ) ) );
-	m_allowSelfLogin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Allow students to sign in themselves" ), this ) ) );
+	m_exitProtection = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "保护学生端不被关闭" ), this ) ) );
+	m_exitRequiresAdmin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "退出时需要管理员凭据" ), this ) ) );
+	m_exitAdminUsername = qobject_cast<QLineEdit*>( addRow( tr( "管理员账户：" ), new QLineEdit( this ) ) );
+	m_allowSelfLogin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "允许学生自行签到登录" ), this ) ) );
 
-	form->addRow( new QLabel( tr( "AI assistant" ), this ) );
-	m_aiEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable AI assistant" ), this ) ) );
-	m_aiEndpoint = qobject_cast<QLineEdit*>( addRow( tr( "Local or network API endpoint:" ), new QLineEdit( this ) ) );
-	m_aiApiKey = qobject_cast<QLineEdit*>( addRow( tr( "API key (optional):" ), new QLineEdit( this ) ) );
+	auto* importRosterButton = new QPushButton( tr( "批量导入名单（座位号 + 姓名）" ), this );
+	addWidget( importRosterButton );
+	connect( importRosterButton, &QPushButton::clicked, this, [this]() {
+		const auto path = QFileDialog::getOpenFileName(
+			this, tr( "批量导入学生名单" ), {},
+			tr( "表格文件 (*.csv *.txt *.tsv);;所有文件 (*)" ) );
+		if( path.isEmpty() ) { return; }
+		const auto dataDirectory = IkebackCore::filesystem().expandPath( m_configuration.dataDirectory() );
+		QDir().mkpath( dataDirectory );
+		ClassroomRoster roster( dataDirectory );
+		ClassroomImportReport report;
+		QString error;
+		if( roster.importTableFile( path, {}, &report, &error ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(),
+								  error.isEmpty() ? tr( "未能从该文件导入任何学生。" ) : error );
+			return;
+		}
+		roster.save();
+		QMessageBox::information( this, windowTitle(),
+								  tr( "导入完成：%1 个班级，%2 名学生。" )
+									.arg( report.classes ).arg( report.students ) );
+	} );
+
+	form->addRow( new QLabel( tr( "AI 助手" ), this ) );
+	m_aiEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用 AI 助手" ), this ) ) );
+	m_aiEndpoint = qobject_cast<QLineEdit*>( addRow( tr( "API 地址：" ), new QLineEdit( this ) ) );
+	m_aiApiKey = qobject_cast<QLineEdit*>( addRow( tr( "API 密钥（可选）：" ), new QLineEdit( this ) ) );
 	m_aiApiKey->setEchoMode( QLineEdit::Password );
-	m_aiModel = qobject_cast<QLineEdit*>( addRow( tr( "Model:" ), new QLineEdit( this ) ) );
-	m_aiSystemPrompt = qobject_cast<QLineEdit*>( addRow( tr( "System prompt:" ), new QLineEdit( this ) ) );
-	m_aiTimeout = qobject_cast<QSpinBox*>( addRow( tr( "Timeout (seconds):" ), new QSpinBox( this ) ) );
+	m_aiModel = qobject_cast<QLineEdit*>( addRow( tr( "模型：" ), new QLineEdit( this ) ) );
+	m_aiSystemPrompt = qobject_cast<QLineEdit*>( addRow( tr( "系统提示词：" ), new QLineEdit( this ) ) );
+	m_aiTimeout = qobject_cast<QSpinBox*>( addRow( tr( "超时（秒）：" ), new QSpinBox( this ) ) );
 	m_aiTimeout->setRange( 5, 600 );
 
-	form->addRow( new QLabel( tr( "Behaviour monitoring" ), this ) );
-	m_monitoringEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Record active windows and applications" ), this ) ) );
-	m_captureInterval = qobject_cast<QSpinBox*>( addRow( tr( "Sampling interval (seconds):" ), new QSpinBox( this ) ) );
+	form->addRow( new QLabel( tr( "行为监控" ), this ) );
+	m_monitoringEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "记录活动窗口和应用程序" ), this ) ) );
+	m_captureInterval = qobject_cast<QSpinBox*>( addRow( tr( "采样间隔（秒）：" ), new QSpinBox( this ) ) );
 	m_captureInterval->setRange( 1, 300 );
-	m_retentionDays = qobject_cast<QSpinBox*>( addRow( tr( "Log retention (days):" ), new QSpinBox( this ) ) );
+	m_retentionDays = qobject_cast<QSpinBox*>( addRow( tr( "日志保留天数：" ), new QSpinBox( this ) ) );
 	m_retentionDays->setRange( 1, 3650 );
 
-	form->addRow( new QLabel( tr( "Scoring, devices and bridge" ), this ) );
-	m_scoreBaseScore = qobject_cast<QSpinBox*>( addRow( tr( "Base score:" ), new QSpinBox( this ) ) );
+	form->addRow( new QLabel( tr( "评分、设备与手机桥接" ), this ) );
+	m_scoreBaseScore = qobject_cast<QSpinBox*>( addRow( tr( "基础分：" ), new QSpinBox( this ) ) );
 	m_scoreBaseScore->setRange( 0, 10000 );
-	m_uwfEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable UWF integration" ), this ) ) );
-	m_internetGuard = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable InternetGuard (WFP)" ), this ) ) );
-	m_usbInputBlock = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Block USB input while locking" ), this ) ) );
-	m_bridgePort = qobject_cast<QSpinBox*>( addRow( tr( "Mobile bridge port:" ), new QSpinBox( this ) ) );
+	m_uwfEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用 UWF 写保护集成" ), this ) ) );
+	m_internetGuard = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用网络防护（WFP）" ), this ) ) );
+	m_usbInputBlock = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "锁定时禁用 USB 输入" ), this ) ) );
+	m_bridgePort = qobject_cast<QSpinBox*>( addRow( tr( "手机桥接端口：" ), new QSpinBox( this ) ) );
 	m_bridgePort->setRange( 1024, 65535 );
-	m_bridgeEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable mobile bridge" ), this ) ) );
-	m_syncEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "Enable automatic LAN sync" ), this ) ) );
-	m_silencePageText = qobject_cast<QLineEdit*>( addRow( tr( "Silence page text:" ), new QLineEdit( this ) ) );
-	m_wordCloudStopWords = qobject_cast<QLineEdit*>( addRow( tr( "Extra word cloud stop words:" ), new QLineEdit( this ) ) );
+	m_bridgeEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用手机桥接" ), this ) ) );
+	m_syncEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用局域网自动同步" ), this ) ) );
+	m_silencePageText = qobject_cast<QLineEdit*>( addRow( tr( "肃静页文字：" ), new QLineEdit( this ) ) );
+	m_wordCloudStopWords = qobject_cast<QLineEdit*>( addRow( tr( "词云额外停用词：" ), new QLineEdit( this ) ) );
 
 	Configuration::UiMapping::setFlags( this, Configuration::Property::Flag::Standard );
 }

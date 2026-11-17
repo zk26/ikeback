@@ -20,6 +20,7 @@
 #include <QDesktopServices>
 #include <QDialog>
 #include <QFileInfo>
+#include <QFileSystemWatcher>
 #include <QDialogButtonBox>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -132,8 +133,8 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 									tr( "操作记录" ), {},
 									tr( "查看教师操作的执行结果（保护、UWF、静音、远程安装等）" ),
 									QStringLiteral(":/core/document-edit.png") ) ),
-	m_features( { m_consoleFeature, m_clientFeature, m_signInFeature, m_signOutFeature,
-				  m_quickToolsFeature, m_checkInFeature, m_operationLogFeature } ),
+	// iKeback / 注销 / 常用工具 不再注册为可用功能，命令行和快捷键也无法触发。
+	m_features( { m_clientFeature, m_signInFeature, m_checkInFeature, m_operationLogFeature } ),
 	m_hostName( QHostInfo::localHostName() )
 {
 	m_ipAddress = localIpAddress();
@@ -146,6 +147,11 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 		IkebackCore::setComputerNameResolver(
 			[this]( const QString& hostName, const QString& hostAddress ) {
 				const auto ip = hostAddress.trimmed();
+				// 优先使用学生刚上报的实时身份，名册 IP 过期时也不会退回目录名。
+				const auto liveName = m_studentDisplayByIp.value( ip );
+				if( liveName.isEmpty() == false ) { return liveName; }
+				const auto liveByHost = m_studentDisplayByIp.value( hostName.trimmed() );
+				if( liveByHost.isEmpty() == false ) { return liveByHost; }
 				for( const auto& classValue : roster()->toJsonArray() )
 				{
 					for( const auto& studentValue : classValue.toObject().value( QStringLiteral("students") ).toArray() )
@@ -153,13 +159,37 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 						const auto student = studentValue.toObject();
 						const auto studentIp = student.value( QStringLiteral("ip") ).toString();
 						if( studentIp.isEmpty() || ( studentIp != ip && studentIp != hostName ) ) { continue; }
-						return QStringLiteral("%1 %2")
+						const auto label = QStringLiteral("%1 %2")
 							.arg( student.value( QStringLiteral("seat") ).toString(),
 								  student.value( QStringLiteral("name") ).toString() ).trimmed();
+						return label.isEmpty() ? QString{} : QStringLiteral("座位 %1").arg( label );
 					}
+				}
+				// 本机（教师机）没有名册条目时不再显示 Administrator/主机名。
+				if( hostName.compare( m_hostName, Qt::CaseInsensitive ) == 0 ||
+					( ip.isEmpty() == false && ip == localIpAddress() ) )
+				{
+					return QStringLiteral("教师机");
 				}
 				return QString{};
 			} );
+
+		// 配置器里批量导入名册后，教师端无需重启即可看到新名单。
+		m_rosterWatcher = new QFileSystemWatcher( this );
+		const auto rosterPath = roster()->filePath();
+		QDir().mkpath( QFileInfo( rosterPath ).absolutePath() );
+		if( QFileInfo::exists( rosterPath ) == false ) { roster()->save(); }
+		m_rosterWatcher->addPath( rosterPath );
+		connect( m_rosterWatcher, &QFileSystemWatcher::fileChanged, this,
+				 [this]( const QString& path ) {
+					 if( m_rosterWatcher->files().contains( path ) == false )
+					 {
+						 m_rosterWatcher->addPath( path );
+					 }
+					 roster()->load();
+					 if( m_dialog ) { m_dialog->reloadRoster(); }
+				 } );
+
 		startDiscoveryListener();
 	}
 }
@@ -196,22 +226,28 @@ void ClassroomPlugin::buildQuickActionFeatures()
 		  ":/classroom/icons/shield.png" },
 		{ "uwf.toggle", "UWF", "点一下切换 Windows 写保护（装软件前先关闭）",
 		  ":/classroom/icons/lock.png" },
-		{ "gateway.toggle", "外网", "点一下切换学生机外网访问",
+		{ "gateway.disable", "禁用网关", "断开学生机外网访问（保留教师机）",
+		  ":/classroom/icons/globe.png" },
+		{ "gateway.enable", "启用网关", "恢复学生机外网访问",
 		  ":/classroom/icons/globe.png" },
 		{ "silence.toggle", "肃静页", "点一下显示或收起肃静页面",
 		  ":/classroom/icons/silence.png" },
-		{ "appblock.toggle", "禁用应用", "有规则时应用，再点一下解除",
+		{ "appblock.toggle", "禁用应用", "添加关键字，命中即拦截程序",
 		  ":/classroom/icons/block-app.png" },
-		{ "webblock.toggle", "禁用网址", "有规则时应用，再点一下解除",
+		{ "webblock.toggle", "禁用网址", "添加关键字，命中即拦截网址",
 		  ":/classroom/icons/block-web.png" },
 		{ "mute.toggle", "静音", "点一下切换学生机静音",
 		  ":/classroom/icons/mute.png" },
-		{ "score.p1", "全班 +1", "给全班每人加 1 分",
+		{ "score.p1", "全部加分", "给全班每人加分（填写分数与原因）",
 		  ":/classroom/icons/plus.png" },
-		{ "score.m1", "全班 -1", "给全班每人减 1 分",
+		{ "score.m1", "全部减分", "给全班每人减分（填写分数与原因）",
 		  ":/classroom/icons/minus.png" },
 		{ "remote.install", "远程装软件", "选择安装包后下发到学生机安装",
 		  ":/classroom/icons/install.png" },
+		{ "batch.programs", "批量打开程序", "一次填写多个学生机程序路径并批量下发",
+		  ":/core/document-open.png" },
+		{ "batch.websites", "批量打开网页", "一次填写多个网址并批量下发",
+		  ":/core/document-open.png" },
 	};
 
 	int index = 0;
@@ -526,7 +562,7 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 	{
 		const auto classNames = roster()->classNames();
 		const auto currentClass = settings()->object().value( QStringLiteral("className") ).toString();
-		ClassroomSignInDialog dialog( classNames, currentClass, master.mainWindow() );
+		ClassroomSignInDialog dialog( classNames, currentClass, roster()->toJsonArray(), master.mainWindow() );
 		if( dialog.exec() != QDialog::Accepted ) { return true; }
 
 		auto message = Classroom::message( Command::SetIdentity );
@@ -822,6 +858,8 @@ bool ClassroomPlugin::handleFeatureMessageFromWorker( IkebackServerInterface& se
 	switch( message.command<Command>() )
 	{
 	case Command::ReportEvent:
+	case Command::ReportIdentity:
+	case Command::InstallResult:
 	case Command::QueryScore:
 	case Command::CallTeacher:
 	case Command::CheckInReply:
@@ -912,6 +950,62 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 		event.ip = message.argument( Argument::Ip ).toString();
 		event.host = message.argument( Argument::Host ).toString();
 		store()->append( event );
+		return true;
+	}
+
+	if( command == Command::InstallResult )
+	{
+		const auto ok = message.argument( Argument::Result ).toString() == QStringLiteral("ok");
+		if( m_dialog )
+		{
+			m_dialog->recordInstallResult( message.argument( Argument::Ip ).toString(),
+										   ok, message.argument( Argument::Detail ).toString() );
+		}
+		ClassroomEvent event;
+		event.timestamp = QDateTime::currentDateTime();
+		event.className = message.argument( Argument::ClassName ).toString();
+		event.seat = message.argument( Argument::Seat ).toString();
+		event.student = message.argument( Argument::Student ).toString();
+		event.ip = message.argument( Argument::Ip ).toString();
+		event.host = message.argument( Argument::Host ).toString();
+		event.type = EventType::install();
+		event.detail = QStringLiteral("install result %1: %2 (%3)")
+						   .arg( ok ? QStringLiteral("ok") : QStringLiteral("failed"),
+								 message.argument( Argument::SoftwarePath ).toString(),
+								 message.argument( Argument::Detail ).toString() );
+		store()->append( event );
+		Q_EMIT eventReceived();
+		return true;
+	}
+
+	// 学生自助签到后主动上报身份，教师端名单/座位表立即同步。
+	if( command == Command::ReportIdentity )
+	{
+		const auto loggedIn = message.argument( Argument::Enabled ).toBool( true );
+		ClassroomEvent event;
+		event.timestamp = QDateTime::currentDateTime();
+		event.className = message.argument( Argument::ClassName ).toString();
+		event.seat = message.argument( Argument::Seat ).toString();
+		event.student = message.argument( Argument::Student ).toString();
+		event.ip = message.argument( Argument::Ip ).toString();
+		event.host = message.argument( Argument::Host ).toString();
+		event.type = loggedIn ? EventType::assign() : EventType::logout();
+		event.detail = loggedIn ? QStringLiteral("student self signed in")
+								: QStringLiteral("student signed out");
+		const auto display = loggedIn ?
+			QStringLiteral("座位 %1 %2").arg( event.seat, event.student ).trimmed() : QString{};
+		for( const auto& key : QStringList{ event.ip, event.host } )
+		{
+			if( key.trimmed().isEmpty() ) { continue; }
+			if( loggedIn ) { m_studentDisplayByIp.insert( key.trimmed(), display ); }
+			else { m_studentDisplayByIp.remove( key.trimmed() ); }
+		}
+		store()->append( event );
+		if( m_dialog )
+		{
+			m_dialog->recordStudentIdentity( event.className, event.seat, event.student, loggedIn );
+		}
+		Q_EMIT eventReceived();
 		return true;
 	}
 
@@ -1006,6 +1100,16 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 				 m_student = student;
 				 if( loggedIn == false ) { m_sessionId.clear(); }
 				 updateTrayTooltip();
+				 // 教师端直接看到学生自助签到结果。
+				 if( m_worker == nullptr ) { return; }
+				 auto report = Classroom::message( Command::ReportIdentity );
+				 report.addArgument( Argument::ClassName, m_className )
+					   .addArgument( Argument::Seat, seat )
+					   .addArgument( Argument::Student, student )
+					   .addArgument( Argument::Enabled, loggedIn )
+					   .addArgument( Argument::Host, m_hostName )
+					   .addArgument( Argument::Ip, m_ipAddress );
+				 m_worker->sendFeatureMessageReply( report );
 			 } );
 	connect( m_clientWidget, &ClassroomClientWidget::quitAuthorized, this, [this]() {
 		if( m_worker ) { m_worker->sendFeatureMessageReply( Classroom::message( Command::RequestQuit ) ); }
@@ -1073,11 +1177,9 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 				 reportEvent( browser ? EventType::webBlock() : EventType::appBlock(),
 							  QStringLiteral("fuzzy rule '%1' matched: %2").arg( rule, title ), app );
 #ifdef Q_OS_WIN
-				 // User-mode enforcement only: no driver, no injection. A matched
-				 // app/browser is simply terminated and reported to the teacher.
-				 // Short rules never reach this point (ClassroomMonitor
-				 // drops them), but keep the guard here as well.
-				 if( app.size() >= 4 && rule.size() >= 4 )
+				 // 应用规则命中才终止进程；网址规则已在学生端关闭当前标签页，
+				 // 不再 taskkill 整个浏览器，避免误杀其他标签页。
+				 if( browser == false && app.size() >= 2 && rule.size() >= 2 )
 				 {
 					 const auto image = app.contains( QLatin1Char('.') ) ? app : app + QStringLiteral(".exe");
 					 QProcess::startDetached( QStringLiteral("taskkill"),
@@ -1232,6 +1334,7 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 	case Command::ForceLogout:
 		m_clientWidget->clearIdentity();
 		m_clientWidget->setLocked( false );
+		m_clientWidget->setInputLocked( false );
 		reportEvent( EventType::logout(), message.argument( Argument::Reason ).toString(), {} );
 		m_seat.clear();
 		m_student.clear();
@@ -1239,10 +1342,14 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 
 	case Command::LockClient:
 	case Command::UnlockClient:
-		m_clientWidget->setLocked( message.command<Command>() == Command::LockClient );
-		reportEvent( message.command<Command>() == Command::LockClient ? EventType::lock() : EventType::unlock(),
+	{
+		const auto locked = message.command<Command>() == Command::LockClient;
+		m_clientWidget->setLocked( locked );
+		m_clientWidget->setInputLocked( locked );
+		reportEvent( locked ? EventType::lock() : EventType::unlock(),
 					 QStringLiteral("client lock changed by teacher"), {} );
 		break;
+	}
 
 	case Command::ToggleAi:
 	{
@@ -1404,20 +1511,61 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 		extraArgs = message.argument( Argument::SoftwareArgs ).toString().split(
 			QLatin1Char(' '), QString::SkipEmptyParts );
 #endif
-		bool started = false;
+		const auto fileName = QFileInfo( stagedPath ).fileName();
+		const auto reportInstall = [this, fileName]( bool ok, const QString& detail ) {
+			if( m_worker == nullptr ) { return; }
+			auto reply = Classroom::message( Command::InstallResult );
+			reply.addArgument( Argument::Result, ok ? QStringLiteral("ok") : QStringLiteral("failed") )
+				 .addArgument( Argument::Detail, detail )
+				 .addArgument( Argument::SoftwarePath, fileName )
+				 .addArgument( Argument::Host, m_hostName )
+				 .addArgument( Argument::Ip, m_ipAddress );
+			m_worker->sendFeatureMessageReply( reply );
+		};
+
+		if( m_installProcess )
+		{
+			m_installProcess->deleteLater();
+			m_installProcess = nullptr;
+		}
+		QString program;
+		QStringList args;
 		if( stagedPath.endsWith( QStringLiteral(".msi"), Qt::CaseInsensitive ) )
 		{
-			QStringList args{ QStringLiteral("/i"), stagedPath, QStringLiteral("/quiet"),
-							  QStringLiteral("/norestart") };
-			args.append( extraArgs );
-			started = QProcess::startDetached( QStringLiteral("msiexec.exe"), args );
+			program = QStringLiteral("msiexec.exe");
+			args = QStringList{ QStringLiteral("/i"), stagedPath, QStringLiteral("/quiet"),
+								QStringLiteral("/norestart") };
 		}
 		else
 		{
-			QStringList args{ QStringLiteral("/VERYSILENT"), QStringLiteral("/SUPPRESSMSGBOXES"),
-							  QStringLiteral("/NORESTART"), QStringLiteral("/S") };
-			args.append( extraArgs );
-			started = QProcess::startDetached( stagedPath, args );
+			program = stagedPath;
+			args = QStringList{ QStringLiteral("/VERYSILENT"), QStringLiteral("/SUPPRESSMSGBOXES"),
+								QStringLiteral("/NORESTART"), QStringLiteral("/S") };
+		}
+		args.append( extraArgs );
+
+		auto* process = new QProcess( this );
+		m_installProcess = process;
+		connect( process, QOverload<int, QProcess::ExitStatus>::of( &QProcess::finished ),
+				 this, [this, process, reportInstall]( int exitCode, QProcess::ExitStatus status ) {
+					 reportInstall( status == QProcess::NormalExit && exitCode == 0,
+									QStringLiteral("exit=%1").arg( exitCode ) );
+					 if( m_installProcess == process )
+					 {
+						 m_installProcess = nullptr;
+						 process->deleteLater();
+					 }
+				 } );
+		process->start( program, args );
+		const auto started = process->waitForStarted( 10000 );
+		if( started == false )
+		{
+			reportInstall( false, process->errorString() );
+			if( m_installProcess == process )
+			{
+				m_installProcess = nullptr;
+				process->deleteLater();
+			}
 		}
 		reportEvent( EventType::install(),
 					 started ? QStringLiteral("installer launched: %1").arg( stagedPath )

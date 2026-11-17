@@ -45,6 +45,7 @@
 #include <QPair>
 #include <QPlainTextEdit>
 #include <QProcess>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QTcpSocket>
 #include <QScrollArea>
@@ -141,6 +142,8 @@ ClassroomMasterDialog::ClassroomMasterDialog( IkebackMasterInterface& master,
 		qWarning( "ikeback: could not migrate legacy settings.json secrets" );
 	}
 	currentSessionId();
+	// 控制台晚于学生签到打开时，从事件日志回放最近一周的身份状态。
+	replayIdentityEvents();
 	refreshRosterTable();
 	m_scorePanel->setClassName( currentClassName() );
 	if( m_bridge ) { m_bridge->setClassName( currentClassName() ); }
@@ -245,22 +248,12 @@ QStringList ClassroomMasterDialog::onlineIps() const
 QStringList ClassroomMasterDialog::selectedIps() const
 {
 	QStringList ips;
+	// 没选学生时返回空列表，绝不能悄悄退回“全班”，否则批量操作会误伤。
 	const auto selected = m_rosterTable->selectionModel()->selectedRows();
-	if( selected.isEmpty() )
+	for( const auto& index : selected )
 	{
-		for( int row = 0; row < m_rosterTable->rowCount(); ++row )
-		{
-			const auto* item = m_rosterTable->item( row, 2 );
-			if( item && item->text().trimmed().isEmpty() == false ) { ips.append( item->text().trimmed() ); }
-		}
-	}
-	else
-	{
-		for( const auto& index : selected )
-		{
-			const auto* item = m_rosterTable->item( index.row(), 2 );
-			if( item && item->text().trimmed().isEmpty() == false ) { ips.append( item->text().trimmed() ); }
-		}
+		const auto* item = m_rosterTable->item( index.row(), 2 );
+		if( item && item->text().trimmed().isEmpty() == false ) { ips.append( item->text().trimmed() ); }
 	}
 	return ips;
 }
@@ -1636,8 +1629,72 @@ void ClassroomMasterDialog::showCall( const QString& ip, const QString& seat, co
 	if( m_scorePanel ) { m_scorePanel->showCall( ip, seat, student ); }
 	if( m_systemStatus )
 	{
-		m_systemStatus->setText( tr( "Call from %1 (%2, seat %3)" ).arg( student, ip, seat ) );
+		m_systemStatus->setText( tr( "来自 %1 的呼叫（%2，座位 %3）" ).arg( student, ip, seat ) );
 	}
+}
+
+
+void ClassroomMasterDialog::recordStudentIdentity( const QString& className, const QString& seat,
+												   const QString& student, bool loggedIn )
+{
+	if( className.isEmpty() == false && m_classCombo )
+	{
+		const auto index = m_classCombo->findText( className );
+		if( index >= 0 ) { m_classCombo->setCurrentIndex( index ); }
+	}
+	if( loggedIn == false )
+	{
+		m_checkInNames.remove( seat );
+		m_checkInTimes.remove( seat );
+	}
+	else
+	{
+		m_checkInNames.insert( seat, student );
+		m_checkInTimes.insert( seat, QDateTime::currentDateTime() );
+	}
+	refreshCheckIn();
+	refreshSeatGrid();
+	if( m_systemStatus )
+	{
+		m_systemStatus->setText( loggedIn ?
+			tr( "%1 已在座位 %2 签到" ).arg( student, seat ) :
+			tr( "座位 %1 的学生已退出登录" ).arg( seat ) );
+	}
+}
+
+
+void ClassroomMasterDialog::replayIdentityEvents()
+{
+	const auto events = m_store.load( QDate::currentDate().addDays( -7 ), QDate::currentDate() );
+	for( const auto& event : events )
+	{
+		if( event.seat.isEmpty() ) { continue; }
+		if( event.type == EventType::assign() )
+		{
+			m_checkInNames.insert( event.seat, event.student );
+			m_checkInTimes.insert( event.seat, event.timestamp );
+		}
+		else if( event.type == EventType::logout() )
+		{
+			m_checkInNames.remove( event.seat );
+			m_checkInTimes.remove( event.seat );
+		}
+	}
+}
+
+
+void ClassroomMasterDialog::reloadRoster()
+{
+	m_roster.load();
+	refreshRosterTable();
+	refreshStatus();
+	if( m_scorePanel ) { m_scorePanel->setClassName( currentClassName() ); }
+	if( m_bridge ) { m_bridge->setClassName( currentClassName() ); }
+	if( m_seatGrid ) { m_seatGrid->setClassName( currentClassName() ); }
+	refreshCheckIn();
+	refreshSeatGrid();
+	pushRoster();
+	setToolStatus( tr( "名册已更新，已同步到全部学生机。" ) );
 }
 
 
@@ -1745,6 +1802,11 @@ void ClassroomMasterDialog::deployInstaller()
 		QMessageBox::information( this, windowTitle(), tr( "已有一次远程安装正在进行，请等待其完成。" ) );
 		return;
 	}
+	if( m_toolScope && m_toolScope->currentIndex() == 1 && selectedIps().isEmpty() )
+	{
+		QMessageBox::information( this, windowTitle(), tr( "请先在名单中选择要安装的学生机。" ) );
+		return;
+	}
 
 	const auto path = QFileDialog::getOpenFileName(
 		this, tr( "选择要下发安装的软件包" ), QString{},
@@ -1792,6 +1854,39 @@ void ClassroomMasterDialog::deployInstaller()
 	m_deployUwfFlow = uwfCheck->isChecked();
 	m_deployWaitTicks = 0;
 	if( m_toolScope ) { m_toolScope->setCurrentIndex( scope->currentIndex() ); }
+	m_deployExpected = toolTargets().size();
+	m_deploySuccess = 0;
+	m_deployFailure = 0;
+	m_deployReported.clear();
+	m_deployInstallSummary.clear();
+
+	// 安装期间弹出不可关闭的进度窗口（窗口模态）：看得到阶段，且无法误操作其他设置。
+	m_deployProgressDialog = new QDialog( this );
+	m_deployProgressDialog->setWindowTitle( tr( "远程安装进度" ) );
+	// 应用级模态：安装完成前整个教师端都不能操作，避免中途改设置打断流程。
+	m_deployProgressDialog->setWindowModality( Qt::ApplicationModal );
+	m_deployProgressDialog->setWindowFlags( m_deployProgressDialog->windowFlags() & ~Qt::WindowCloseButtonHint );
+	m_deployProgressDialog->setMinimumWidth( 440 );
+	auto* progressLayout = new QVBoxLayout( m_deployProgressDialog );
+	m_deployProgressLabel = new QLabel( tr( "准备安装..." ), m_deployProgressDialog );
+	m_deployProgressLabel->setWordWrap( true );
+	m_deployProgressBar = new QProgressBar( m_deployProgressDialog );
+	m_deployProgressBar->setRange( 0, 100 );
+	m_deployProgressBar->setValue( 0 );
+	auto* progressHint = new QLabel( tr( "安装非常重要：请等待全部学生机完成，期间请勿关闭教师端或操作其他按钮。" ),
+									 m_deployProgressDialog );
+	progressHint->setWordWrap( true );
+	progressHint->setStyleSheet( QStringLiteral("color:#c0392b; font-weight:bold;") );
+	progressLayout->addWidget( m_deployProgressLabel );
+	progressLayout->addWidget( m_deployProgressBar );
+	progressLayout->addWidget( progressHint );
+	m_deployProgressDialog->show();
+	m_deployProgressDialog->raise();
+	connect( m_deployProgressDialog, &QObject::destroyed, this, [this]() {
+		m_deployProgressDialog = nullptr;
+		m_deployProgressLabel = nullptr;
+		m_deployProgressBar = nullptr;
+	} );
 
 	// The whole install runs through OUR feature channel (chunked file
 	// transfer + local silent install) instead of the old StartApp with a
@@ -1837,6 +1932,12 @@ void ClassroomMasterDialog::advanceDeploy()
 		const auto online = onlineIps().size();
 		setToolStatus( tr( "远程装软件 [3/7]：等待学生机上线（当前 %1 台在线）..." ).arg( online ) );
 		++m_deployWaitTicks;
+		// 超时仍无学生上线时直接判失败，不再继续走完流程谎报成功。
+		if( m_deployWaitTicks >= 75 && online == 0 )
+		{
+			finishDeploy( tr( "远程安装失败：超时后仍没有学生机上线，未下发安装包。" ) );
+			break;
+		}
 		// At least 20s of settle time, then proceed as soon as somebody is
 		// back; hard cap of 150s so a dead machine cannot stall the class.
 		if( ( online > 0 && m_deployWaitTicks >= 10 ) || m_deployWaitTicks >= 75 )
@@ -1866,6 +1967,7 @@ void ClassroomMasterDialog::advanceDeploy()
 			const auto percent = m_deploySource->size() > 0 ?
 									 int( m_deploySource->pos() * 100 / m_deploySource->size() ) : 100;
 			setToolStatus( tr( "远程装软件 [4/7]：正在下发安装包 %1%" ).arg( percent ) );
+			setDeployProgress( tr( "正在下发安装包 %1%" ).arg( percent ), 55 + percent / 5 );
 			break;
 		}
 		m_deploySource->close();
@@ -1882,14 +1984,15 @@ void ClassroomMasterDialog::advanceDeploy()
 	}
 
 	case DeployPhase::WaitInstall:
-		if( ++m_deployWaitTicks < 15 ) { break; } // 30s for the installer to finish
+		if( ++m_deployWaitTicks < 15 ) { break; } // 等 30s 收回执，不再视为安装成功
+		m_deployInstallSummary = installSummaryText();
 		if( m_deployUwfFlow )
 		{
 			m_deployPhase = DeployPhase::EnableUwf;
 		}
 		else
 		{
-			finishDeploy( tr( "安装命令已下发完成（未启用 UWF 流程）" ) );
+			finishDeploy( m_deployInstallSummary );
 		}
 		break;
 
@@ -1907,11 +2010,55 @@ void ClassroomMasterDialog::advanceDeploy()
 			break;
 		}
 		sendToAll( Classroom::message( Command::UwfRestart ) );
-		finishDeploy( tr( "远程安装完成：软件已安装，UWF 还原已恢复，学生机将再次重启" ) );
+		const auto summary = m_deployInstallSummary.isEmpty() ? installSummaryText() : m_deployInstallSummary;
+		finishDeploy( summary + tr( "；UWF 还原已恢复，学生机将再次重启。" ) );
 		break;
 
 	case DeployPhase::Idle:
 		break;
+	}
+}
+
+
+QString ClassroomMasterDialog::installSummaryText() const
+{
+	const int received = m_deployReported.size();
+	if( m_deployExpected == 0 || received == 0 )
+	{
+		return tr( "远程安装未能确认：未收到任何学生机安装回执，请检查操作记录。" );
+	}
+	QString text = tr( "安装回执：%1/%2 台，成功 %3 台，失败 %4 台" )
+					   .arg( received ).arg( m_deployExpected )
+					   .arg( m_deploySuccess ).arg( m_deployFailure );
+	const int missing = qMax( 0, m_deployExpected - received );
+	if( missing > 0 ) { text += tr( "；%1 台未确认，请检查操作记录。" ).arg( missing ); }
+	else if( m_deployFailure > 0 ) { text += tr( "；存在失败机器，请检查操作记录。" ); }
+	else { text += tr( "；全部学生机确认安装成功。" ); }
+	return text;
+}
+
+
+void ClassroomMasterDialog::recordInstallResult( const QString& ip, bool success, const QString& detail )
+{
+	if( m_deployPhase == DeployPhase::Idle ) { return; }
+	if( ip.isEmpty() == false && m_deployReported.contains( ip ) == false )
+	{
+		m_deployReported.insert( ip );
+		if( success ) { ++m_deploySuccess; }
+		else { ++m_deployFailure; }
+	}
+	appendTeacherEvent( EventType::install(),
+						tr( "安装回执 %1：%2（%3）" )
+							.arg( ip.isEmpty() ? tr( "未知机器" ) : ip,
+								  success ? tr( "成功" ) : tr( "失败" ), detail ) );
+	setToolStatus( tr( "正在收集安装回执 %1/%2：成功 %3，失败 %4" )
+				   .arg( m_deployReported.size() ).arg( m_deployExpected )
+				   .arg( m_deploySuccess ).arg( m_deployFailure ) );
+	if( m_deployExpected > 0 && m_deployReported.size() >= m_deployExpected )
+	{
+		m_deployInstallSummary = installSummaryText();
+		if( m_deployUwfFlow ) { m_deployPhase = DeployPhase::EnableUwf; }
+		else { finishDeploy( m_deployInstallSummary ); }
 	}
 }
 
@@ -1924,6 +2071,14 @@ void ClassroomMasterDialog::finishDeploy( const QString& result )
 		m_deploySource->close();
 		m_deploySource->deleteLater();
 		m_deploySource = nullptr;
+	}
+	if( m_deployProgressDialog )
+	{
+		setDeployProgress( tr( "安装流程已结束" ), 100 );
+		m_deployProgressDialog->deleteLater();
+		m_deployProgressDialog = nullptr;
+		m_deployProgressLabel = nullptr;
+		m_deployProgressBar = nullptr;
 	}
 	m_deployPhase = DeployPhase::Idle;
 	setToolStatus( result );
@@ -2060,7 +2215,13 @@ void ClassroomMasterDialog::sendToTargets( const FeatureMessage& message )
 {
 	if( m_toolScope && m_toolScope->currentIndex() == 1 )
 	{
-		for( const auto& ip : selectedIps() ) { sendToIp( ip, message ); }
+		const auto ips = selectedIps();
+		if( ips.isEmpty() )
+		{
+			setToolStatus( tr( "请先在名单中选择学生机，未发送任何操作。" ) );
+			return;
+		}
+		for( const auto& ip : ips ) { sendToIp( ip, message ); }
 	}
 	else
 	{
@@ -2073,6 +2234,22 @@ void ClassroomMasterDialog::setToolStatus( const QString& text )
 {
 	if( m_toolsStatus ) { m_toolsStatus->setText( text ); }
 	if( m_systemStatus ) { m_systemStatus->setText( text ); }
+	if( m_deployProgressDialog && m_deployPhase != DeployPhase::Idle )
+	{
+		int percent = 10;
+		switch( m_deployPhase )
+		{
+		case DeployPhase::DisableUwf: percent = 10; break;
+		case DeployPhase::RebootAfterDisable: percent = 20; break;
+		case DeployPhase::WaitOnline: percent = 35; break;
+		case DeployPhase::Transfer: percent = 55; break;
+		case DeployPhase::WaitInstall: percent = 80; break;
+		case DeployPhase::EnableUwf: percent = 90; break;
+		case DeployPhase::RebootAfterEnable: percent = 96; break;
+		case DeployPhase::Idle: break;
+		}
+		setDeployProgress( text, percent );
+	}
 	// Quick action buttons run with the console hidden, so show the result on
 	// the Master's status bar - otherwise "nothing seems to happen" (Q3).
 	if( auto* mainWindow = qobject_cast<QMainWindow*>( m_master.mainWindow() ) )
@@ -2148,8 +2325,8 @@ void ClassroomMasterDialog::applyFuzzyRules( const QString& key, const QString& 
 						 QString::fromUtf8( QJsonDocument( array ).toJson( QJsonDocument::Compact ) ) );
 	sendToAll( message );
 
-	setToolStatus( tr( "%1 fuzzy rule(s) applied: %2" )
-				   .arg( rules.size() ).arg( rules.isEmpty() ? tr( "(none - blocking cleared)" ) : rules.join( QStringLiteral(", ") ) ) );
+	setToolStatus( tr( "已应用 %1 条规则：%2" )
+				   .arg( rules.size() ).arg( rules.isEmpty() ? tr( "（无，拦截已解除）" ) : rules.join( QStringLiteral(", ") ) ) );
 }
 
 
@@ -2158,7 +2335,12 @@ void ClassroomMasterDialog::openOnTargets( bool website, const QString& target )
 	const auto value = target.trimmed();
 	if( value.isEmpty() )
 	{
-		setToolStatus( website ? tr( "Enter a website address first." ) : tr( "Enter a software path first." ) );
+		setToolStatus( website ? tr( "请先输入网址。" ) : tr( "请先输入程序路径。" ) );
+		return;
+	}
+	if( toolTargets().isEmpty() )
+	{
+		setToolStatus( tr( "没有目标学生机，请检查选择范围或等待学生上线。" ) );
 		return;
 	}
 
@@ -2173,25 +2355,167 @@ void ClassroomMasterDialog::openOnTargets( bool website, const QString& target )
 		message.addArgument( Argument::SoftwareArgs, QString{} );
 	}
 	sendToTargets( message );
-	setToolStatus( tr( "Sent to %1 machine(s): %2" ).arg( toolTargets().size() ).arg( value ) );
+	setToolStatus( tr( "已下发到 %1 台学生机：%2" ).arg( toolTargets().size() ).arg( value ) );
 }
 
 
-void ClassroomMasterDialog::scoreWholeClass( int delta )
+void ClassroomMasterDialog::scoreWholeClass( int delta, const QString& reason )
 {
 	const auto* item = m_roster.findClass( currentClassName() );
 	if( item == nullptr || m_scorePanel == nullptr ) { return; }
 
 	const auto deltaText = delta > 0 ? QStringLiteral("+%1").arg( delta ) : QString::number( delta );
-	const auto label = tr( "Whole class %1" ).arg( deltaText );
+	const auto base = tr( "全班 %1" ).arg( deltaText );
+	const auto label = reason.trimmed().isEmpty() ? base
+												  : QStringLiteral("%1（%2）").arg( base, reason.trimmed() );
 	for( const auto& student : item->students )
 	{
 		m_scorePanel->addEntryForSeat( student.seat, delta, label );
 	}
-	appendTeacherEvent( EventType::quickScore(),
-						tr( "whole class %1 points for %2 students" ).arg( deltaText ).arg( item->students.size() ) );
-	setToolStatus( tr( "%1 points applied to all %2 students." ).arg( deltaText ).arg( item->students.size() ) );
+	appendTeacherEvent( EventType::quickScore(), label );
+	setToolStatus( tr( "已给全班 %1 名学生%2：%3" ).arg( item->students.size() ).arg( base, label ) );
 	refreshSeatGrid();
+}
+
+
+void ClassroomMasterDialog::showWholeClassScoreDialog( bool add )
+{
+	QDialog dialog( this );
+	dialog.setWindowTitle( add ? tr( "全部加分" ) : tr( "全部减分" ) );
+	auto* form = new QFormLayout( &dialog );
+	auto* spin = new QSpinBox( &dialog );
+	spin->setRange( 1, 100 );
+	spin->setValue( 1 );
+	auto* reason = new QLineEdit( &dialog );
+	reason->setPlaceholderText( add ? tr( "请输入加分原因（必填）" ) : tr( "请输入减分原因（必填）" ) );
+	form->addRow( tr( "分数：" ), spin );
+	form->addRow( tr( "原因：" ), reason );
+
+	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
+	form->addRow( buttons );
+	auto* ok = buttons->button( QDialogButtonBox::Ok );
+	ok->setEnabled( false );
+	connect( reason, &QLineEdit::textChanged, &dialog, [ok]( const QString& text ) {
+		if( ok ) { ok->setEnabled( text.trimmed().isEmpty() == false ); }
+	} );
+	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+	if( dialog.exec() != QDialog::Accepted ) { return; }
+
+	scoreWholeClass( add ? spin->value() : -spin->value(), reason->text().trimmed() );
+}
+
+
+void ClassroomMasterDialog::showKeywordDialog( bool websites )
+{
+	const auto key = websites ? SettingKey::blockedWebsites() : SettingKey::blockedApps();
+	QStringList current;
+	for( const auto& value : settingsJson().value( key ).toArray() )
+	{
+		current.append( value.toString() );
+	}
+
+	QDialog dialog( this );
+	dialog.setWindowTitle( websites ? tr( "禁用网址 - 添加关键字" ) : tr( "禁用应用 - 添加关键字" ) );
+	dialog.setMinimumWidth( 520 );
+	auto* layout = new QVBoxLayout( &dialog );
+	auto* hint = new QLabel( websites ?
+		tr( "每行或逗号输入一个关键字（至少 2 个字）。学生访问网址命中时立即关闭当前标签页。" ) :
+		tr( "每行或逗号输入一个关键字（至少 2 个字）。学生运行程序命中时立即终止该程序。" ), &dialog );
+	hint->setWordWrap( true );
+	layout->addWidget( hint );
+
+	auto* editor = new QPlainTextEdit( &dialog );
+	editor->setPlainText( current.join( QStringLiteral("\n") ) );
+	editor->setMinimumHeight( 220 );
+	layout->addWidget( editor, 1 );
+
+	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
+	bool clearRequested = false;
+	auto* clearButton = new QPushButton( tr( "清除规则并解除拦截" ), &dialog );
+	buttons->addButton( clearButton, QDialogButtonBox::ActionRole );
+	connect( clearButton, &QPushButton::clicked, &dialog, [&dialog, &clearRequested]() {
+		clearRequested = true;
+		dialog.accept();
+	} );
+	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+	layout->addWidget( buttons );
+
+	if( dialog.exec() != QDialog::Accepted ) { return; }
+	const auto text = clearRequested ? QString{} : editor->toPlainText();
+	if( websites && m_toolWebRules ) { m_toolWebRules->setText( text ); }
+	if( websites == false && m_toolAppRules ) { m_toolAppRules->setText( text ); }
+	applyFuzzyRules( key, text );
+	if( websites ) { m_webBlockOn = clearRequested == false; }
+	else { m_appBlockOn = clearRequested == false; }
+	setToolStatus( clearRequested ? tr( "已清除%1规则并解除拦截。" ).arg( websites ? tr( "网址" ) : tr( "应用" ) )
+								  : tr( "已保存%1关键字，命中即拦截。" ).arg( websites ? tr( "网址" ) : tr( "应用" ) ) );
+}
+
+
+void ClassroomMasterDialog::showBatchOpenDialog( bool websites )
+{
+	QDialog dialog( this );
+	dialog.setWindowTitle( websites ? tr( "批量打开网页" ) : tr( "批量打开程序" ) );
+	dialog.setMinimumWidth( 560 );
+	auto* layout = new QVBoxLayout( &dialog );
+	auto* hint = new QLabel( websites ?
+		tr( "每行输入一个网址，例如 https://www.example.com；留空的项会被跳过。" ) :
+		tr( "每行输入一个学生机上已存在的 exe 完整路径；无效路径会被跳过。" ), &dialog );
+	hint->setWordWrap( true );
+	layout->addWidget( hint );
+
+	auto* editor = new QPlainTextEdit( &dialog );
+	editor->setPlaceholderText( websites ? QStringLiteral("https://www.example.com")
+									      : QStringLiteral("C:\\Program Files\\App\\app.exe") );
+	editor->setMinimumHeight( 200 );
+	layout->addWidget( editor, 1 );
+
+	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
+	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
+	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+	layout->addWidget( buttons );
+	if( dialog.exec() != QDialog::Accepted ) { return; }
+
+	int sent = 0;
+	int skipped = 0;
+	for( const auto& rawLine : editor->toPlainText().split( QLatin1Char('\n') ) )
+	{
+		auto value = rawLine.trimmed();
+		if( value.isEmpty() ) { continue; }
+		if( websites )
+		{
+			if( value.startsWith( QStringLiteral("http://"), Qt::CaseInsensitive ) == false &&
+				value.startsWith( QStringLiteral("https://"), Qt::CaseInsensitive ) == false )
+			{
+				value.prepend( QStringLiteral("https://") );
+			}
+			if( QUrl( value ).isValid() == false ) { ++skipped; continue; }
+		}
+		else
+		{
+			// 路径在学生机上，教师端只校验 exe 后缀；存在性由学生端确认。
+			const QFileInfo info( value );
+			if( info.suffix().compare( QStringLiteral("exe"), Qt::CaseInsensitive ) != 0 )
+			{
+				++skipped;
+				continue;
+			}
+		}
+		openOnTargets( websites, value );
+		++sent;
+	}
+	setToolStatus( tr( "已批量下发 %1 个%2到 %3 台学生机（跳过 %4 个无效项）。" )
+				   .arg( sent ).arg( websites ? tr( "网页" ) : tr( "程序" ) )
+				   .arg( toolTargets().size() ).arg( skipped ) );
+}
+
+
+void ClassroomMasterDialog::setDeployProgress( const QString& stage, int percent )
+{
+	if( m_deployProgressLabel ) { m_deployProgressLabel->setText( stage ); }
+	if( m_deployProgressBar ) { m_deployProgressBar->setValue( qBound( 0, percent, 100 ) ); }
 }
 
 
@@ -2557,14 +2881,16 @@ void ClassroomMasterDialog::setupToolsTab()
 			setUwfFilter( m_uwfOn );
 		} } } );
 
-	group( tr( "Gateway" ), QStringLiteral(":/core/go-next.png"), {
-		{ QStringLiteral("gateway.block"), tr( "Disable gateway" ),
-		  [send]() { send( Command::SetInternetBlock, true ); } },
-		{ QStringLiteral("gateway.allow"), tr( "Enable gateway" ),
-		  [send]() { send( Command::SetInternetBlock, false ); } },
-		{ QStringLiteral("gateway.toggle"), tr( "外网" ), [this, send]() {
-			m_gatewayBlocked = !m_gatewayBlocked;
-			send( Command::SetInternetBlock, m_gatewayBlocked );
+	group( tr( "网关" ), QStringLiteral(":/core/go-next.png"), {
+		{ QStringLiteral("gateway.disable"), tr( "禁用网关" ), [this, send]() {
+			m_gatewayBlocked = true;
+			send( Command::SetInternetBlock, true );
+			setToolStatus( tr( "已禁用网关，学生机外网已断开。" ) );
+		} },
+		{ QStringLiteral("gateway.enable"), tr( "启用网关" ), [this, send]() {
+			m_gatewayBlocked = false;
+			send( Command::SetInternetBlock, false );
+			setToolStatus( tr( "已启用网关，学生机外网已恢复。" ) );
 		} } } );
 
 	input( tr( "Silence page text:" ), m_toolSilence,
@@ -2608,9 +2934,7 @@ void ClassroomMasterDialog::setupToolsTab()
 			applyFuzzyRules( SettingKey::blockedApps(), {} );
 		} },
 		{ QStringLiteral("appblock.toggle"), tr( "禁用应用" ), [this]() {
-			m_appBlockOn = !m_appBlockOn;
-			if( m_appBlockOn ) { applyFuzzyRules( SettingKey::blockedApps(), m_toolAppRules->text() ); }
-			else { applyFuzzyRules( SettingKey::blockedApps(), {} ); }
+			showKeywordDialog( false );
 		} } } );
 
 	input( tr( "Blocked sites (fuzzy):" ), m_toolWebRules,
@@ -2623,30 +2947,24 @@ void ClassroomMasterDialog::setupToolsTab()
 			applyFuzzyRules( SettingKey::blockedWebsites(), {} );
 		} },
 		{ QStringLiteral("webblock.toggle"), tr( "禁用网址" ), [this]() {
-			m_webBlockOn = !m_webBlockOn;
-			if( m_webBlockOn ) { applyFuzzyRules( SettingKey::blockedWebsites(), m_toolWebRules->text() ); }
-			else { applyFuzzyRules( SettingKey::blockedWebsites(), {} ); }
+			showKeywordDialog( true );
 		} } } );
 
 	input( tr( "Software path:" ), m_toolSoftware, tr( "Full path of the program on the student machine" ) );
 	input( tr( "Website URL:" ), m_toolWebsite, tr( "https://..." ) );
-	group( tr( "Open on students" ), QStringLiteral(":/core/document-open.png"), {
-		{ QStringLiteral("open.software"), tr( "Open software" ),
+	group( tr( "在学生机打开" ), QStringLiteral(":/core/document-open.png"), {
+		{ QStringLiteral("open.software"), tr( "打开程序" ),
 		  [this]() { openOnTargets( false, m_toolSoftware->text() ); } },
-		{ QStringLiteral("open.website"), tr( "Open website" ),
-		  [this]() { openOnTargets( true, m_toolWebsite->text() ); } } } );
+		{ QStringLiteral("open.website"), tr( "打开网页" ),
+		  [this]() { openOnTargets( true, m_toolWebsite->text() ); } },
+		{ QStringLiteral("batch.programs"), tr( "批量打开程序" ), [this]() { showBatchOpenDialog( false ); } },
+		{ QStringLiteral("batch.websites"), tr( "批量打开网页" ), [this]() { showBatchOpenDialog( true ); } } } );
 
-	group( tr( "Whole class score" ), QStringLiteral(":/core/list-add.png"), {
-		{ QStringLiteral("score.p5"), tr( "+5" ), [this]() { scoreWholeClass( 5 ); } },
-		{ QStringLiteral("score.p1"), tr( "+1" ), [this]() { scoreWholeClass( 1 ); } },
-		{ QStringLiteral("score.m1"), tr( "-1" ), [this]() { scoreWholeClass( -1 ); } },
-		{ QStringLiteral("score.m5"), tr( "-5" ), [this]() { scoreWholeClass( -5 ); } },
-		{ QStringLiteral("score.custom"), tr( "Custom..." ), [this]() {
-			bool accepted = false;
-			const auto delta = QInputDialog::getInt( this, windowTitle(), tr( "Points for every student:" ),
-													 0, -100, 100, 1, &accepted );
-			if( accepted && delta != 0 ) { scoreWholeClass( delta ); }
-		} } } );
+	group( tr( "全班积分" ), QStringLiteral(":/core/list-add.png"), {
+		{ QStringLiteral("score.p5"), QStringLiteral("+5"), [this]() { scoreWholeClass( 5 ); } },
+		{ QStringLiteral("score.p1"), tr( "全部加分" ), [this]() { showWholeClassScoreDialog( true ); } },
+		{ QStringLiteral("score.m1"), tr( "全部减分" ), [this]() { showWholeClassScoreDialog( false ); } },
+		{ QStringLiteral("score.m5"), QStringLiteral("-5"), [this]() { scoreWholeClass( -5 ); } } } );
 
 	// Check-in has its own button on the Ikeback tool bar, so it is deliberately
 	// not repeated inside this menu.
@@ -2666,7 +2984,7 @@ void ClassroomMasterDialog::setupToolsTab()
 		{ QStringLiteral("remote.install"), tr( "远程装软件" ), [this]() { deployInstaller(); } } } );
 
 	auto* toolbarHint = new QLabel(
-		tr( "所有动作都可直接在 iKeback 主工具栏上点击（图标下方有名称）。"
+		tr( "所有动作都可直接在主工具栏上点击（图标下方有名称）。"
 			"本页只保存这些动作的参数：肃静文案、禁用规则、软件路径与网址。" ), page );
 	toolbarHint->setWordWrap( true );
 	toolbarHint->setStyleSheet( QStringLiteral("color:#546e7a; font-size:11px;") );

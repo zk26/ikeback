@@ -44,6 +44,8 @@ public:
 	void setIdentity( const QString& className, const QString& seat, const QString& student );
 	void clearIdentity();
 	void setLocked( bool locked );
+	//! 「锁定全部」真正锁住键鼠，而不只是改标签。
+	void setInputLocked( bool locked );
 	void setScoreHtml( const QString& html );
 	void setSilence( bool visible, const QString& text );
 	void showCheckIn();
@@ -99,6 +101,7 @@ private:
 	ClassroomAiChatWidget* m_aiChat = nullptr;
 	ClassroomScoreView* m_scoreView = nullptr;
 	ClassroomSilencePage* m_silencePage = nullptr;
+	ClassroomSilencePage* m_lockOverlay = nullptr;
 	ClassroomCheckInDialog* m_checkIn = nullptr;
 
 	bool m_keyConfigured = false;
@@ -120,6 +123,9 @@ private:
 	//! The card must stay on screen for as long as the ikeback service runs.
 	QTimer* m_guardTimer = nullptr;
 	bool m_hideAllowed = false;
+	//! Only one protected-exit dialog at a time - repeated close attempts must
+	//! not stack up modal dialogs on the student desktop.
+	bool m_quitDialogOpen = false;
 };
 
 
@@ -170,10 +176,13 @@ class ClassroomSilencePage : public QWidget
 	Q_OBJECT
 public:
 	explicit ClassroomSilencePage( QWidget* parent = nullptr );
+	~ClassroomSilencePage() override;
 	void setText( const QString& text );
+	void setInputLocked( bool locked );
 
 private:
 	QLabel* m_label = nullptr;
+	bool m_inputLocked = false;
 };
 
 

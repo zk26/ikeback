@@ -6,7 +6,9 @@
 
 #include <algorithm>
 
+#include <QByteArray>
 #include <QCoreApplication>
+#include <QHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -23,7 +25,20 @@
 
 static QString trText( const char* text )
 {
-	return QCoreApplication::translate( "ClassroomScoreBook", text );
+	// 这些文案通过变量传给 translate，lupdate 抓不到，构建出来的中文包里
+	// 仍是英文。这里直接给出中文映射，保证「我的成绩」页面全中文。
+	static const QHash<QByteArray, QString> chinese = {
+		{ "Current score", QStringLiteral("当前积分") },
+		{ "Base score", QStringLiteral("基础分") },
+		{ "Score details", QStringLiteral("积分明细") },
+		{ "No entries yet.", QStringLiteral("暂无记录") },
+		{ "Time", QStringLiteral("时间") },
+		{ "Lesson", QStringLiteral("课堂") },
+		{ "Detail", QStringLiteral("说明") },
+		{ "Delta", QStringLiteral("变动") },
+		{ "Scoring rules", QStringLiteral("评分规则") }
+	};
+	return chinese.value( QByteArray( text ), QString::fromUtf8( text ) );
 }
 
 

@@ -468,14 +468,14 @@ void MainWindow::addFeaturesToToolBar()
 	// ikeback: put the everyday actions first. Everything else wraps onto a
 	// second row or goes into Qt's ">>" overflow menu. Names that are not in
 	// the list below simply land in the second group, so no feature is lost.
+	// 按课堂使用反馈移除三个按钮：iKeback（独立控制台）、注销、常用工具。
+	// 「登录」保留；快速工具以独立按钮形式存在，控制台仍可由其他按钮打开。
 	static const QStringList primaryNames{
 		QStringLiteral("monitoring"), QStringLiteral("demo"), QStringLiteral("lock"),
 		QStringLiteral("remoteview"), QStringLiteral("remoteaccess"),
 		QStringLiteral("textmessage"), QStringLiteral("screenshot"),
 		QStringLiteral("classroom"), QStringLiteral("ikeback"),
-		QStringLiteral("ClassroomConsole"), QStringLiteral("ClassroomSignIn"),
-		QStringLiteral("ClassroomSignOut"), QStringLiteral("ClassroomQuickTools"),
-		QStringLiteral("ClassroomCheckIn")
+		QStringLiteral("ClassroomSignIn"), QStringLiteral("ClassroomCheckIn")
 	};
 
 	// ikeback 5.2.0: Ikeback's native UserLogin/UserLogoff actions open a
@@ -486,7 +486,10 @@ void MainWindow::addFeaturesToToolBar()
 	// "Quick tools" menu only, so hide the upstream copies (no lost function).
 	static const QStringList supersededNames{
 		QStringLiteral("UserLogin"), QStringLiteral("UserLogoff"),
-		QStringLiteral("StartApp"), QStringLiteral("OpenWebsite")
+		QStringLiteral("StartApp"), QStringLiteral("OpenWebsite"),
+		// 这三个按钮从工具栏彻底移除，而不是挪到溢出菜单。
+		QStringLiteral("ClassroomConsole"), QStringLiteral("ClassroomSignOut"),
+		QStringLiteral("ClassroomQuickTools")
 	};
 
 	QVector<Feature> primary;

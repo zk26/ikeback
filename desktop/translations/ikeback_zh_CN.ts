@@ -6188,8 +6188,8 @@ Example: [^-]*-(PC[0-9]*)</source>
         <translation>已解除学生端卸载保护。</translation>
     </message>
     <message>
-        <source>Students may sign in themselves (seat + name + key)</source>
-        <translation>允许学生自助登录（座位号 + 姓名 + 密钥）</translation>
+        <source>Students may sign in themselves (seat + name)</source>
+        <translation>允许学生自助登录（座位号 + 姓名）</translation>
     </message>
     <message>
         <source>Suggested layer</source>

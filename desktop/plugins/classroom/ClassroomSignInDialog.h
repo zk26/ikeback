@@ -11,6 +11,7 @@
 #pragma once
 
 #include <QDialog>
+#include <QJsonArray>
 #include <QString>
 #include <QStringList>
 
@@ -24,6 +25,7 @@ class ClassroomSignInDialog : public QDialog
 public:
 	explicit ClassroomSignInDialog( const QStringList& classNames,
 									const QString& currentClassName,
+									const QJsonArray& classes,
 									QWidget* parent = nullptr );
 
 	QString className() const;
@@ -32,8 +34,12 @@ public:
 
 private:
 	void updateOkButton();
+	void refreshRosterStudents();
+	void selectRosterStudent( int index );
 
+	const QJsonArray m_classes;
 	QComboBox* m_classCombo = nullptr;
+	QComboBox* m_studentCombo = nullptr;
 	QLineEdit* m_nameEdit = nullptr;
 	QLineEdit* m_seatEdit = nullptr;
 	QDialogButtonBox* m_buttons = nullptr;

@@ -101,7 +101,7 @@ void ClassroomScorePanel::refresh()
 
 void ClassroomScorePanel::showCall( const QString& ip, const QString& seat, const QString& student )
 {
-	m_callLabel->setText( tr( "Call from %1 (%2, seat %3)" ).arg( student, ip, seat ) );
+	m_callLabel->setText( tr( "来自 %1 的呼叫（%2，座位 %3）" ).arg( student, ip, seat ) );
 	m_callLabel->setStyleSheet( QStringLiteral("color:#c0392b; font-weight:bold;") );
 	m_tabs->setCurrentIndex( 0 );
 }

@@ -229,7 +229,10 @@ enum class Command
 	// the student machine, then UwfInstall runs it locally. ALWAYS append:
 	// numeric values are the wire protocol.
 	DeployFileBegin,
-	DeployFileChunk
+	DeployFileChunk,
+
+	// student -> teacher: real installer exit result (ALWAYS append)
+	InstallResult
 };
 
 enum class Argument

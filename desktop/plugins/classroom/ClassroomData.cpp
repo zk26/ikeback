@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cmath>
 
+#include <QByteArray>
 #include <QCoreApplication>
+#include <QHash>
 #include <QDebug>
 #include <QDir>
 #include <QFile>
@@ -123,6 +125,18 @@ QJsonObject ClassroomSettings::forStudents( const QJsonObject& object )
 	else
 	{
 		result.remove( SettingKey::adminKeyHash() );
+	}
+	// 下发给学生的肃静文案必须是中文；旧配置中的英文一律回退为「肃静」。
+	const auto silenceText = result.value( SettingKey::silencePageText() ).toString().trimmed();
+	bool hasChinese = false;
+	for( const auto ch : silenceText )
+	{
+		const auto code = ch.unicode();
+		if( code >= 0x4E00 && code <= 0x9FFF ) { hasChinese = true; break; }
+	}
+	if( hasChinese == false )
+	{
+		result.insert( SettingKey::silencePageText(), QStringLiteral("肃静") );
 	}
 	result.insert( QStringLiteral("keyConfigured"),
 				   object.value( QStringLiteral("sessionKey") ).toString().isEmpty() == false );
@@ -515,7 +529,13 @@ bool ClassroomRoster::importTable( const QString& text, const QString& defaultCl
 {
 	Q_UNUSED( error )
 	const auto tr = []( const char* text ) {
-		return QCoreApplication::translate( "ClassroomRoster", text );
+		static const QHash<QByteArray, QString> chinese = {
+			{ "No seat/name column found in the imported table.", QStringLiteral("导入表格中没有找到座位号或姓名列。") },
+			{ "Line %1: no class name", QStringLiteral("第 %1 行：缺少班级名称") },
+			{ "Line %1: no student name", QStringLiteral("第 %1 行：缺少学生姓名") },
+			{ "Line %1: %2 already uses IP %3 in class %4", QStringLiteral("第 %1 行：%2 已在班级 %4 中使用 IP %3") }
+		};
+		return chinese.value( QByteArray( text ), QString::fromUtf8( text ) );
 	};
 	ClassroomImportReport localReport;
 	auto& result = report ? *report : localReport;

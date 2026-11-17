@@ -52,6 +52,7 @@
 #include "ClassroomSecrets.h"
 #include "CryptoCore.h"
 #include "PlatformCoreFunctions.h"
+#include "PlatformInputDeviceFunctions.h"
 #include "PlatformPluginInterface.h"
 #include "PlatformUserFunctions.h"
 #include "IkebackCore.h"
@@ -74,6 +75,18 @@ static void keepFloating( QWidget* widget )
 }
 
 
+#ifdef Q_OS_WIN
+//! 网址命中时只关掉当前浏览器标签页，而不是 taskkill 整个浏览器。
+static void closeForegroundBrowserTab()
+{
+	keybd_event( VK_CONTROL, 0, 0, 0 );
+	keybd_event( static_cast<BYTE>( 'W' ), 0, 0, 0 );
+	keybd_event( static_cast<BYTE>( 'W' ), 0, KEYEVENTF_KEYUP, 0 );
+	keybd_event( VK_CONTROL, 0, KEYEVENTF_KEYUP, 0 );
+}
+#endif
+
+
 static QPoint mouseGlobalPoint( QMouseEvent* event )
 {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -81,6 +94,46 @@ static QPoint mouseGlobalPoint( QMouseEvent* event )
 #else
 	return event->globalPos();
 #endif
+}
+
+
+//! 锁定输入采用引用计数：肃静页与「锁定全部」可能同时生效，
+//! 任意一个解除时不能把另一个的输入锁也放开。
+static int s_inputLockCount = 0;
+
+static void lockStudentInput()
+{
+	if( s_inputLockCount++ == 0 )
+	{
+		IkebackCore::platform().coreFunctions().setSystemUiState( false );
+		IkebackCore::platform().inputDeviceFunctions().disableInputDevices();
+		QGuiApplication::setOverrideCursor( Qt::BlankCursor );
+	}
+}
+
+
+static void unlockStudentInput()
+{
+	if( s_inputLockCount == 0 ) { return; }
+	if( --s_inputLockCount == 0 )
+	{
+		IkebackCore::platform().inputDeviceFunctions().enableInputDevices();
+		IkebackCore::platform().coreFunctions().setSystemUiState( true );
+		QGuiApplication::restoreOverrideCursor();
+	}
+}
+
+
+//! 肃静页必须显示中文；旧配置里残留的英文文案一律回退为「肃静」。
+static QString chineseSilenceText( const QString& text )
+{
+	const auto trimmed = text.trimmed();
+	for( const auto ch : trimmed )
+	{
+		const auto code = ch.unicode();
+		if( code >= 0x4E00 && code <= 0x9FFF ) { return trimmed; }
+	}
+	return QStringLiteral("肃静");
 }
 
 
@@ -95,13 +148,19 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 
 	const auto dark = IkebackCore::useDarkMode();
 	setStyleSheet( QStringLiteral(
-		"QWidget#classroomClient { background: %1; border: 1px solid %2; border-radius: 6px; }"
+		"QWidget#classroomClient { background: %1; border: 1px solid %2; border-radius: 10px; }"
 		"QLabel { color: %3; }"
-		"QLineEdit { padding: 3px; }"
-		"QPushButton { padding: 4px 8px; }" ).
+		"QLineEdit { padding: 6px 8px; border: 1px solid %2; border-radius: 6px; background: %4; color: %3; }"
+		"QLineEdit:focus { border-color: %5; }"
+		"QPushButton { padding: 6px 10px; border-radius: 6px; border: 1px solid %2; "
+		"background: %5; color: #ffffff; font-weight: bold; }"
+		"QPushButton:hover { background: %6; }"
+		"QPushButton:disabled { background: %2; color: %3; }" ).
 		arg( dark ? QStringLiteral("#2b2b2b") : QStringLiteral("#f5f7f9"),
 			 dark ? QStringLiteral("#555555") : QStringLiteral("#9fc4d0"),
-			 dark ? QStringLiteral("#f0f0f0") : QStringLiteral("#202020") ) );
+			 dark ? QStringLiteral("#f0f0f0") : QStringLiteral("#202020"),
+			 dark ? QStringLiteral("#333333") : QStringLiteral("#ffffff"),
+			 QStringLiteral("#1976d2"), QStringLiteral("#1565c0") ) );
 
 	m_identityLabel = new QLabel( this );
 	m_identityLabel->setStyleSheet( QStringLiteral("font-size: 15px; font-weight: bold;") );
@@ -201,7 +260,8 @@ void ClassroomClientWidget::updateVisibility()
 	m_seatEdit->setVisible( signedIn == false );
 	m_nameEdit->setVisible( signedIn == false );
 	m_loginButton->setVisible( signedIn == false && m_allowSelfLogin );
-	m_callButton->setVisible( signedIn == false );
+	// 呼叫老师必须在签到前后都能点：老师端靠这条消息定位学生座位。
+	m_callButton->setVisible( true );
 	m_scoreButton->setVisible( true );
 	m_aiButton->setVisible( true );
 	adjustSize();
@@ -316,6 +376,28 @@ void ClassroomClientWidget::setLocked( bool locked )
 }
 
 
+void ClassroomClientWidget::setInputLocked( bool locked )
+{
+	if( locked )
+	{
+		if( m_lockOverlay == nullptr )
+		{
+			m_lockOverlay = new ClassroomSilencePage( this );
+			m_lockOverlay->setText( tr( "已锁定" ) );
+		}
+		m_lockOverlay->setVisible( true );
+		m_lockOverlay->raise();
+		m_lockOverlay->activateWindow();
+		m_lockOverlay->setInputLocked( true );
+	}
+	else if( m_lockOverlay )
+	{
+		m_lockOverlay->setInputLocked( false );
+		m_lockOverlay->setVisible( false );
+	}
+}
+
+
 void ClassroomClientWidget::updateStatus()
 {
 	m_statusLabel->setText( tr( "班级：%1  |  课堂：%2" ).
@@ -376,14 +458,7 @@ void ClassroomClientWidget::handleLogin()
 		QMessageBox::warning( this, windowTitle(), tr( "请同时输入座位号和姓名。" ) );
 		return;
 	}
-	// The bridge key never reaches this process. Self sign-in is gated by the
-	// teacher having started a lesson plus the roster check below.
-	if( m_keyConfigured == false )
-	{
-		Q_EMIT eventOccurred( Classroom::EventType::keyFailed(), tr( "教师尚未开始上课" ), {} );
-		QMessageBox::warning( this, windowTitle(), tr( "老师还没有开始上课，请稍候。" ) );
-		return;
-	}
+	// 学生只需姓名 + 座位号即可自助签到；名单匹配在下方完成，不再要求老师先下发课堂密钥。
 	if( m_allowSelfLogin == false )
 	{
 		QMessageBox::information( this, windowTitle(), tr( "自助签到已关闭，请等待老师为您签到。" ) );
@@ -448,6 +523,10 @@ void ClassroomClientWidget::showAiChat()
 
 void ClassroomClientWidget::requestQuit()
 {
+	if( m_quitDialogOpen )
+	{
+		return;
+	}
 	if( m_exitProtection == false )
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::quitAllowed(), tr( "exit protection disabled" ), {} );
@@ -459,6 +538,13 @@ void ClassroomClientWidget::requestQuit()
 	// configures it once; students only ever see its hash. Windows
 	// administrator credentials remain as a fallback for installs without a
 	// configured key.
+	m_quitDialogOpen = true;
+	struct QuitDialogGuard
+	{
+		bool& flag;
+		~QuitDialogGuard() { flag = false; }
+	} guard{ m_quitDialogOpen };
+
 	QDialog dialog( this );
 	dialog.setWindowTitle( tr( "受保护退出" ) );
 	auto* form = new QFormLayout( &dialog );
@@ -530,6 +616,12 @@ void ClassroomClientWidget::requestQuit()
 void ClassroomClientWidget::allowHide()
 {
 	m_hideAllowed = true;
+	setInputLocked( false );
+	if( m_silencePage )
+	{
+		m_silencePage->setInputLocked( false );
+		m_silencePage->hide();
+	}
 	if( m_guardTimer ) { m_guardTimer->stop(); }
 	hide();
 }
@@ -555,10 +647,13 @@ void ClassroomClientWidget::closeEvent( QCloseEvent* event )
 		hide();
 		return;
 	}
+	// 卡片右上角的关闭键只拦截，不再弹出管理员对话框；反复点 X 曾导致
+	// 「受保护退出」一直堆叠弹出。受保护退出仅从右键菜单显式触发。
 	event->ignore();
 	show();
 	raise();
-	requestQuit();
+	m_statusLabel->setText( tr( "卡片不能关闭。如需退出，请右键选择「退出客户端（受保护）」。" ) );
+	QTimer::singleShot( 2500, this, &ClassroomClientWidget::updateStatus );
 }
 
 
@@ -613,8 +708,14 @@ void ClassroomClientWidget::setSilence( bool visible, const QString& text )
 		m_silencePage = new ClassroomSilencePage( this );
 	}
 	m_silencePage->setText( text );
+	if( visible == false ) { m_silencePage->setInputLocked( false ); }
 	m_silencePage->setVisible( visible );
-	if( visible ) { m_silencePage->raise(); }
+	if( visible )
+	{
+		m_silencePage->raise();
+		m_silencePage->activateWindow();
+		m_silencePage->setInputLocked( true );
+	}
 }
 
 
@@ -707,22 +808,57 @@ void ClassroomScoreView::setHtml( const QString& html )
 ClassroomSilencePage::ClassroomSilencePage( QWidget* parent ) :
 	QWidget( parent )
 {
-	setWindowFlags( Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
-					Qt::WindowTransparentForInput );
+	// 覆盖所有显示器，且不再透传输入。
+	setWindowFlags( Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint );
+	QRect allScreens;
+	for( auto* screen : QGuiApplication::screens() )
+	{
+		if( screen ) { allScreens = allScreens.united( screen->geometry() ); }
+	}
+	if( allScreens.isEmpty() == false ) { setGeometry( allScreens ); }
 	setWindowState( Qt::WindowFullScreen );
+	setFocusPolicy( Qt::StrongFocus );
 	setStyleSheet( QStringLiteral("background:#0d1b2a;") );
 	m_label = new QLabel( this );
 	m_label->setAlignment( Qt::AlignCenter );
 	m_label->setWordWrap( true );
-	m_label->setStyleSheet( QStringLiteral("color:#f0f0f0; font-size:48px; font-weight:bold;") );
+	m_label->setText( QStringLiteral("肃静") );
+	m_label->setStyleSheet( QStringLiteral("color:#f0f0f0; font-size:96px; font-weight:bold; letter-spacing:12px;") );
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_label );
 }
 
 
+ClassroomSilencePage::~ClassroomSilencePage()
+{
+	setInputLocked( false );
+}
+
+
 void ClassroomSilencePage::setText( const QString& text )
 {
-	m_label->setText( text );
+	const auto value = chineseSilenceText( text );
+	m_label->setText( value.isEmpty() ? QStringLiteral("肃静") : value );
+}
+
+
+void ClassroomSilencePage::setInputLocked( bool locked )
+{
+	if( locked == m_inputLocked ) { return; }
+	if( locked )
+	{
+		lockStudentInput();
+		setFocus();
+		grabMouse();
+		grabKeyboard();
+	}
+	else
+	{
+		releaseMouse();
+		releaseKeyboard();
+		unlockStudentInput();
+	}
+	m_inputLocked = locked;
 }
 
 
@@ -929,9 +1065,8 @@ void ClassroomMonitor::setSettings( const QJsonObject& settings )
 		for( const auto& value : settings.value( key ).toArray() )
 		{
 			const auto rule = value.toString().trimmed();
-			// Fuzzy substring matching plus taskkill /F /IM: a one-character
-			// rule such as "e" would terminate dozens of unrelated processes.
-			if( rule.size() >= 4 ) { rules.append( rule ); }
+			// 允许「微信」这类两字关键字；单字符仍会误杀大量进程。
+			if( rule.size() >= 2 ) { rules.append( rule ); }
 		}
 		return rules;
 	};
@@ -939,7 +1074,9 @@ void ClassroomMonitor::setSettings( const QJsonObject& settings )
 	m_blockedWebsites = toStringList( Classroom::SettingKey::blockedWebsites() );
 
 	const auto interval = settings.value( Classroom::SettingKey::captureInterval() ).toInt( 5 );
-	m_timer->setInterval( std::max( 1, interval ) * 1000 );
+	const auto hasRules = m_blockedApps.isEmpty() == false || m_blockedWebsites.isEmpty() == false;
+	// 有拦截规则时最快 2 秒复查一次，避免规则形同虚设。
+	m_timer->setInterval( std::max( 1, hasRules ? std::min( interval, 2 ) : interval ) * 1000 );
 	if( m_enabled ) { start(); }
 	else { stop(); }
 }
@@ -968,7 +1105,8 @@ void ClassroomMonitor::sample()
 		title.contains( QStringLiteral("iKeback") ) ) { return; }
 
 	const QString key = application + QLatin1Char('|') + title;
-	if( key == m_lastSample ) { return; }
+	const auto unchanged = key == m_lastSample;
+	// 即使窗口没变化也要复查拦截规则：上次 taskkill 失败时必须在下一次重试。
 	m_lastSample = key;
 
 	static const QStringList browsers{ QStringLiteral("chrome"), QStringLiteral("msedge"), QStringLiteral("firefox"),
@@ -994,10 +1132,13 @@ void ClassroomMonitor::sample()
 		matchRule( title + QLatin1Char(' ') + application, m_blockedWebsites ) : QString{};
 	if( appRule.isEmpty() == false || webRule.isEmpty() == false )
 	{
+#ifdef Q_OS_WIN
+		if( webRule.isEmpty() == false ) { closeForegroundBrowserTab(); }
+#endif
 		Q_EMIT blockedActivity( application, title,
 								appRule.isEmpty() ? webRule : appRule,
 								appRule.isEmpty() );
 	}
 
-	Q_EMIT activity( application, title, browser );
+	if( unchanged == false ) { Q_EMIT activity( application, title, browser ); }
 }

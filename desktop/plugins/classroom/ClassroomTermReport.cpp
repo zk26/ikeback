@@ -6,10 +6,12 @@
 
 #include <algorithm>
 
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QHash>
 #include <QMap>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -22,7 +24,25 @@
 
 static QString trText( const char* text )
 {
-	return QCoreApplication::translate( "ClassroomTermReport", text );
+	static const QHash<QByteArray, QString> chinese = {
+		{ "Classroom score report", QStringLiteral("班级成绩报表") },
+		{ "No.", QStringLiteral("序号") },
+		{ "Name", QStringLiteral("姓名") },
+		{ "Class", QStringLiteral("班级") },
+		{ "Attendance", QStringLiteral("考勤") },
+		{ "Current total", QStringLiteral("当前总分") },
+		{ "Final total", QStringLiteral("最终总分") },
+		{ "Rules", QStringLiteral("评分规则") },
+		{ "Time", QStringLiteral("时间") },
+		{ "Lesson", QStringLiteral("课堂") },
+		{ "Seat", QStringLiteral("座位") },
+		{ "Delta", QStringLiteral("变动") },
+		{ "Reason", QStringLiteral("原因") },
+		{ "Operator", QStringLiteral("操作人") },
+		{ "Score details", QStringLiteral("积分明细") },
+		{ "Could not create the destination directory.", QStringLiteral("无法创建目标目录。") }
+	};
+	return chinese.value( QByteArray( text ), QString::fromUtf8( text ) );
 }
 
 
@@ -142,17 +162,12 @@ QVector<DetailRow> detailRows( const ClassroomScoreBook& book )
 QString detailsWorksheet( const QVector<DetailRow>& rows )
 {
 	const QStringList headers{
-		QCoreApplication::translate( "ClassroomTermReport", "Time" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Lesson" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Seat" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Name" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Delta" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Reason" ),
-		QCoreApplication::translate( "ClassroomTermReport", "Operator" )
+		trText( "Time" ), trText( "Lesson" ), trText( "Seat" ), trText( "Name" ),
+		trText( "Delta" ), trText( "Reason" ), trText( "Operator" )
 	};
 
 	QString xml = QStringLiteral("<Worksheet ss:Name=\"%1\"><Table>\n")
-					  .arg( sheetName( QCoreApplication::translate( "ClassroomTermReport", "Score details" ) ) );
+					  .arg( sheetName( trText( "Score details" ) ) );
 	xml += QStringLiteral("<Row ss:Height=\"26\">");
 	for( const auto& header : headers )
 	{

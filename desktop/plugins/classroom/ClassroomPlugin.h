@@ -28,6 +28,8 @@
 #include "PluginInterface.h"
 
 class QFile;
+class QFileSystemWatcher;
+class QProcess;
 class QSystemTrayIcon;
 class QTimer;
 class QUdpSocket;
@@ -172,4 +174,10 @@ private:
 	QMap<QString, QDateTime> m_discoveredHosts;
 	//! Worker-side staging file for remote software deployment.
 	QFile* m_deployFile = nullptr;
+	//! Worker-side installer process so its real exit code can be reported.
+	QProcess* m_installProcess = nullptr;
+	//! Master-side watcher so roster imports from the configurator show up at once.
+	QFileSystemWatcher* m_rosterWatcher = nullptr;
+	//! ip -> live classroom display name, more reliable than a stale roster IP.
+	QMap<QString, QString> m_studentDisplayByIp;
 };
