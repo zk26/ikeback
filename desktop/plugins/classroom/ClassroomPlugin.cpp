@@ -981,7 +981,8 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 	// 学生自助签到后主动上报身份，教师端名单/座位表立即同步。
 	if( command == Command::ReportIdentity )
 	{
-		const auto loggedIn = message.argument( Argument::Enabled ).toBool( true );
+		// FeatureMessage 的参数是 QVariant（没有默认值重载），必须直接 toBool()。
+		const auto loggedIn = message.argument( Argument::Enabled ).toBool();
 		ClassroomEvent event;
 		event.timestamp = QDateTime::currentDateTime();
 		event.className = message.argument( Argument::ClassName ).toString();
