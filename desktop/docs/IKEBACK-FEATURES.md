@@ -83,21 +83,6 @@
 > 「◐」表示代码已完成但**尚未在真实机房 / Windows UWF 环境联调**，且需由
 > GitHub Actions 的 Qt6/MinGW 编译验证。本机无 Qt/MinGW 工具链，桌面端未做本地编译。
 
-## 移动端（底部栏 / 课表 / 更多）
-
-| # | 需求 | 状态 | 实现位置 | 使用入口 |
-|---|---|---|---|---|
-| M1 | 底部栏**图标 + 名称常显**（不再用单字假图标） | ✅ | `BottomBar.kt` + 4 个 `res/drawable/ck_tab_*.xml` 矢量图标 | 四个标签 |
-| M2 | 课堂 = **课堂控制 + 加分减分** | ✅ | `MainActivity.kt` → `buildPages()` 的 `pages[0]` | 「课堂」 |
-| M3 | 课表：一天几节课 / 大课间 / 中午 / 单列双列时间可调 | ✅ | `TimetableStore.kt` → `TimetableConfig` / `buildPeriods()`；`showTimetableSettings()` | 「课表」→ 作息设置 |
-| M4 | 配置页（IP / 密钥 / 端口 / 时间列切换） | ✅ | `MainActivity.kt` → `pages[2]` | 「配置」 |
-| M5 | 更多页：导入导出 + 查询这堂课讲了什么/干了什么/同学表现 | ✅ | `exportTimetable()` / `exportLocalData()` / `showLessonReview()` / `renderLessonReview()` | 「更多」 |
-| M6 | 名称只用英文 `ikeback` | ✅ | `strings.xml` / `brandHeader()` / `mobile/README.md` | 应用名与品牌头 |
-
-> 移动端已用本机 JDK 23 + Android SDK 实测：`:app:assembleDebug` +
-> `:app:testDebugUnitTest` **BUILD SUCCESSFUL，7 个单测全绿**（含新增的
-> 节次生成 / 大课间 / 午休 / 配置断言）。
-
 ---
 
 ## A. 课堂身份与连接

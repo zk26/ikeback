@@ -135,7 +135,7 @@ Linux 编译走 `#else` 分支，**不会验证这些 Windows 专属代码**。
 
 ---
 
-## 路线 D：GitHub Actions 产出 Windows 二进制（推荐用于出包）
+## 2. 路线 D：GitHub Actions 产出 Windows 二进制（推荐用于出包）
 
 workflow：`.github/workflows/ikeback-windows.yml` → **ikeback Windows Build**
 
@@ -178,13 +178,13 @@ LICENSE.TXT / COPYING.TXT / README.TXT / ikeback.ico
 
 ---
 
-## 2. 路线 B：本机 Windows 编译出真正的教师端 / 学生端
+## 3. 路线 B：本机 Windows 编译出真正的教师端 / 学生端
 
 需要 **MSYS2 + MinGW-w64 GCC**（不是 Visual Studio）。
 **最简单的做法是照抄路线 D 的 workflow**——那份配置已在 GitHub Actions 上实测跑通，
 直接在本机 MSYS2 UCRT64 里执行同样的命令即可。
 
-### 2.1 准备工具链（UCRT64）
+### 3.1 准备工具链（UCRT64）
 
 ```bash
 # 用 MSYS2 UCRT64 终端（不是 MINGW64）：QCA / LibVNC 只发布到 ucrt64 / clang64
@@ -207,13 +207,13 @@ pacman -S --needed \
 > 不是 `qca` / `libldap` / `libsasl` / `lzo`；MSYS2 也没有 `qt-cmake` wrapper，
 > 用普通 `cmake -DCMAKE_PREFIX_PATH=/ucrt64` 即可。
 
-### 2.2 QCA-Qt6 不需要自己编译
+### 3.2 QCA-Qt6 不需要自己编译
 
 早期判断有误：MSYS2 UCRT64 **有现成的 `mingw-w64-ucrt-x86_64-qca-qt6` 包**，
 它会提供 `Qca-qt6Config.cmake`、`libqca-qt6.dll` 与 `crypto/libqca-ossl.dll`。
 只有在使用非 MSYS2 的 Qt6（例如官方 Qt 安装器）时才需要从源码编 QCA。
 
-### 2.3 补齐 3rdparty 并编译
+### 3.3 补齐 3rdparty 并编译
 
 按路线 A/D 的 `fetch()` 脚本检出上游 v4.11.4 锁定的 3rdparty
 （Windows 另需 `ultravnc`、`qthttpserver`），然后在 UCRT64 终端：
@@ -240,7 +240,7 @@ cmake --build build --parallel 4 --target \
 > 运行时 DLL 与 Qt 插件的收集由
 > [`collect-windows-runtime.sh`](../scripts/collect-windows-runtime.sh) 完成。
 
-### 2.4 生成安装程序
+### 3.4 生成安装程序
 
 ```bash
 cd /g/ikeback
@@ -257,29 +257,11 @@ makensis -DVERSION=5.2.0 -DROLE=student installer.nsi
 
 ---
 
-## 3. 路线 C：在 GitHub 上自动出 Windows 产物
-
-上游的做法是 Linux 容器里用 `x86_64-w64-mingw32` 交叉编译（`.ci/windows/build.sh`），
-但它依赖的镜像 `ci-mingw-w64:main` 是 **GitLab 私有镜像且没有 Dockerfile**，外部无法复现。
-
-要在 GitHub Actions 上做，需要二选一：
-
-| 方式 | 成本 | 说明 |
-|---|---|---|
-| **自建 MinGW Docker 镜像** | 高 | 在 Dockerfile 里装 MinGW-w64、Qt6-MinGW、自编 QCA-Qt6、LibVNC/OpenSSL/LZO/JPEG/SASL/LDAP/interception、NSIS；推到 GHCR，再让 workflow 用它。相当于重建上游私有镜像 |
-| **自托管 runner** | 中 | 一台按路线 B 配好的 Windows/MSYS2 机器注册为 self-hosted runner，workflow 里 `runs-on: self-hosted` 直接调现成工具链 |
-
-**建议顺序**：先跑路线 A 把 30 多个 C++ 文件的编译错误全部消灭 → 再决定是否为 Windows 产物投入路线 C。
-`ikeback-release.yml` 目前已改成「只发布能真实构建的东西」（Android APK + 两个部署预设包 + 校验），
-**不再假装能编译 Windows，也不上传占位二进制**。
-
----
-
 ## 4. 常见错误对照
 
 | 报错 | 原因 | 处理 |
 |---|---|---|
-| `Could not find a package configuration file provided by "Qca-qt6"` | QCA-Qt6 未装 / 不在 `CMAKE_PREFIX_PATH` | 路线 A 装 `libqca-qt6-dev`；路线 B 见第 2.2 步自编 |
+| `Could not find a package configuration file provided by "Qca-qt6"` | QCA-Qt6 未装 / 不在 `CMAKE_PREFIX_PATH` | 路线 A 装 `libqca-qt6-dev`；路线 B 见第 3.2 步 |
 | `LibVNCServer or LibVNCClient not found` | 系统 LibVNC < 0.9.14 | `-DWITH_BUNDLED_LIBVNC=ON` + clone `3rdparty/libvncserver` |
 | `Cannot find source file .../3rdparty/kldap...` | 子模块为空 | 显式 clone（根仓库没有 `.gitmodules`） |
 | `Qt6::GuiPrivate` / `Qt6::HttpServer` 找不到 | Qt6 模块不全 | 装 `qt6-base-private-dev` / `qt6-httpserver-dev`；或 `-DWITH_WEBAPI=OFF`。**不要退回 Qt5** |
@@ -297,15 +279,4 @@ makensis -DVERSION=5.2.0 -DROLE=student installer.nsi
 | 同上但平台插件在，仍崩 | `crypto/libqca-ossl.dll` 缺失或挑到了 qca-qt5 版本，`CryptoCore.cpp:39` → `qFatal("RSA not supported!")` | 从精确路径 `/ucrt64/lib/qca-qt6/crypto/libqca-ossl.dll` 复制，并硬校验 |
 | `-linterception` 找不到（MSYS2 UCRT64） | 该库既不在上游 `3rdparty/interception/`（只有安装器 exe + bat），也不在 MSYS2 | 使用上述自制最小兼容头，去掉链接参数；Interception 驱动是可选的，默认不启用 |
 
----
 
-## 5. 已修正的坑（本轮）
-
-1. 新建仓库根 `.github/workflows/ikeback-build.yml` — **真实编译验证**（Linux/GCC + Android）。
-2. 新建仓库根 `.github/workflows/ikeback-release.yml` — 只发布能真实构建的东西。
-3. 删除 `desktop/.github/workflows/ikeback-release.yml`（位置错误 + 基于不可行的 `vcpkg install qca` + MSVC）。
-4. build workflow 显式 clone 5 个 3rdparty 源码，绕开根仓库缺 `.gitmodules`。
-5. 文档不再声称「MSVC 可用」。
-
-> 上游 `desktop/.github/workflows/build.yml` 和 `release.yml` 保留原样，
-> 但它们同样位于子目录，在本仓库结构下**不会被触发**；不要依赖它们做验证。
