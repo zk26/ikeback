@@ -5,10 +5,11 @@ A hand-written whitelist of DLL prefixes is unreliable: Qt6 pulls in libbz2,
 libbrotli, libmd4c, libpcre2, libharfbuzz, ICU, etc. through indirect imports,
 and any omission makes the installed EXE fail with "DLL not found" dialogs.
 
-Instead we ask ntldd (or ldd as a fallback) what every PE file in the payload
-actually imports, copy every DLL that exists under /ucrt64/bin, and iterate
-until no new dependency appears. System DLLs (KERNEL32.dll, api-ms-win-*) are
-not present under /ucrt64/bin and are therefore skipped - Windows supplies them.
+Instead we inspect every PE file's import table with objdump and copy every
+DLL that exists under /ucrt64/bin, then iterate until no new dependency appears.
+ntldd/ldd remain fallbacks for environments without objdump. System DLLs
+(KERNEL32.dll, api-ms-win-*) are not present under /ucrt64/bin and are therefore
+skipped - Windows supplies them.
 """
 
 import argparse
@@ -18,7 +19,8 @@ import shutil
 import subprocess
 import sys
 
-DLL_NAME = re.compile(r"([A-Za-z0-9_.+-]+\.dll)\b", re.IGNORECASE)
+DLL_NAME = re.compile(r"DLL Name:\s*([^\s]+)", re.IGNORECASE)
+FALLBACK_DLL_NAME = re.compile(r"([A-Za-z0-9_.+-]+\.dll)\b", re.IGNORECASE)
 
 
 def pe_files(root):
@@ -29,35 +31,43 @@ def pe_files(root):
 
 
 def imported_names(path, tool):
+    command = [tool, path]
+    pattern = FALLBACK_DLL_NAME
+    if os.path.basename(tool).lower().startswith("objdump"):
+        command = [tool, "-p", path]
+        pattern = DLL_NAME
     try:
         result = subprocess.run(
-            [tool, path],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=60,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        if os.path.basename(tool).lower().startswith("objdump"):
+            raise SystemExit(f"Could not inspect {path}: {error}")
         return set()
-    return {match.group(1) for match in DLL_NAME.finditer(result.stdout)}
+    if result.returncode != 0 and os.path.basename(tool).lower().startswith("objdump"):
+        raise SystemExit(f"Could not inspect {path}: {tool} exited {result.returncode}")
+    return {match.group(1) for match in pattern.finditer(result.stdout)}
 
 
 def resolve_tool(preferred):
-    found = shutil.which(preferred)
-    if found:
-        return found
-    fallback = shutil.which("ldd")
-    if fallback:
-        print(f"{preferred} not found, falling back to ldd", file=sys.stderr)
-        return fallback
-    raise SystemExit("Neither ntldd nor ldd is available; install mingw-w64-ucrt-x86_64-ntldd")
+    for candidate in (preferred, "objdump", "ntldd", "ldd"):
+        found = shutil.which(candidate)
+        if found:
+            if candidate != preferred:
+                print(f"{preferred} not found, using {candidate}", file=sys.stderr)
+            return found
+    raise SystemExit("No PE import tool found; install binutils or mingw-w64-ucrt-x86_64-ntldd")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--payload", required=True, help="directory containing the built exe/dll files")
     parser.add_argument("--ucrt", default="/ucrt64", help="MSYS2 UCRT64 prefix")
-    parser.add_argument("--tool", default="ntldd")
+    parser.add_argument("--tool", default="objdump", help="PE import inspection tool (objdump, ntldd or ldd)")
     parser.add_argument("--max-rounds", type=int, default=10)
     args = parser.parse_args()
 
@@ -85,6 +95,16 @@ def main():
         print(f"round {round_no}: imports={len(needed)} newly copied={added}", file=sys.stderr)
         if added == 0:
             break
+
+    missing = set()
+    for pe in pe_files(args.payload):
+        for name in imported_names(pe, tool):
+            source = os.path.join(runtime_bin, name)
+            target = os.path.join(args.payload, name)
+            if os.path.isfile(source) and not os.path.isfile(target):
+                missing.add(name)
+    if missing:
+        raise SystemExit("Runtime DLL closure is incomplete: " + ", ".join(sorted(missing)))
 
     for name in sorted(copied):
         print(f"  + {name}")

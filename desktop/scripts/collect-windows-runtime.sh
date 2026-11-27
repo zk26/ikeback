@@ -64,8 +64,8 @@ if [ "$qca_copied" -eq 0 ]; then
 fi
 
 echo "== full runtime DLL closure =="
-# Fixes the "libbz2-1.dll / libmd4c.dll / libbrotli*.dll not found" failures:
-# ntldd walks the real PE import graph instead of a hand-written whitelist.
+# Fixes indirect runtime failures such as missing libiconv/libbz2/libmd4c:
+# objdump reads every PE import table directly, without loader/PATH masking.
 PY="$(command -v python3 || command -v python)"
 if [ -z "$PY" ]; then
   echo "python3/python not found; install mingw-w64-ucrt-x86_64-python" >&2
@@ -91,7 +91,7 @@ echo "== verify (startup-critical files included) =="
 for f in ikeback-core.dll ikeback-master.exe ikeback-configurator.exe ikeback-cli.exe \
          ikeback-wcli.exe ikeback-service.exe ikeback-server.exe ikeback-worker.exe \
          plugins/classroom.dll plugins/windows-platform.dll \
-         crypto/libqca-ossl.dll libqca-qt6.dll \
+         crypto/libqca-ossl.dll libqca-qt6.dll libiconv-2.dll \
          platforms/qwindows.dll ikeback.ico translations/ikeback_zh_CN.qm; do
   if [ ! -f "$PAYLOAD/$f" ]; then
     echo "MISSING REQUIRED FILE: $f" >&2

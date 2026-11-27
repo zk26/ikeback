@@ -116,10 +116,15 @@ Function un.ExitPasswordPageShow
   ${NSD_CreateText} 0 38u 100% 14u ""
   Pop $ExitPasswordEdit
   ${NSD_Edit_SetPasswordChar} $ExitPasswordEdit 0x25
+  nsDialogs::Show
 FunctionEnd
 
 Function un.ExitPasswordPageLeave
   ${NSD_GetText} $ExitPasswordEdit $R1
+  ${If} $R1 == ""
+    MessageBox MB_OK|MB_ICONEXCLAMATION "请输入管理员密码后再卸载。"
+    Abort
+  ${EndIf}
   StrCpy $R2 "$PLUGINSDIR\ikeback-exit-password.utf16"
   FileOpen $R3 $R2 w
   FileWriteUTF16LE $R3 "$R1"
@@ -299,6 +304,24 @@ Section "ikeback Service (required)" SEC_SERVICE
   SetOutPath "$INSTDIR"
   FileOpen $9 "$INSTDIR\install.log" w
   FileWrite $9 "ikeback ${VERSION} ${ROLE_EN} install log$\r$\n"
+
+  ; Run the installed CLIs with the normal system PATH before touching SCM.
+  ; A missing runtime DLL otherwise looks like a service timeout (1053).
+  nsExec::ExecToStack '"$INSTDIR\ikeback-wcli.exe" --version'
+  Pop $R0
+  Pop $1
+  FileWrite $9 "wcli preflight exit=$R0 output=$1$\r$\n"
+  nsExec::ExecToStack '"$INSTDIR\ikeback-cli.exe" --version'
+  Pop $R1
+  Pop $1
+  FileWrite $9 "cli preflight exit=$R1 output=$1$\r$\n"
+  ${If} $R0 != "0"
+  ${OrIf} $R1 != "0"
+    FileWrite $9 "RESULT: runtime preflight failed$\r$\n"
+    FileClose $9
+    MessageBox MB_OK|MB_ICONSTOP "安装运行时自检失败，服务尚未注册。$\r$\n$\r$\n请把 $INSTDIR\install.log 发给管理员排查缺失的 DLL 或插件。"
+    Abort
+  ${EndIf}
 
   ; Machine role marker: the classroom card/tray only appears on student
   ; installs and the configurator is key-gated there (see ClassroomPlugin).
