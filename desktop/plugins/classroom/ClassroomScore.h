@@ -41,6 +41,31 @@ struct ClassroomScoreEntry
 	static ClassroomScoreEntry fromJson( const QJsonObject& object );
 };
 
+struct ClassroomAttendance
+{
+	enum Status
+	{
+		Present = 0,
+		Absent = 1,
+		Late = 2,
+		Leave = 3,
+		Custom = 4
+	};
+
+	QString lessonId;
+	QString className;
+	QString seat;
+	QString student;
+	int status = Absent;
+	QString reason;
+	QString author;
+	QDateTime checkInTime;
+	QDateTime updated;
+
+	QJsonObject toJson() const;
+	static ClassroomAttendance fromJson( const QJsonObject& object );
+};
+
 struct ClassroomScoreRules
 {
 	bool published = false;
@@ -48,6 +73,8 @@ struct ClassroomScoreRules
 	QString html;
 	QDateTime updated;
 	QVector<QPair<QString, int>> quickActions;
+	QString levelSchemeName = QStringLiteral("默认课堂等级");
+	QVector<QPair<int, QString>> levels;
 
 	QJsonObject toJson() const;
 	static ClassroomScoreRules fromJson( const QJsonObject& object );
@@ -65,12 +92,18 @@ public:
 	const QString& className() const { return m_className; }
 	const QVector<ClassroomScoreLesson>& lessons() const { return m_lessons; }
 	const QVector<ClassroomScoreEntry>& entries() const { return m_entries; }
+	const QVector<ClassroomAttendance>& attendance() const { return m_attendance; }
 	const ClassroomScoreRules& rules() const { return m_rules; }
 
 	bool setRules( const ClassroomScoreRules& rules );
 	QString ensureLesson( const QDate& date, const QString& topic );
 	bool addEntry( const ClassroomScoreEntry& entry );
 	bool removeEntry( const QString& entryId );
+	bool setAttendance( const ClassroomAttendance& attendance );
+	ClassroomAttendance attendanceFor( const QString& lessonId, const QString& seat ) const;
+	QString attendanceText( const QString& lessonId, const QString& seat ) const;
+	QString levelName( int score ) const;
+	static QVector<QPair<int, QString>> defaultLevels();
 
 	int total( const QString& seat, const QString& upToLessonId = QString{} ) const;
 	QVector<ClassroomScoreEntry> entriesForCell( const QString& lessonId, const QString& seat ) const;
@@ -92,5 +125,6 @@ private:
 	QString m_className;
 	QVector<ClassroomScoreLesson> m_lessons;
 	QVector<ClassroomScoreEntry> m_entries;
+	QVector<ClassroomAttendance> m_attendance;
 	ClassroomScoreRules m_rules;
 };

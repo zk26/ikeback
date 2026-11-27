@@ -4,6 +4,8 @@
  * This file is part of the Ikeback classroom modification.
  */
 
+#include <algorithm>
+
 #include <QAbstractItemView>
 #include <QBoxLayout>
 #include <QCheckBox>
@@ -34,6 +36,7 @@
 #include "ClassroomData.h"
 #include "ClassroomProtocol.h"
 #include "ClassroomScorePanel.h"
+#include "ClassroomTheme.h"
 #include "ClassroomTermReport.h"
 #include "ClassroomWordCloud.h"
 
@@ -48,6 +51,8 @@ ClassroomScorePanel::ClassroomScorePanel( const QString& dataDirectory, Classroo
 	m_settings( settings ),
 	m_book( dataDirectory )
 {
+	setObjectName( QStringLiteral("classroomScorePanel") );
+	Classroom::Theme::apply( this );
 	m_tabs = new QTabWidget( this );
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_tabs );
@@ -64,8 +69,34 @@ void ClassroomScorePanel::setClassName( const QString& className )
 	if( className.isEmpty() || className == m_className ) { return; }
 	m_className = className;
 	m_lessonId.clear();
+	m_lessonPinned = false;
 	m_book.load( className );
 	refresh();
+}
+
+
+void ClassroomScorePanel::setCurrentLessonId( const QString& lessonId )
+{
+	if( lessonId.isEmpty() ) { return; }
+	m_book.load( m_className );
+	m_lessonId = lessonId;
+	m_lessonPinned = true;
+	for( const auto& lesson : m_book.lessons() )
+	{
+		if( lesson.id == lessonId )
+		{
+			m_lessonDate->setDate( lesson.date );
+			m_lessonTopic->setText( lesson.topic );
+			break;
+		}
+	}
+	refreshStudentTable();
+}
+
+
+void ClassroomScorePanel::showRules()
+{
+	m_tabs->setCurrentIndex( 1 );
 }
 
 
@@ -86,6 +117,18 @@ void ClassroomScorePanel::refresh()
 	}
 	m_quickActions->setPlainText( quick.join( QLatin1Char('\n') ) );
 
+	m_levelScheme->setCurrentIndex( rules.levelSchemeName == QStringLiteral("自定义等级") ? 1 : 0 );
+	const auto levels = rules.levels.isEmpty() ? ClassroomScoreBook::defaultLevels() : rules.levels;
+	{
+		QSignalBlocker blocker( m_levelTable );
+		m_levelTable->setRowCount( levels.size() );
+		for( int row = 0; row < levels.size(); ++row )
+		{
+			m_levelTable->setItem( row, 0, new QTableWidgetItem( QString::number( levels.at( row ).first ) ) );
+			m_levelTable->setItem( row, 1, new QTableWidgetItem( levels.at( row ).second ) );
+		}
+	}
+
 	const auto previous = m_cloudStudent->currentData().toString();
 	m_cloudStudent->clear();
 	if( const auto* item = m_roster.findClass( m_className ) )
@@ -102,7 +145,7 @@ void ClassroomScorePanel::refresh()
 void ClassroomScorePanel::showCall( const QString& ip, const QString& seat, const QString& student )
 {
 	m_callLabel->setText( tr( "来自 %1 的呼叫（%2，座位 %3）" ).arg( student, ip, seat ) );
-	m_callLabel->setStyleSheet( QStringLiteral("color:#c0392b; font-weight:bold;") );
+	m_callLabel->setProperty( "state", QStringLiteral("error") );
 	m_tabs->setCurrentIndex( 0 );
 }
 
@@ -129,9 +172,9 @@ void ClassroomScorePanel::setupDailyTab()
 	layout->addLayout( lessonRow );
 	connect( lessonButton, &QPushButton::clicked, this, [this]() { ensureLesson(); refreshStudentTable(); } );
 
-	m_studentTable = new QTableWidget( 0, 4, page );
+	m_studentTable = new QTableWidget( 0, 5, page );
 	m_studentTable->setHorizontalHeaderLabels( { tr( "Seat" ), tr( "Name" ),
-												 tr( "This lesson" ), tr( "Current total" ) } );
+												 tr( "This lesson" ), tr( "Current total" ), tr( "Level" ) } );
 	m_studentTable->horizontalHeader()->setSectionResizeMode( QHeaderView::Stretch );
 	m_studentTable->setSelectionBehavior( QAbstractItemView::SelectRows );
 	m_studentTable->setEditTriggers( QAbstractItemView::NoEditTriggers );
@@ -253,6 +296,23 @@ void ClassroomScorePanel::setupRulesTab()
 	m_quickActions->setPlaceholderText( tr( "Quick actions, one per line: label:delta" ) );
 	layout->addWidget( m_quickActions );
 
+	auto* levelRow = new QHBoxLayout;
+	levelRow->addWidget( new QLabel( tr( "等级方案：" ), page ) );
+	m_levelScheme = new QComboBox( page );
+	m_levelScheme->addItem( tr( "默认课堂等级" ) );
+	m_levelScheme->addItem( tr( "自定义等级" ) );
+	levelRow->addWidget( m_levelScheme );
+	levelRow->addStretch( 1 );
+	layout->addLayout( levelRow );
+	m_levelTable = new QTableWidget( 0, 2, page );
+	m_levelTable->setHorizontalHeaderLabels( { tr( "最低积分" ), tr( "等级名称" ) } );
+	m_levelTable->horizontalHeader()->setSectionResizeMode( QHeaderView::Stretch );
+	m_levelTable->setMaximumHeight( 190 );
+	layout->addWidget( m_levelTable );
+	connect( m_levelTable, &QTableWidget::itemChanged, this, [this]() {
+		if( m_levelScheme ) { m_levelScheme->setCurrentIndex( 1 ); }
+	} );
+
 	auto* saveButton = new QPushButton( tr( "Save and publish rules" ), page );
 	layout->addWidget( saveButton );
 	connect( saveButton, &QPushButton::clicked, this, [this]() { saveRules(); } );
@@ -272,8 +332,22 @@ void ClassroomScorePanel::saveRules()
 		const auto parts = line.split( QLatin1Char(':'), Qt::SkipEmptyParts );
 		if( parts.size() >= 2 ) { rules.quickActions.append( { parts.at( 0 ).trimmed(), parts.at( 1 ).trimmed().toInt() } ); }
 	}
-	m_book.setRules( rules );
-	QMessageBox::information( this, windowTitle(), tr( "Scoring rules saved." ) );
+	rules.levelSchemeName = m_levelScheme->currentIndex() == 1 ? tr( "自定义等级" ) : tr( "默认课堂等级" );
+	for( int row = 0; row < m_levelTable->rowCount(); ++row )
+	{
+		const auto threshold = m_levelTable->item( row, 0 );
+		const auto name = m_levelTable->item( row, 1 );
+		if( threshold && name && name->text().trimmed().isEmpty() == false )
+		{
+			rules.levels.append( { threshold->text().toInt(), name->text().trimmed() } );
+		}
+	}
+	std::stable_sort( rules.levels.begin(), rules.levels.end(), []( const auto& a, const auto& b ) {
+		return a.first < b.first;
+	} );
+	if( rules.levels.isEmpty() ) { rules.levels = ClassroomScoreBook::defaultLevels(); }
+	const bool saved = m_book.setRules( rules );
+	QMessageBox::information( this, windowTitle(), saved ? tr( "Scoring rules saved." ) : tr( "Could not save scoring rules." ) );
 }
 
 
@@ -432,6 +506,7 @@ void ClassroomScorePanel::ensureLesson()
 {
 	if( m_className.isEmpty() ) { return; }
 	m_book.load( m_className );
+	if( m_lessonPinned && m_lessonId.isEmpty() == false ) { return; }
 	m_lessonId = m_book.ensureLesson( m_lessonDate->date(), m_lessonTopic->text().trimmed() );
 }
 
@@ -452,6 +527,7 @@ void ClassroomScorePanel::refreshStudentTable()
 		m_studentTable->setItem( row, 1, new QTableWidgetItem( student.name ) );
 		m_studentTable->setItem( row, 2, new QTableWidgetItem( labels.join( QStringLiteral("; ") ) ) );
 		m_studentTable->setItem( row, 3, new QTableWidgetItem( QString::number( m_book.total( student.seat, m_lessonId ) ) ) );
+		m_studentTable->setItem( row, 4, new QTableWidgetItem( m_book.levelName( m_book.total( student.seat ) ) ) );
 		++row;
 	}
 }
@@ -499,10 +575,18 @@ int ClassroomScorePanel::scoreForSeat( const QString& seat ) const
 }
 
 
-void ClassroomScorePanel::addEntryForSeat( const QString& seat, int delta, const QString& label,
+QString ClassroomScorePanel::levelForSeat( const QString& seat ) const
+{
+	if( seat.isEmpty() || m_className.isEmpty() ) { return {}; }
+	m_book.load( m_className );
+	return m_book.levelName( m_book.total( seat ) );
+}
+
+
+bool ClassroomScorePanel::addEntryForSeat( const QString& seat, int delta, const QString& label,
 										   const QString& richText )
 {
-	if( seat.isEmpty() || m_className.isEmpty() ) { return; }
+	if( seat.isEmpty() || m_className.isEmpty() ) { return false; }
 	ensureLesson();
 
 	ClassroomScoreEntry entry;
@@ -514,6 +598,7 @@ void ClassroomScorePanel::addEntryForSeat( const QString& seat, int delta, const
 	entry.label = label;
 	entry.richText = richText;
 	entry.author = tr( "Teacher" );
-	m_book.addEntry( entry );
+	if( m_book.addEntry( entry ) == false ) { return false; }
 	refreshStudentTable();
+	return true;
 }

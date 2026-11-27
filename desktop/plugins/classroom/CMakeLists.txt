@@ -23,6 +23,10 @@ build_ikeback_plugin(classroom
 	ClassroomScore.h
 	ClassroomScorePanel.cpp
 	ClassroomScorePanel.h
+	ClassroomShop.cpp
+	ClassroomShop.h
+	ClassroomShopPanel.cpp
+	ClassroomShopPanel.h
 	ClassroomSignInDialog.cpp
 	ClassroomSignInDialog.h
 	ClassroomSeatGrid.cpp
@@ -31,6 +35,8 @@ build_ikeback_plugin(classroom
 	ClassroomSecrets.h
 	ClassroomSystem.cpp
 	ClassroomSystem.h
+	ClassroomTheme.cpp
+	ClassroomTheme.h
 	ClassroomTermReport.cpp
 	ClassroomTermReport.h
 	ClassroomWordCloud.cpp
@@ -46,11 +52,8 @@ endif()
 test_ikeback_plugin(classroom ClassroomSelfTest)
 if(WITH_TESTS)
 	target_include_directories(ClassroomSelfTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-	if(WIN32)
-		# The plugin does not export business classes explicitly; a test executable
-		# needs them visible in the SHARED import library on Windows.
-		set_property(TARGET classroom PROPERTY WINDOWS_EXPORT_ALL_SYMBOLS ON)
-	else()
-		set_tests_properties(ClassroomSelfTest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+	set_tests_properties(ClassroomSelfTest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+	if(WIN32 AND MINGW)
+		target_link_options(classroom PRIVATE "-Wl,--export-all-symbols")
 	endif()
 endif()

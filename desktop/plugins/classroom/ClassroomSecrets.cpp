@@ -180,6 +180,18 @@ QString ClassroomSecrets::adminKeyHash( const QString& key )
 }
 
 
+QString ClassroomSecrets::defaultAdminKey()
+{
+	return QStringLiteral("Admin@123");
+}
+
+
+QString ClassroomSecrets::defaultAdminKeyHash()
+{
+	return QStringLiteral("e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7");
+}
+
+
 bool ClassroomSecrets::verifyAdminKey( const QString& key, const QString& storedHash )
 {
 	if( storedHash.isEmpty() || key.isEmpty() ) { return false; }

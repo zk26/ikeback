@@ -28,9 +28,7 @@ private:
 
 	QCheckBox* m_enabled = nullptr;
 	QLineEdit* m_dataDirectory = nullptr;
-	QLineEdit* m_sessionKey = nullptr;
 	QCheckBox* m_exitProtection = nullptr;
-	QCheckBox* m_exitRequiresAdmin = nullptr;
 	QLineEdit* m_exitAdminUsername = nullptr;
 	QCheckBox* m_allowSelfLogin = nullptr;
 	QCheckBox* m_aiEnabled = nullptr;
@@ -42,12 +40,6 @@ private:
 	QCheckBox* m_monitoringEnabled = nullptr;
 	QSpinBox* m_captureInterval = nullptr;
 	QSpinBox* m_retentionDays = nullptr;
-	QSpinBox* m_scoreBaseScore = nullptr;
-	QCheckBox* m_uwfEnabled = nullptr;
-	QCheckBox* m_internetGuard = nullptr;
-	QCheckBox* m_usbInputBlock = nullptr;
-	QSpinBox* m_bridgePort = nullptr;
-	QCheckBox* m_bridgeEnabled = nullptr;
 	QCheckBox* m_syncEnabled = nullptr;
 	QLineEdit* m_silencePageText = nullptr;
 	QLineEdit* m_wordCloudStopWords = nullptr;

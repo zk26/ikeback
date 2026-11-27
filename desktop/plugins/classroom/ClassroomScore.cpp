@@ -58,6 +58,14 @@ static QJsonArray toEntryArray( const QVector<ClassroomScoreEntry>& entries )
 }
 
 
+static QJsonArray toAttendanceArray( const QVector<ClassroomAttendance>& attendance )
+{
+	QJsonArray array;
+	for( const auto& item : attendance ) { array.append( item.toJson() ); }
+	return array;
+}
+
+
 static QJsonArray toQuickActionArray( const QVector<QPair<QString, int>>& actions )
 {
 	QJsonArray array;
@@ -119,13 +127,50 @@ ClassroomScoreEntry ClassroomScoreEntry::fromJson( const QJsonObject& object )
 }
 
 
+QJsonObject ClassroomAttendance::toJson() const
+{
+	return { { QStringLiteral("lessonId"), lessonId },
+			 { QStringLiteral("className"), className },
+			 { QStringLiteral("seat"), seat },
+			 { QStringLiteral("student"), student },
+			 { QStringLiteral("status"), status },
+			 { QStringLiteral("reason"), reason },
+			 { QStringLiteral("author"), author },
+			 { QStringLiteral("checkInTime"), checkInTime.toString( Qt::ISODateWithMs ) },
+			 { QStringLiteral("updated"), updated.toString( Qt::ISODateWithMs ) } };
+}
+
+
+ClassroomAttendance ClassroomAttendance::fromJson( const QJsonObject& object )
+{
+	ClassroomAttendance attendance;
+	attendance.lessonId = object.value( QStringLiteral("lessonId") ).toString();
+	attendance.className = object.value( QStringLiteral("className") ).toString();
+	attendance.seat = object.value( QStringLiteral("seat") ).toString();
+	attendance.student = object.value( QStringLiteral("student") ).toString();
+	attendance.status = qBound( int( Present ), object.value( QStringLiteral("status") ).toInt( int( Absent ) ),
+								int( Custom ) );
+	attendance.reason = object.value( QStringLiteral("reason") ).toString();
+	attendance.author = object.value( QStringLiteral("author") ).toString();
+	attendance.checkInTime = QDateTime::fromString( object.value( QStringLiteral("checkInTime") ).toString(),
+													 Qt::ISODateWithMs );
+	attendance.updated = QDateTime::fromString( object.value( QStringLiteral("updated") ).toString(),
+												 Qt::ISODateWithMs );
+	return attendance;
+}
+
+
 QJsonObject ClassroomScoreRules::toJson() const
 {
+	QJsonArray levelArray;
+	for( const auto& level : this->levels ) { levelArray.append( QJsonArray{ level.first, level.second } ); }
 	return { { QStringLiteral("published"), published },
 			 { QStringLiteral("baseScore"), baseScore },
 			 { QStringLiteral("html"), html },
 			 { QStringLiteral("updated"), updated.toString( Qt::ISODateWithMs ) },
-			 { QStringLiteral("quickActions"), toQuickActionArray( quickActions ) } };
+			 { QStringLiteral("quickActions"), toQuickActionArray( quickActions ) },
+			 { QStringLiteral("levelSchemeName"), levelSchemeName },
+			 { QStringLiteral("levels"), levelArray } };
 }
 
 
@@ -145,6 +190,18 @@ ClassroomScoreRules ClassroomScoreRules::fromJson( const QJsonObject& object )
 			rules.quickActions.append( { pair.at( 0 ).toString(), pair.at( 1 ).toInt() } );
 		}
 	}
+	rules.levelSchemeName = object.value( QStringLiteral("levelSchemeName") ).toString( rules.levelSchemeName );
+	for( const auto& value : object.value( QStringLiteral("levels") ).toArray() )
+	{
+		const auto pair = value.toArray();
+		if( pair.size() >= 2 && pair.at( 0 ).isDouble() )
+		{
+			rules.levels.append( { pair.at( 0 ).toInt(), pair.at( 1 ).toString() } );
+		}
+	}
+	std::stable_sort( rules.levels.begin(), rules.levels.end(), []( const auto& a, const auto& b ) {
+		return a.first < b.first;
+	} );
 	return rules;
 }
 
@@ -167,6 +224,7 @@ bool ClassroomScoreBook::load( const QString& className )
 	m_className = className;
 	m_lessons.clear();
 	m_entries.clear();
+	m_attendance.clear();
 	m_rules = ClassroomScoreRules{};
 
 	const auto fileName = filePath( className );
@@ -181,6 +239,8 @@ bool ClassroomScoreBook::load( const QString& className )
 	for( const auto& value : lessons ) { m_lessons.append( ClassroomScoreLesson::fromJson( value.toObject() ) ); }
 	const auto entries = object.value( QStringLiteral("entries") ).toArray();
 	for( const auto& value : entries ) { m_entries.append( ClassroomScoreEntry::fromJson( value.toObject() ) ); }
+	const auto attendance = object.value( QStringLiteral("attendance") ).toArray();
+	for( const auto& value : attendance ) { m_attendance.append( ClassroomAttendance::fromJson( value.toObject() ) ); }
 	return true;
 }
 
@@ -244,6 +304,85 @@ bool ClassroomScoreBook::removeEntry( const QString& entryId )
 		}
 	}
 	return false;
+}
+
+
+bool ClassroomScoreBook::setAttendance( const ClassroomAttendance& attendance )
+{
+	if( m_className.isEmpty() || attendance.lessonId.isEmpty() || attendance.seat.isEmpty() ||
+		attendance.status < ClassroomAttendance::Present || attendance.status > ClassroomAttendance::Custom )
+	{
+		return false;
+	}
+	auto copy = attendance;
+	if( copy.className.isEmpty() ) { copy.className = m_className; }
+	if( copy.updated.isValid() == false ) { copy.updated = QDateTime::currentDateTime(); }
+	for( int index = 0; index < m_attendance.size(); ++index )
+	{
+		if( m_attendance.at( index ).lessonId == copy.lessonId && m_attendance.at( index ).seat == copy.seat )
+		{
+			const auto previous = m_attendance.at( index );
+			m_attendance[index] = copy;
+			if( save() ) { return true; }
+			m_attendance[index] = previous;
+			return false;
+		}
+	}
+	m_attendance.append( copy );
+	if( save() ) { return true; }
+	m_attendance.removeLast();
+	return false;
+}
+
+
+ClassroomAttendance ClassroomScoreBook::attendanceFor( const QString& lessonId, const QString& seat ) const
+{
+	for( const auto& attendance : m_attendance )
+	{
+		if( attendance.lessonId == lessonId && attendance.seat == seat ) { return attendance; }
+	}
+	return {};
+}
+
+
+QString ClassroomScoreBook::attendanceText( const QString& lessonId, const QString& seat ) const
+{
+	const auto attendance = attendanceFor( lessonId, seat );
+	switch( attendance.status )
+	{
+	case ClassroomAttendance::Present: return QStringLiteral("出勤");
+	case ClassroomAttendance::Late: return QStringLiteral("迟到");
+	case ClassroomAttendance::Leave: return QStringLiteral("请假");
+	case ClassroomAttendance::Custom: return attendance.reason.isEmpty() ? QStringLiteral("自定义") : attendance.reason;
+	default: return QStringLiteral("缺勤");
+	}
+}
+
+
+QVector<QPair<int, QString>> ClassroomScoreBook::defaultLevels()
+{
+	return { { 0, QStringLiteral("重度危险玩家") },
+			 { 60, QStringLiteral("无电脑玩家") },
+			 { 70, QStringLiteral("危险玩家") },
+			 { 80, QStringLiteral("轻度危险玩家") },
+			 { 90, QStringLiteral("调皮玩家") },
+			 { 100, QStringLiteral("积极玩家") },
+			 { 200, QStringLiteral("达人玩家") },
+			 { 300, QStringLiteral("大神玩家") },
+			 { 500, QStringLiteral("超神玩家") } };
+}
+
+
+QString ClassroomScoreBook::levelName( int score ) const
+{
+	const auto levels = m_rules.levels.isEmpty() ? defaultLevels() : m_rules.levels;
+	QString name = levels.isEmpty() ? QString{} : levels.first().second;
+	for( const auto& level : levels )
+	{
+		if( score >= level.first ) { name = level.second; }
+		else { break; }
+	}
+	return name;
 }
 
 
@@ -315,6 +454,7 @@ QString ClassroomScoreBook::studentHtml( const QString& seat, const QString& stu
 	html += QStringLiteral("<p><b>%1 %2</b> &nbsp; <span style=\"color:#888;\">%3 %4</span></p>")
 				.arg( trText("Current score" ), QString::number( score ),
 					  trText("Base score" ), QString::number( m_rules.baseScore ) );
+	html += QStringLiteral("<p><b>%1：</b>%2</p>").arg( QStringLiteral("等级"), xmlEscape( levelName( score ) ) );
 
 	html += QStringLiteral("<hr><h3>%1</h3>").arg( trText("Score details" ) );
 	const auto details = entriesForStudent( seat );
@@ -360,7 +500,8 @@ QJsonObject ClassroomScoreBook::syncSnapshot() const
 	return { { QStringLiteral("className"), m_className },
 			 { QStringLiteral("rules"), m_rules.toJson() },
 			 { QStringLiteral("lessons"), toLessonArray( m_lessons ) },
-			 { QStringLiteral("entries"), toEntryArray( m_entries ) } };
+			 { QStringLiteral("entries"), toEntryArray( m_entries ) },
+			 { QStringLiteral("attendance"), toAttendanceArray( m_attendance ) } };
 }
 
 
@@ -376,6 +517,9 @@ bool ClassroomScoreBook::applySnapshot( const QJsonObject& snapshot )
 	m_entries.clear();
 	const auto entries = snapshot.value( QStringLiteral("entries") ).toArray();
 	for( const auto& value : entries ) { m_entries.append( ClassroomScoreEntry::fromJson( value.toObject() ) ); }
+	m_attendance.clear();
+	const auto attendance = snapshot.value( QStringLiteral("attendance") ).toArray();
+	for( const auto& value : attendance ) { m_attendance.append( ClassroomAttendance::fromJson( value.toObject() ) ); }
 	return save();
 }
 

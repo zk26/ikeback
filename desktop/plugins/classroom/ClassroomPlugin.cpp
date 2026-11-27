@@ -17,9 +17,13 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
+#include <QCryptographicHash>
 #include <QDesktopServices>
 #include <QDialog>
+#include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QFileSystemWatcher>
 #include <QDialogButtonBox>
 #include <QHostAddress>
@@ -28,8 +32,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkInterface>
-#include <QMenu>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QSet>
 #include <QSettings>
 #include <QStandardPaths>
@@ -49,6 +53,8 @@
 #include "ClassroomPlugin.h"
 #include "ClassroomProtocol.h"
 #include "ClassroomScore.h"
+#include "ClassroomSecrets.h"
+#include "ClassroomShop.h"
 #include "ClassroomSignInDialog.h"
 #include "ClassroomSystem.h"
 #include "ComputerControlInterface.h"
@@ -78,6 +84,55 @@ using namespace Classroom;
 static constexpr int MaxWorkerRestartFailures = 5;
 
 static void persistAdminKeyHash( const QJsonObject& settingsObject );
+static QJsonObject withLocalStudentProtection( QJsonObject settingsObject );
+
+static QString portableAppsRoot()
+{
+#ifdef Q_OS_WIN
+	return QStringLiteral("C:/IkebackApps");
+#else
+	return QStandardPaths::writableLocation( QStandardPaths::AppDataLocation ) + QStringLiteral("/IkebackApps");
+#endif
+}
+
+static bool safeRelativePath( const QString& value )
+{
+	if( value.isEmpty() || value.contains( QLatin1Char(':') ) || QDir::isAbsolutePath( value ) ) { return false; }
+	const auto native = QDir::fromNativeSeparators( value );
+	if( native.startsWith( QLatin1Char('/') ) || native.startsWith( QLatin1Char('\\') ) ) { return false; }
+	for( const auto& part : native.split( QLatin1Char('/') ) )
+	{
+		if( part.isEmpty() || part == QStringLiteral("." ) || part == QStringLiteral(".." ) ) { return false; }
+	}
+	return true;
+}
+
+static bool safePackageFolder( const QString& value )
+{
+	return value.isEmpty() == false && value != QStringLiteral("." ) && value != QStringLiteral(".." ) &&
+		value.contains( QRegularExpression( QStringLiteral("[<>:\"/\\\\|?*]") ) ) == false;
+}
+
+static QByteArray fileSha256( const QString& path )
+{
+	QFile file( path );
+	if( file.open( QIODevice::ReadOnly ) == false ) { return {}; }
+	QCryptographicHash hash( QCryptographicHash::Sha256 );
+	while( file.atEnd() == false )
+	{
+		const auto chunk = file.read( 1024 * 1024 );
+		if( chunk.isEmpty() && file.error() != QFileDevice::NoError ) { return {}; }
+		hash.addData( chunk );
+	}
+	return hash.result().toHex();
+}
+
+static QString desktopShortcutPath( const QString& name )
+{
+	const auto shortcutName = QFileInfo( name ).fileName();
+	return QDir( QStandardPaths::writableLocation( QStandardPaths::DesktopLocation ) ).filePath(
+		shortcutName.endsWith( QStringLiteral(".lnk"), Qt::CaseInsensitive ) ? shortcutName : shortcutName + QStringLiteral(".lnk") );
+}
 
 IMPLEMENT_CONFIG_PROXY(ClassroomConfiguration)
 
@@ -89,8 +144,8 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 							   Feature::Flag::Action | Feature::Flag::Master,
 							   consoleFeatureUid(), Feature::Uid(),
 							   Classroom::productName(), {},
-							   tr( "iKeback - 班级、按 IP 登录、日志、积分与控制" ),
-							   QStringLiteral(":/core/icon22.png") ) ),
+							   tr( "开始上课：进入课堂模式并发起全班签到" ),
+							   QStringLiteral(":/classroom/icons/class.png") ) ),
 	m_clientFeature( Feature( QStringLiteral("ClassroomClient"),
 							  Feature::Flag::Session | Feature::Flag::Service | Feature::Flag::Worker,
 							  clientFeatureUid(), Feature::Uid(),
@@ -103,7 +158,7 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 							  signInFeatureUid(), Feature::Uid(),
 							  tr( "Sign in" ), {},
 							  tr( "Sign in a student by name and seat number" ),
-							  QStringLiteral(":/core/user-group-new.png") ) ),
+							  QStringLiteral(":/classroom/icons/check-in.png") ) ),
 	m_signOutFeature( Feature( QStringLiteral("ClassroomSignOut"),
 							   Feature::Flag::Action | Feature::Flag::Master,
 							   signOutFeatureUid(), Feature::Uid(),
@@ -124,7 +179,7 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 								   checkInFeatureUid(), Feature::Uid(),
 								   tr( "签到" ), {},
 								   tr( "在所有学生机上开始签到" ),
-								   QStringLiteral(":/core/user-group-new.png") ) ),
+								   QStringLiteral(":/classroom/icons/check-in.png") ) ),
 	// 5.2.2: operation log button - answers "did my protection/UWF command
 	// actually succeed?" without digging through the behaviour log.
 	m_operationLogFeature( Feature( QStringLiteral("ClassroomOperationLog"),
@@ -133,8 +188,14 @@ ClassroomPlugin::ClassroomPlugin( QObject* parent ) :
 									tr( "操作记录" ), {},
 									tr( "查看教师操作的执行结果（保护、UWF、静音、远程安装等）" ),
 									QStringLiteral(":/core/document-edit.png") ) ),
+	m_endLessonFeature( Feature( QStringLiteral("ClassroomEndLesson"),
+								 Feature::Flag::Action | Feature::Flag::Master,
+								 endLessonFeatureUid(), Feature::Uid(),
+								 tr( "结束上课" ), {},
+								 tr( "结束当前课堂并返回监控模式" ),
+								 QStringLiteral(":/core/edit-delete.png") ) ),
 	// iKeback / 注销 / 常用工具 不再注册为可用功能，命令行和快捷键也无法触发。
-	m_features( { m_clientFeature, m_signInFeature, m_checkInFeature, m_operationLogFeature } ),
+	m_features( { m_clientFeature, m_consoleFeature, m_checkInFeature, m_operationLogFeature, m_endLessonFeature } ),
 	m_hostName( QHostInfo::localHostName() )
 {
 	m_ipAddress = localIpAddress();
@@ -223,13 +284,13 @@ void ClassroomPlugin::buildQuickActionFeatures()
 	// do that.
 	static const QuickButton buttons[] = {
 		{ "protection.toggle", "保护", "点一下切换：学生能否退出 iKeback 卡片",
-		  ":/classroom/icons/shield.png" },
+		  ":/classroom/icons/protection.png" },
 		{ "uwf.toggle", "UWF", "点一下切换 Windows 写保护（装软件前先关闭）",
 		  ":/classroom/icons/lock.png" },
 		{ "gateway.disable", "禁用网关", "断开学生机外网访问（保留教师机）",
-		  ":/classroom/icons/globe.png" },
+		  ":/classroom/icons/gateway-disable.png" },
 		{ "gateway.enable", "启用网关", "恢复学生机外网访问",
-		  ":/classroom/icons/globe.png" },
+		  ":/classroom/icons/gateway-enable.png" },
 		{ "silence.toggle", "肃静页", "点一下显示或收起肃静页面",
 		  ":/classroom/icons/silence.png" },
 		{ "appblock.toggle", "禁用应用", "添加关键字，命中即拦截程序",
@@ -243,7 +304,7 @@ void ClassroomPlugin::buildQuickActionFeatures()
 		{ "score.m1", "全部减分", "给全班每人减分（填写分数与原因）",
 		  ":/classroom/icons/minus.png" },
 		{ "remote.install", "远程装软件", "选择安装包后下发到学生机安装",
-		  ":/classroom/icons/install.png" },
+		  ":/classroom/icons/remote-install.png" },
 		{ "batch.programs", "批量打开程序", "一次填写多个学生机程序路径并批量下发",
 		  ":/core/document-open.png" },
 		{ "batch.websites", "批量打开网页", "一次填写多个网址并批量下发",
@@ -253,13 +314,11 @@ void ClassroomPlugin::buildQuickActionFeatures()
 	int index = 0;
 	for( const auto& button : buttons )
 	{
+		const auto id = QString::fromLatin1( button.id );
 		const auto uid = quickActionUid( index );
-		m_quickActionIds.append( QString::fromLatin1( button.id ) );
-		// displayName is what the tool bar prints below the icon, so every quick
-		// action needs its own label here (an empty displayName renders an
-		// unlabelled button).
+		m_quickActionIds.append( id );
 		const auto label = QCoreApplication::translate( "ClassroomPlugin", button.name );
-		m_features.append( Feature( label,
+		m_features.append( Feature( id,
 									Feature::Flag::Action | Feature::Flag::Master,
 									uid, Feature::Uid(),
 									label, {},
@@ -274,10 +333,8 @@ ClassroomPlugin::~ClassroomPlugin()
 {
 	if( m_trayIcon )
 	{
-		// setContextMenu() does not transfer ownership.
-		delete m_trayIcon->contextMenu();
+		delete m_trayIcon;
 	}
-	delete m_trayIcon;
 	m_trayIcon = nullptr;
 	delete m_clientWidget;
 	m_clientWidget = nullptr;
@@ -304,22 +361,6 @@ void ClassroomPlugin::ensureTrayIcon()
 
 	m_trayIcon = new QSystemTrayIcon( QIcon( QStringLiteral(":/core/icon32.png") ), this );
 	m_trayIcon->setToolTip( Classroom::productName() );
-
-	auto* menu = new QMenu;
-	menu->addAction( tr( "显示 iKeback 卡片" ), this, [this]() {
-		if( m_clientWidget ) { m_clientWidget->reactivate(); }
-	} );
-	menu->addAction( tr( "我的成绩" ), this, [this]() {
-		if( m_clientWidget ) { m_clientWidget->requestScore(); }
-	} );
-	menu->addAction( tr( "AI 助手" ), this, [this]() {
-		if( m_clientWidget ) { m_clientWidget->openAiAssistant(); }
-	} );
-	menu->addSeparator();
-	menu->addAction( tr( "退出（受保护）" ), this, [this]() {
-		if( m_clientWidget ) { m_clientWidget->requestProtectedQuit(); }
-	} );
-	m_trayIcon->setContextMenu( menu );
 
 	connect( m_trayIcon, &QSystemTrayIcon::activated, this,
 			 [this]( QSystemTrayIcon::ActivationReason reason ) {
@@ -599,6 +640,14 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 		return true;
 	}
 
+	// --------------------------------------------------------------- end lesson
+	if( feature.uid() == endLessonFeatureUid() )
+	{
+		if( m_dialog ) { m_dialog->endLesson(); }
+		master.setClassroomMode( false );
+		return true;
+	}
+
 	// ------------------------------------------- first-class quick action buttons
 	for( int index = 0; index < m_quickActionIds.size(); ++index )
 	{
@@ -607,7 +656,7 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 		// console, so make sure it exists - but HIDDEN: a one-click action must
 		// not pop up the whole console window (5.2.2 UX fix).
 		if( ensureConsoleDialog( master, computerControlInterfaces, false ) == nullptr ) { return true; }
-		m_dialog->runQuickTool( m_quickActionIds.at( index ) );
+		m_dialog->runQuickTool( m_quickActionIds.at( index ), computerControlInterfaces );
 		return true;
 	}
 
@@ -639,7 +688,9 @@ bool ClassroomPlugin::startFeature( IkebackMasterInterface& master, const Featur
 
 	if( feature.uid() != consoleFeatureUid() ) { return false; }
 
-	ensureConsoleDialog( master, computerControlInterfaces, true );
+	if( ensureConsoleDialog( master, computerControlInterfaces, false ) == nullptr ) { return true; }
+	m_dialog->beginLesson();
+	master.setClassroomMode( true );
 	return true;
 }
 
@@ -648,14 +699,15 @@ ClassroomMasterDialog* ClassroomPlugin::ensureConsoleDialog( IkebackMasterInterf
 															const ComputerControlInterfaceList& computerControlInterfaces,
 															bool show )
 {
-	// The console always opens as its own window (a pop-up) instead of being
-	// docked into the Master window: the monitoring view must stay usable while
-	// the console is open, and teachers expect a dialog they can move/close.
+	// The console is embedded in the Master's central stack. Quick actions may
+	// create it without switching the visible page; starting a lesson does.
 	if( m_dialog.isNull() )
 	{
-		m_dialog = new ClassroomMasterDialog( master, m_configuration, *roster(), *store(), *settings() );
-		m_dialog->setWindowFlag( Qt::Window );
+		m_dialog = new ClassroomMasterDialog( master, m_configuration, *roster(), *store(), *settings(),
+											  master.mainWindow() );
 		m_dialog->setWindowTitle( Classroom::productName() );
+		m_dialog->restoreProtectionStates( m_studentProtectionByAddress );
+		master.setClassroomPage( m_dialog.data() );
 		connect( m_dialog.data(), &ClassroomMasterDialog::hideRequested, m_dialog.data(), [this]() {
 			if( m_dialog ) { m_dialog->hide(); }
 		} );
@@ -663,9 +715,9 @@ ClassroomMasterDialog* ClassroomPlugin::ensureConsoleDialog( IkebackMasterInterf
 
 	if( show )
 	{
+		master.setClassroomMode( true );
 		m_dialog->show();
 		m_dialog->raise();
-		m_dialog->activateWindow();
 
 		// One message, one session-worker wake-up. The old three-message burst
 		// re-armed the watchdog and repeatedly called startUnmanagedSessionWorker()
@@ -689,8 +741,9 @@ ClassroomMasterDialog* ClassroomPlugin::ensureConsoleDialog( IkebackMasterInterf
 
 void ClassroomPlugin::startClient( IkebackServerInterface& server )
 {
-	const auto settingsObject = ClassroomSettings::forStudents(
+	auto settingsObject = ClassroomSettings::forStudents(
 		ClassroomSettings::fromConfiguration( m_configuration ) );
+	settingsObject = withLocalStudentProtection( settingsObject );
 	persistAdminKeyHash( settingsObject );
 
 	auto message = Classroom::message( Command::StartClient );
@@ -825,6 +878,22 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackServerInterface& server, cons
 		persistAdminKeyHash( QJsonDocument::fromJson(
 			message.argument( Argument::SettingsJson ).toString().toUtf8() ).object() );
 	}
+#ifdef Q_OS_WIN
+	if( command == Command::SetExitProtection )
+	{
+		QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Classroom"),
+						   QSettings::Registry64Format );
+		machine.setValue( QStringLiteral("ExitProtection"), message.argument( Argument::Enabled ).toBool() );
+		machine.sync();
+	}
+	if( command == Command::SetUninstallProtection )
+	{
+		QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
+						   QSettings::Registry64Format );
+		machine.setValue( QStringLiteral("UninstallProtection"), message.argument( Argument::Enabled ).toBool() );
+		machine.sync();
+	}
+#endif
 	if( command == Command::StopClient )
 	{
 		m_stopAllowed = true;
@@ -860,12 +929,17 @@ bool ClassroomPlugin::handleFeatureMessageFromWorker( IkebackServerInterface& se
 	case Command::ReportEvent:
 	case Command::ReportIdentity:
 	case Command::InstallResult:
+	case Command::DeployPackageResult:
 	case Command::QueryScore:
 	case Command::CallTeacher:
 	case Command::CheckInReply:
 	case Command::UwfStatusReport:
 	case Command::ProtectionStateReport:
 	case Command::AiPrompt:
+	case Command::ShopQuery:
+	case Command::ShopRedeem:
+	case Command::ShopBid:
+	case Command::ShopImageQuery:
 		if( hasActiveContext() )
 		{
 			for( const auto& context : m_contexts )
@@ -894,12 +968,40 @@ bool ClassroomPlugin::handleFeatureMessageFromWorker( IkebackServerInterface& se
 }
 
 
+static QString shopMachineAddress( const ComputerControlInterface::Pointer& controlInterface );
+
 bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer computerControlInterface,
 											const FeatureMessage& message )
 {
 	if( message.featureUid() != clientFeatureUid() ) { return false; }
 
 	const auto command = message.command<Command>();
+	if( command == Command::ProtectionStateReport )
+	{
+		const auto enabled = message.argument( Argument::Enabled ).toBool();
+		const auto ip = message.argument( Argument::Ip ).toString();
+		const auto host = message.argument( Argument::Host ).toString();
+		for( const auto& key : QStringList{ shopMachineAddress( computerControlInterface ), ip, host } )
+		{
+			if( key.trimmed().isEmpty() == false ) { m_studentProtectionByAddress.insert( key.trimmed(), enabled ); }
+		}
+		if( m_dialog ) { m_dialog->recordProtectionState( ip, enabled ); }
+		ClassroomEvent event;
+		event.timestamp = QDateTime::currentDateTime();
+		event.ip = ip;
+		event.host = host;
+		event.type = EventType::protection();
+		event.detail = enabled ? QStringLiteral("student protection enabled") : QStringLiteral("student protection disabled");
+		store()->append( event );
+		Q_EMIT eventReceived();
+		return true;
+	}
+	if( command == Command::ShopQuery || command == Command::ShopRedeem ||
+		command == Command::ShopBid || command == Command::ShopImageQuery )
+	{
+		handleShopRequest( message, computerControlInterface );
+		return true;
+	}
 	if( command == Command::QueryScore )
 	{
 		const auto className = message.argument( Argument::ClassName ).toString();
@@ -953,6 +1055,24 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 		return true;
 	}
 
+	if( command == Command::DeployPackageResult )
+	{
+		const auto ok = message.argument( Argument::Result ).toString() == QStringLiteral("ok");
+		const auto phase = message.argument( Argument::DeployPhase ).toString();
+		const auto ip = message.argument( Argument::Ip ).toString();
+		const auto detail = message.argument( Argument::Detail ).toString();
+		if( m_dialog ) { m_dialog->recordPackageResult( ip, phase, ok, detail ); }
+		ClassroomEvent event;
+		event.timestamp = QDateTime::currentDateTime();
+		event.ip = ip;
+		event.host = message.argument( Argument::Host ).toString();
+		event.type = EventType::install();
+		event.detail = QStringLiteral("deployment %1 %2: %3" ).arg( phase, ok ? QStringLiteral("ok") : QStringLiteral("failed"), detail );
+		store()->append( event );
+		Q_EMIT eventReceived();
+		return true;
+	}
+
 	if( command == Command::InstallResult )
 	{
 		const auto ok = message.argument( Argument::Result ).toString() == QStringLiteral("ok");
@@ -983,11 +1103,14 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 	{
 		// FeatureMessage 的参数是 QVariant（没有默认值重载），必须直接 toBool()。
 		const auto loggedIn = message.argument( Argument::Enabled ).toBool();
+		const auto className = message.argument( Argument::ClassName ).toString().trimmed();
+		const auto seat = message.argument( Argument::Seat ).toString().trimmed();
+		const auto student = message.argument( Argument::Student ).toString().trimmed();
 		ClassroomEvent event;
 		event.timestamp = QDateTime::currentDateTime();
-		event.className = message.argument( Argument::ClassName ).toString();
-		event.seat = message.argument( Argument::Seat ).toString();
-		event.student = message.argument( Argument::Student ).toString();
+		event.className = className;
+		event.seat = seat;
+		event.student = student;
 		event.ip = message.argument( Argument::Ip ).toString();
 		event.host = message.argument( Argument::Host ).toString();
 		event.type = loggedIn ? EventType::assign() : EventType::logout();
@@ -995,11 +1118,14 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 								: QStringLiteral("student signed out");
 		const auto display = loggedIn ?
 			QStringLiteral("座位 %1 %2").arg( event.seat, event.student ).trimmed() : QString{};
-		for( const auto& key : QStringList{ event.ip, event.host } )
+		const auto identity = QVector<QString>{ className, seat, student };
+		for( const auto& key : QStringList{ shopMachineAddress( computerControlInterface ), event.ip, event.host } )
 		{
 			if( key.trimmed().isEmpty() ) { continue; }
 			if( loggedIn ) { m_studentDisplayByIp.insert( key.trimmed(), display ); }
 			else { m_studentDisplayByIp.remove( key.trimmed() ); }
+			if( loggedIn ) { m_studentIdentityByAddress.insert( key.trimmed(), identity ); }
+			else { m_studentIdentityByAddress.remove( key.trimmed() ); }
 		}
 		store()->append( event );
 		if( m_dialog )
@@ -1079,6 +1205,204 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 }
 
 
+//! Address of the student machine behind a control interface - the same
+//! identifier the console uses to match roster entries.
+static QString shopMachineAddress( const ComputerControlInterface::Pointer& controlInterface )
+{
+	if( controlInterface.isNull() ) { return {}; }
+	const auto address = controlInterface->computer().hostAddress().toString().trimmed();
+	return address.isEmpty() ? controlInterface->computer().hostName().trimmed() : address;
+}
+
+
+//! The shop acts as the student signed in on that machine, exactly like score
+//! queries and teacher calls: the seat/name pair must exist in the roster of
+//! the class. Unknown identities never see a balance and can neither redeem
+//! nor bid.
+static bool shopIdentityKnown( ClassroomRoster& roster, const QString& className,
+							   const QString& seat, const QString& student )
+{
+	if( seat.isEmpty() || student.isEmpty() ) { return false; }
+	const auto* rosterStudent = roster.findStudent( className, seat );
+	return rosterStudent != nullptr && rosterStudent->name == student;
+}
+
+
+//! Master-side shop request handler (runs in the ikeback Master process).
+//! Everything is validated against the teacher machine's own books; student
+//! machines never write shop data.
+void ClassroomPlugin::handleShopRequest( const FeatureMessage& message,
+										 const ComputerControlInterface::Pointer& computerControlInterface )
+{
+	const auto command = message.command<Command>();
+	const auto className = message.argument( Argument::ClassName ).toString().trimmed();
+	const auto seat = message.argument( Argument::Seat ).toString().trimmed();
+	const auto student = message.argument( Argument::Student ).toString().trimmed();
+	const auto machine = computerControlInterface ?
+		computerControlInterface->computer().displayName() : message.argument( Argument::Host ).toString();
+
+	// The catalog is always that of the class the signed-in student belongs
+	// to; an unknown or empty class simply has an empty shop.
+	ClassroomShopBook book( dataDirectory() );
+	if( book.load( className ) == false )
+	{
+		const auto action = command == Command::ShopBid ? Classroom::ShopAction::bid() :
+			( ( command == Command::ShopQuery || command == Command::ShopImageQuery ) ?
+			  Classroom::ShopAction::query() : Classroom::ShopAction::redeem() );
+		auto reply = Classroom::message( Command::ShopReply );
+		reply.addArgument( Argument::ShopAction, action )
+			 .addArgument( Argument::ClassName, className )
+			 .addArgument( Argument::Result, Classroom::ShopAction::failed() )
+			 .addArgument( Argument::Message, tr( "商城数据加载失败，请联系老师检查数据文件。" ) )
+			 .addArgument( Argument::TotalScore, -1 );
+		if( computerControlInterface ) { computerControlInterface->sendFeatureMessage( reply ); }
+		return;
+	}
+
+	// Identity follows the same rule as the floating card's sign-in: seat and
+	// name must be a student of that class in the roster. Without a valid
+	// identity a student may look, but never sees a balance, redeem or bid.
+	bool identityOk = shopIdentityKnown( *roster(), className, seat, student );
+	if( identityOk && computerControlInterface )
+	{
+		const auto reported = m_studentIdentityByAddress.value( shopMachineAddress( computerControlInterface ) );
+		identityOk = reported.size() == 3 && reported.at( 0 ) == className &&
+					 reported.at( 1 ) == seat && reported.at( 2 ) == student;
+	}
+	else
+	{
+		identityOk = false;
+	}
+
+	const auto send = [&computerControlInterface]( const FeatureMessage& reply ) {
+		if( computerControlInterface ) { computerControlInterface->sendFeatureMessage( reply ); }
+	};
+	const auto catalogText = [&book]() {
+		return QJsonDocument( book.catalogJson() ).toJson( QJsonDocument::Compact );
+	};
+
+	// --------------------------------------------------------- product image
+	if( command == Command::ShopImageQuery )
+	{
+		const auto productId = message.argument( Argument::ProductId ).toString();
+		const auto imageId = message.argument( Argument::ShopImageId ).toString();
+		const auto* product = book.product( productId );
+		const bool imageOk = identityOk && product != nullptr && product->imageId == imageId &&
+							 product->image.isEmpty() == false;
+		auto reply = Classroom::message( Command::ShopImageReply );
+		reply.addArgument( Argument::ClassName, className )
+			 .addArgument( Argument::ProductId, productId )
+			 .addArgument( Argument::ShopImageId, imageId )
+			 .addArgument( Argument::Result, imageOk ? Classroom::ShopAction::ok()
+													: Classroom::ShopAction::failed() )
+			 .addArgument( Argument::Message, imageOk ? QString{} : tr( "商品图片不存在或身份已失效。" ) )
+			 .addArgument( Argument::ShopImageData, imageOk ? product->image : QByteArray{} );
+		send( reply );
+		return;
+	}
+
+	// ------------------------------------------------------------ shop query
+	if( command == Command::ShopQuery )
+	{
+		auto reply = Classroom::message( Command::ShopState );
+		reply.addArgument( Argument::ClassName, className )
+			 .addArgument( Argument::ShopJson, identityOk ? catalogText() : QByteArrayLiteral("{}") )
+			 .addArgument( Argument::TotalScore, identityOk ? book.balance( seat ) : -1 );
+		send( reply );
+		return;
+	}
+
+	// -------------------------------------------------------- redeem / bid
+	QString errorText;
+	auto action = Classroom::ShopAction::redeem();
+	QString item;
+	if( identityOk == false )
+	{
+		errorText = tr( "请先用座位号和姓名签到，再使用班级商场。" );
+	}
+	else if( command == Command::ShopRedeem )
+	{
+		const auto productId = message.argument( Argument::ProductId ).toString();
+		if( const auto* product = book.product( productId ) ) { item = product->name; }
+		errorText = book.redeem( productId, seat, student, book.balance( seat ) );
+	}
+	else if( command == Command::ShopBid )
+	{
+		action = Classroom::ShopAction::bid();
+		const auto auctionId = message.argument( Argument::AuctionId ).toString();
+		bool amountOk = false;
+		const auto amount = message.argument( Argument::Amount ).toInt( &amountOk );
+		if( const auto* auction = book.auction( auctionId ) ) { item = auction->name; }
+		if( amountOk == false )
+		{
+			errorText = tr( "出价无效。" );
+		}
+		else
+		{
+			errorText = book.placeBid( auctionId, amount, seat, student, book.balance( seat ) );
+			if( errorText.isEmpty() ) { item = QStringLiteral("%1（%2 分）").arg( item ).arg( amount ); }
+		}
+	}
+	else
+	{
+		return;
+	}
+
+	const auto ok = errorText.isEmpty();
+	auto reply = Classroom::message( Command::ShopReply );
+	reply.addArgument( Argument::ShopAction, action )
+		 .addArgument( Argument::ClassName, className )
+		 .addArgument( Argument::Result, ok ? Classroom::ShopAction::ok()
+											: Classroom::ShopAction::failed() )
+		 .addArgument( Argument::Message,
+					   ok ? ( action == Classroom::ShopAction::bid() ?
+								  tr( "出价成功，结束时价高者得。" ) :
+								  tr( "兑换成功，请等待老师发货。" ) )
+						  : errorText )
+		 .addArgument( Argument::TotalScore, identityOk ? book.balance( seat ) : -1 )
+		 // The catalog is built AFTER the operation, so the student at once
+		 // sees the new stock / leading bid.
+		 .addArgument( Argument::ShopJson, identityOk ? catalogText() : QByteArrayLiteral("{}") );
+	send( reply );
+
+	// Audit trail for every attempt - failed ones show who tried what.
+	ClassroomEvent event;
+	event.timestamp = QDateTime::currentDateTime();
+	event.className = className;
+	event.seat = seat;
+	event.student = student;
+	event.host = machine;
+	event.ip = shopMachineAddress( computerControlInterface );
+	event.type = action == Classroom::ShopAction::bid() ? EventType::auction() : EventType::shop();
+	event.detail = ok ?
+		QStringLiteral( "%1 %2" ).arg( action == Classroom::ShopAction::bid() ?
+			QStringLiteral( "bid on" ) : QStringLiteral( "redeemed" ), item ) :
+		QStringLiteral( "rejected %1: %2" ).arg( item, errorText );
+	store()->append( event );
+
+	if( ok )
+	{
+		// Everyone else's catalog changed (stock, leading bid, bid list).
+		broadcastShopState( className );
+		if( m_dialog )
+		{
+			m_dialog->refreshShopPanel();
+			if( action == Classroom::ShopAction::redeem() ) { m_dialog->refreshScoresAfterShop(); }
+		}
+	}
+	Q_EMIT eventReceived();
+}
+
+
+void ClassroomPlugin::broadcastShopState( const QString& className )
+{
+	// The console owns the list of all student control interfaces. It is
+	// created on the first console open and then keeps living (hidden), which
+	// is fine: a shop without products cannot exist before that anyway.
+	if( m_dialog ) { m_dialog->broadcastShopState( className ); }
+}
+
+
 void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 {
 	if( m_clientWidget ) { return; }
@@ -1125,6 +1449,54 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 			 .addArgument( Argument::Ip, m_ipAddress );
 		m_worker->sendFeatureMessageReply( query );
 	} );
+	connect( m_clientWidget, &ClassroomClientWidget::shopRequested, this, [this]() {
+		if( m_worker == nullptr ) { return; }
+		auto query = Classroom::message( Command::ShopQuery );
+		query.addArgument( Argument::ClassName, m_className )
+			 .addArgument( Argument::Seat, m_seat )
+			 .addArgument( Argument::Student, m_student )
+			 .addArgument( Argument::Host, m_hostName )
+			 .addArgument( Argument::Ip, m_ipAddress );
+		m_worker->sendFeatureMessageReply( query );
+	} );
+	connect( m_clientWidget, &ClassroomClientWidget::shopRedeemRequested, this,
+			 [this]( const QString& productId ) {
+				 if( m_worker == nullptr ) { return; }
+				 auto redeem = Classroom::message( Command::ShopRedeem );
+				 redeem.addArgument( Argument::ClassName, m_className )
+					   .addArgument( Argument::Seat, m_seat )
+					   .addArgument( Argument::Student, m_student )
+					   .addArgument( Argument::Host, m_hostName )
+					   .addArgument( Argument::Ip, m_ipAddress )
+					   .addArgument( Argument::ProductId, productId );
+				 m_worker->sendFeatureMessageReply( redeem );
+			 } );
+	connect( m_clientWidget, &ClassroomClientWidget::shopBidRequested, this,
+			 [this]( const QString& auctionId, int amount ) {
+				 if( m_worker == nullptr ) { return; }
+				 auto bid = Classroom::message( Command::ShopBid );
+				 bid.addArgument( Argument::ClassName, m_className )
+					.addArgument( Argument::Seat, m_seat )
+					.addArgument( Argument::Student, m_student )
+					.addArgument( Argument::Host, m_hostName )
+					.addArgument( Argument::Ip, m_ipAddress )
+					.addArgument( Argument::AuctionId, auctionId )
+					.addArgument( Argument::Amount, amount );
+				 m_worker->sendFeatureMessageReply( bid );
+			 } );
+	connect( m_clientWidget, &ClassroomClientWidget::shopImageRequested, this,
+			 [this]( const QString& productId, const QString& imageId ) {
+				 if( m_worker == nullptr ) { return; }
+				 auto query = Classroom::message( Command::ShopImageQuery );
+				 query.addArgument( Argument::ClassName, m_className )
+					  .addArgument( Argument::Seat, m_seat )
+					  .addArgument( Argument::Student, m_student )
+					  .addArgument( Argument::Host, m_hostName )
+					  .addArgument( Argument::Ip, m_ipAddress )
+					  .addArgument( Argument::ProductId, productId )
+					  .addArgument( Argument::ShopImageId, imageId );
+				 m_worker->sendFeatureMessageReply( query );
+			 } );
 	connect( m_clientWidget, &ClassroomClientWidget::aiPromptRequested, this,
 			 [this]( const QString& prompt, const QVariantList& history ) {
 				 if( m_worker == nullptr ) { return; }
@@ -1191,17 +1563,76 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 }
 
 
-//! Mirror the super-admin key digest into HKLM (machine-readable, writable
-//! only with elevation) so the configurator can gate itself on student
-//! machines. Called in the server process which runs as SYSTEM.
+static QJsonObject withLocalStudentProtection( QJsonObject settingsObject )
+{
+#ifdef Q_OS_WIN
+	QSettings user( QStringLiteral("HKEY_CURRENT_USER\\SOFTWARE\\ikeback\\Classroom"),
+					QSettings::Registry64Format );
+	if( user.contains( QStringLiteral("ExitProtection") ) )
+	{
+		settingsObject.insert( Classroom::SettingKey::exitProtection(),
+							   user.value( QStringLiteral("ExitProtection") ).toBool() );
+	}
+	if( user.contains( QStringLiteral("ExitAdminUsername") ) )
+	{
+		settingsObject.insert( Classroom::SettingKey::exitAdminUsername(),
+							   user.value( QStringLiteral("ExitAdminUsername") ).toString() );
+	}
+	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
+					   QSettings::Registry64Format );
+	const auto storedHash = machine.value( QStringLiteral("AdminKeyHash") ).toString();
+	if( storedHash.isEmpty() == false )
+	{
+		settingsObject.insert( Classroom::SettingKey::adminKeyHash(), storedHash );
+	}
+#else
+	Q_UNUSED(settingsObject)
+#endif
+	return settingsObject;
+}
+
+
+//! Mirror the super-admin key digest into HKLM so the configurator and the
+//! cooperative uninstaller can verify it. Never erase a working digest merely
+//! because a student-side settings snapshot does not contain the teacher key.
 static void persistAdminKeyHash( const QJsonObject& settingsObject )
 {
 #ifdef Q_OS_WIN
 	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
 					   QSettings::Registry64Format );
-	machine.setValue( QStringLiteral("AdminKeyHash"),
-					  settingsObject.value( Classroom::SettingKey::adminKeyHash() ).toString() );
+	auto hash = settingsObject.value( Classroom::SettingKey::adminKeyHash() ).toString();
+	if( hash.isEmpty() )
+	{
+		hash = machine.value( QStringLiteral("AdminKeyHash") ).toString();
+	}
+	if( hash.isEmpty() ) { hash = ClassroomSecrets::defaultAdminKeyHash(); }
+	machine.setValue( QStringLiteral("AdminKeyHash"), hash );
 	machine.sync();
+#else
+	Q_UNUSED(settingsObject)
+#endif
+}
+
+
+static void persistWorkerProtection( const QJsonObject& settingsObject )
+{
+#ifdef Q_OS_WIN
+	QSettings user( QStringLiteral("HKEY_CURRENT_USER\\SOFTWARE\\ikeback\\Classroom"),
+					QSettings::Registry64Format );
+	user.setValue( QStringLiteral("ExitProtection"),
+				   settingsObject.value( Classroom::SettingKey::exitProtection() ).toBool( true ) );
+	user.setValue( QStringLiteral("ExitAdminUsername" ),
+				   settingsObject.value( Classroom::SettingKey::exitAdminUsername() ).toString() );
+	user.sync();
+
+	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Classroom"),
+					   QSettings::Registry64Format );
+	machine.setValue( QStringLiteral("ExitProtection"),
+					  settingsObject.value( Classroom::SettingKey::exitProtection() ).toBool( true ) );
+	machine.setValue( QStringLiteral("ExitAdminUsername" ),
+					  settingsObject.value( Classroom::SettingKey::exitAdminUsername() ).toString() );
+	machine.sync();
+	persistAdminKeyHash( settingsObject );
 #else
 	Q_UNUSED(settingsObject)
 #endif
@@ -1211,6 +1642,7 @@ static void persistAdminKeyHash( const QJsonObject& settingsObject )
 void ClassroomPlugin::applyWorkerSettings( const QJsonObject& settingsObject )
 {
 	m_workerSettings = settingsObject;
+	persistWorkerProtection( settingsObject );
 	if( m_clientWidget ) { m_clientWidget->setSettings( settingsObject ); }
 	if( m_monitor ) { m_monitor->setSettings( settingsObject ); }
 }
@@ -1246,6 +1678,86 @@ void ClassroomPlugin::reportEvent( const QString& type, const QString& detail, c
 }
 
 
+void ClassroomPlugin::sendPackageResult( const QString& phase, bool ok, const QString& detail )
+{
+	if( m_worker == nullptr ) { return; }
+	auto reply = Classroom::message( Command::DeployPackageResult );
+	reply.addArgument( Argument::DeploymentId, m_packageId )
+		 .addArgument( Argument::DeployPhase, phase )
+		 .addArgument( Argument::Result, ok ? QStringLiteral("ok") : QStringLiteral("failed") )
+		 .addArgument( Argument::Detail, detail.left( 1000 ) )
+		 .addArgument( Argument::Host, m_hostName )
+		 .addArgument( Argument::Ip, m_ipAddress );
+	m_worker->sendFeatureMessageReply( reply );
+}
+
+
+bool ClassroomPlugin::verifyDeployedPackage( const QJsonObject& state, QString* error ) const
+{
+	const auto manifest = state.value( QStringLiteral("manifest") ).toObject();
+	const auto folder = manifest.value( QStringLiteral("folder") ).toString();
+	if( safePackageFolder( folder ) == false ) { if( error ) { *error = QStringLiteral("invalid folder name"); } return false; }
+	const auto root = QDir( portableAppsRoot() ).filePath( folder );
+	const auto files = manifest.value( QStringLiteral("files") ).toArray();
+	for( const auto& value : files )
+	{
+		const auto entry = value.toObject();
+		const auto relative = entry.value( QStringLiteral("path") ).toString();
+		if( safeRelativePath( relative ) == false ) { if( error ) { *error = QStringLiteral("invalid file path"); } return false; }
+		const auto path = QDir( root ).filePath( relative );
+		if( QFileInfo( path ).size() != entry.value( QStringLiteral("size") ).toVariant().toLongLong() ||
+			fileSha256( path ) != entry.value( QStringLiteral("sha256") ).toString().toLatin1() )
+		{
+			if( error ) { *error = QStringLiteral("file verification failed: %1" ).arg( relative ); }
+			return false;
+		}
+	}
+	const auto shortcut = state.value( QStringLiteral("shortcutPath") ).toString();
+	if( shortcut.isEmpty() || QFileInfo::exists( shortcut ) == false )
+	{
+		if( error ) { *error = QStringLiteral("desktop shortcut is missing"); }
+		return false;
+	}
+	return true;
+}
+
+
+void ClassroomPlugin::resumePackageDeployment()
+{
+	if( m_worker == nullptr ) { return; }
+	QDir apps( portableAppsRoot() );
+	const auto states = apps.entryList( { QStringLiteral(".ikeback-deploy-*.json") }, QDir::Files );
+	for( const auto& fileName : states )
+	{
+		QFile file( apps.filePath( fileName ) );
+		if( file.open( QIODevice::ReadOnly ) == false ) { continue; }
+		const auto state = QJsonDocument::fromJson( file.readAll() ).object();
+		if( state.value( QStringLiteral("phase") ).toString() != QStringLiteral("verify") ) { continue; }
+		m_packageId = state.value( QStringLiteral("id") ).toString();
+		QString error;
+		const auto ok = verifyDeployedPackage( state, &error );
+		const auto statePath = file.fileName();
+		file.close();
+		sendPackageResult( QStringLiteral("verify"), ok, ok ? QStringLiteral("verified after reboot") : error );
+		if( ok ) { QFile::remove( statePath ); }
+	}
+	m_packageId.clear();
+}
+
+
+void ClassroomPlugin::resetPackageReceive()
+{
+	if( m_packageFile )
+	{
+		m_packageFile->close();
+		delete m_packageFile;
+		m_packageFile = nullptr;
+	}
+	m_packageRelativePath.clear();
+	m_packageOffset = 0;
+}
+
+
 bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, const FeatureMessage& message )
 {
 	if( message.featureUid() != clientFeatureUid() ) { return false; }
@@ -1260,7 +1772,10 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 		const auto commandWithoutUi = message.command<Command>();
 		if( commandWithoutUi != Command::DeployFileBegin &&
 			commandWithoutUi != Command::DeployFileChunk &&
-			commandWithoutUi != Command::UwfInstall )
+			commandWithoutUi != Command::UwfInstall &&
+			commandWithoutUi != Command::DeployPackageBegin &&
+			commandWithoutUi != Command::DeployPackageChunk &&
+			commandWithoutUi != Command::DeployPackageCommit )
 		{
 			return true;
 		}
@@ -1273,14 +1788,22 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 	switch( message.command<Command>() )
 	{
 	case Command::StartClient:
+	{
 		applyWorkerSettings( settingsFromJson() );
 		m_keyConfigured = message.argument( Argument::KeyConfigured ).toBool();
 		m_sessionId = message.argument( Argument::SessionId ).toString();
 		m_clientWidget->setKeyConfigured( m_keyConfigured );
 		m_clientWidget->reactivate();
 		IkebackCore::platform().coreFunctions().raiseWindow( m_clientWidget, false );
+		resumePackageDeployment();
+		auto protectionReply = Classroom::message( Command::ProtectionStateReport );
+		protectionReply.addArgument( Argument::Enabled,
+			m_workerSettings.value( SettingKey::exitProtection() ).toBool( true ) )
+			.addArgument( Argument::Ip, m_ipAddress ).addArgument( Argument::Host, m_hostName );
+		if( m_worker ) { m_worker->sendFeatureMessageReply( protectionReply ); }
 		reportEvent( EventType::connection(), QStringLiteral("classroom client connected"), {} );
 		break;
+	}
 
 	case Command::ApplySession:
 		// Combined console-open state. Keeping it to one message avoids
@@ -1374,6 +1897,50 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 										message.argument( Argument::AiAnswer ).toString() );
 		break;
 
+	// --------------------------------------------------- 5.3.0 shop & auction
+	case Command::ShopState:
+	{
+		// 教师广播的目录属于教师当前所选班级；与本班不符时忽略。
+		// 学生打开商场时的单独查询（ShopQuery）按学生自己的班级应答，不受影响。
+		const auto stateClassName = message.argument( Argument::ClassName ).toString().trimmed();
+		if( m_className.isEmpty() == false && stateClassName.isEmpty() == false &&
+			stateClassName != m_className )
+		{
+			break;
+		}
+		const auto balanceValue = message.argument( Argument::TotalScore );
+		const auto balance = balanceValue.isValid() ? balanceValue.toInt() : -1;
+		m_clientWidget->applyShopState(
+			QJsonDocument::fromJson( message.argument( Argument::ShopJson ).toByteArray() ).object(),
+			balance );
+		break;
+	}
+
+	case Command::ShopReply:
+	{
+		const auto replyClassName = message.argument( Argument::ClassName ).toString().trimmed();
+		if( replyClassName != m_className ) { break; }
+		const auto balanceValue = message.argument( Argument::TotalScore );
+		const auto balance = balanceValue.isValid() ? balanceValue.toInt() : -1;
+		m_clientWidget->shopReply(
+			message.argument( Argument::Result ).toString() == Classroom::ShopAction::ok(),
+			message.argument( Argument::Message ).toString(),
+			balance,
+			QJsonDocument::fromJson( message.argument( Argument::ShopJson ).toString().toUtf8() ).object() );
+		break;
+	}
+
+		case Command::ShopImageReply:
+		{
+			const auto stateClassName = message.argument( Argument::ClassName ).toString().trimmed();
+			if( stateClassName != m_className ) { break; }
+			m_clientWidget->applyShopImage(
+				message.argument( Argument::ProductId ).toString(),
+				message.argument( Argument::ShopImageId ).toString(),
+				message.argument( Argument::ShopImageData ).toByteArray() );
+			break;
+		}
+
 	case Command::StartCheckIn:
 		m_clientWidget->showCheckIn();
 		break;
@@ -1457,6 +2024,161 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 	case Command::UwfRestart:
 		ClassroomSystem::restartSystem();
 		break;
+
+	case Command::DeployPackageBegin:
+	{
+		resetPackageReceive();
+		const auto id = message.argument( Argument::DeploymentId ).toString();
+		const auto manifestBytes = message.argument( Argument::ManifestJson ).toByteArray();
+		const auto manifest = QJsonDocument::fromJson( manifestBytes ).object();
+		const auto folder = manifest.value( QStringLiteral("folder") ).toString();
+		const auto shortcut = manifest.value( QStringLiteral("shortcut") ).toObject();
+		const auto target = shortcut.value( QStringLiteral("target") ).toString();
+		if( QUuid( id ).isNull() || manifest.value( QStringLiteral("id") ).toString() != id ||
+			safePackageFolder( folder ) == false || safeRelativePath( target ) == false ||
+			target.endsWith( QStringLiteral(".exe"), Qt::CaseInsensitive ) == false ||
+			manifestBytes.size() > 256 * 1024 || manifest.value( QStringLiteral("files") ).toArray().size() > 5000 )
+		{
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("invalid deployment manifest") );
+			break;
+		}
+		m_packageId = id;
+		m_packageManifest = manifest;
+		const auto apps = QDir( portableAppsRoot() );
+		m_packageStagingRoot = apps.filePath( QStringLiteral(".ikeback-staging/%1" ).arg( id ) );
+		QDir( m_packageStagingRoot ).removeRecursively();
+		if( QDir().mkpath( m_packageStagingRoot ) == false )
+		{
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot create C:\\IkebackApps staging directory") );
+			m_packageId.clear();
+		}
+		break;
+	}
+
+	case Command::DeployPackageChunk:
+	{
+		if( message.argument( Argument::DeploymentId ).toString() != m_packageId || m_packageId.isEmpty() ) { break; }
+		const auto relative = message.argument( Argument::RelativePath ).toString();
+		const auto offset = message.argument( Argument::FileOffset ).toLongLong();
+		const auto data = message.argument( Argument::FileData ).toByteArray();
+		qint64 expectedSize = -1;
+		for( const auto& value : m_packageManifest.value( QStringLiteral("files") ).toArray() )
+		{
+			const auto entry = value.toObject();
+			if( entry.value( QStringLiteral("path") ).toString() == relative )
+			{
+				expectedSize = entry.value( QStringLiteral("size") ).toVariant().toLongLong();
+				break;
+			}
+		}
+		if( safeRelativePath( relative ) == false || expectedSize < 0 || expectedSize > 512LL * 1024 * 1024 ||
+			offset < 0 || offset + data.size() > expectedSize || data.size() > 256 * 1024 )
+		{
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("invalid file chunk") );
+			break;
+		}
+		if( relative != m_packageRelativePath )
+		{
+			resetPackageReceive();
+			m_packageRelativePath = relative;
+			const auto path = QDir( m_packageStagingRoot ).filePath( relative );
+			if( QDir().mkpath( QFileInfo( path ).absolutePath() ) == false )
+			{
+				sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot create package subdirectory") );
+				break;
+			}
+			m_packageFile = new QFile( path, this );
+			if( m_packageFile->open( QIODevice::WriteOnly | QIODevice::Truncate ) == false )
+			{
+				sendPackageResult( QStringLiteral("transfer"), false, m_packageFile->errorString() );
+				resetPackageReceive();
+				break;
+			}
+		}
+		if( m_packageFile == nullptr || offset != m_packageOffset ||
+			m_packageFile->write( data ) != data.size() || m_packageFile->flush() == false )
+		{
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("out-of-order or failed file write") );
+			break;
+		}
+		m_packageOffset += data.size();
+		break;
+	}
+
+	case Command::DeployPackageCommit:
+	{
+		if( message.argument( Argument::DeploymentId ).toString() != m_packageId || m_packageId.isEmpty() ) { break; }
+		resetPackageReceive();
+		QString error;
+		for( const auto& value : m_packageManifest.value( QStringLiteral("files") ).toArray() )
+		{
+			const auto entry = value.toObject();
+			const auto relative = entry.value( QStringLiteral("path") ).toString();
+			if( safeRelativePath( relative ) == false ) { error = QStringLiteral("invalid file path" ); break; }
+			const auto stagedPath = QDir( m_packageStagingRoot ).filePath( relative );
+			const auto expectedSize = entry.value( QStringLiteral("size") ).toVariant().toLongLong();
+			if( expectedSize == 0 && QFileInfo::exists( stagedPath ) == false )
+			{
+				QDir().mkpath( QFileInfo( stagedPath ).absolutePath() );
+				QFile emptyFile( stagedPath );
+				if( emptyFile.open( QIODevice::WriteOnly ) == false ) { error = QStringLiteral("cannot create empty file: %1" ).arg( relative ); break; }
+			}
+			if( safeRelativePath( relative ) == false ||
+				QFileInfo( stagedPath ).size() != expectedSize ||
+				fileSha256( stagedPath ) != entry.value( QStringLiteral("sha256") ).toString().toLatin1() )
+			{
+				error = QStringLiteral("file verification failed: %1" ).arg( relative );
+				break;
+			}
+		}
+		const auto apps = QDir( portableAppsRoot() );
+		const auto folder = m_packageManifest.value( QStringLiteral("folder") ).toString();
+		const auto finalRoot = apps.filePath( folder );
+		const auto shortcut = m_packageManifest.value( QStringLiteral("shortcut") ).toObject();
+		const auto shortcutName = shortcut.value( QStringLiteral("name") ).toString();
+		const auto shortcutTarget = QDir::fromNativeSeparators( shortcut.value( QStringLiteral("target") ).toString() );
+		QString backup;
+		if( error.isEmpty() )
+		{
+			if( QDir().mkpath( apps.absolutePath() ) == false ) { error = QStringLiteral("cannot create C:\\IkebackApps"); }
+			else if( QFileInfo::exists( finalRoot ) )
+			{
+				backup = apps.filePath( QStringLiteral(".ikeback-backup-%1-%2" ).arg( m_packageId ).arg( QDateTime::currentMSecsSinceEpoch() ) );
+				if( QDir().rename( finalRoot, backup ) == false ) { error = QStringLiteral("cannot preserve the previous application folder"); }
+			}
+			if( error.isEmpty() && QDir().rename( m_packageStagingRoot, finalRoot ) == false )
+			{
+				error = QStringLiteral("cannot activate the deployed folder" );
+				if( backup.isEmpty() == false ) { QDir().rename( backup, finalRoot ); }
+			}
+		}
+		if( error.isEmpty() )
+		{
+			const auto target = QDir( finalRoot ).filePath( shortcutTarget );
+			if( ClassroomSystem::createDesktopShortcut( shortcutName, target,
+				shortcut.value( QStringLiteral("arguments") ).toString(), QFileInfo( target ).absolutePath() ) == false )
+			{
+				error = ClassroomSystem::lastError();
+				QDir( finalRoot ).removeRecursively();
+				if( backup.isEmpty() == false ) { QDir().rename( backup, finalRoot ); }
+			}
+		}
+		if( error.isEmpty() )
+		{
+			const QJsonObject state{ { QStringLiteral("id"), m_packageId }, { QStringLiteral("phase"), QStringLiteral("verify") },
+				{ QStringLiteral("manifest"), m_packageManifest }, { QStringLiteral("shortcutPath"), desktopShortcutPath( shortcutName ) } };
+			QSaveFile stateFile( apps.filePath( QStringLiteral(".ikeback-deploy-%1.json" ).arg( m_packageId ) ) );
+			if( stateFile.open( QIODevice::WriteOnly ) == false ||
+				stateFile.write( QJsonDocument( state ).toJson( QJsonDocument::Compact ) ) < 0 || stateFile.commit() == false )
+			{
+				error = QStringLiteral("cannot save reboot verification state" );
+			}
+		}
+		sendPackageResult( QStringLiteral("commit"), error.isEmpty(), error.isEmpty() ?
+			QStringLiteral("files verified and desktop shortcut created") : error );
+		if( error.isEmpty() == false ) { m_packageId.clear(); }
+		break;
+	}
 
 	// ------------------------------------------- 5.2.2 remote software deployment
 	case Command::DeployFileBegin:

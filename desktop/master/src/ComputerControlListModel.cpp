@@ -23,6 +23,7 @@
  */
 
 #include <QCoreApplication>
+#include <QDynamicPropertyChangeEvent>
 #include <QPainter>
 
 #include "ComputerControlListModel.h"
@@ -255,6 +256,26 @@ void ComputerControlListModel::update()
 
 
 
+bool ComputerControlListModel::eventFilter( QObject* object, QEvent* event )
+{
+	if( event->type() == QEvent::DynamicPropertyChange )
+	{
+		const auto* propertyEvent = static_cast<QDynamicPropertyChangeEvent*>( event );
+		const auto name = propertyEvent->propertyName();
+		if( name == QByteArrayLiteral("ikebackSeat") || name == QByteArrayLiteral("ikebackStudentName") ||
+			name == QByteArrayLiteral("ikebackScore") || name == QByteArrayLiteral("ikebackProtected") )
+		{
+			const auto rowIndex = interfaceIndex( qobject_cast<ComputerControlInterface*>( object ) );
+			if( rowIndex.isValid() )
+			{
+				Q_EMIT dataChanged( rowIndex, rowIndex, { Qt::DisplayRole, Qt::SizeHintRole } );
+			}
+		}
+	}
+	return QAbstractListModel::eventFilter( object, event );
+}
+
+
 QModelIndex ComputerControlListModel::interfaceIndex( ComputerControlInterface* controlInterface ) const
 {
 	return ComputerListModel::index( m_computerControlInterfaces.indexOf( controlInterface->weakPointer() ), 0 );
@@ -349,6 +370,7 @@ void ComputerControlListModel::updateSessionInfo(const QModelIndex& index)
 
 void ComputerControlListModel::startComputerControlInterface( ComputerControlInterface* controlInterface )
 {
+	controlInterface->installEventFilter( this );
 	controlInterface->start( computerScreenSize(), ComputerControlInterface::UpdateMode::Monitoring );
 
 	connect(controlInterface, &ComputerControlInterface::framebufferSizeChanged,
@@ -509,13 +531,15 @@ QString withIkebackScore( const ComputerControlInterface::Pointer& controlInterf
 		return label;
 	}
 
-	// Agreed layout: shield (client protection on) + name + [score].
-	// The shield is a plain glyph so it renders even without an emoji font.
-	const auto protection = object->property( "ikebackProtected" );
-	const auto shield = protection.toBool() ? QString::fromUtf8( "\xF0\x9F\x9B\xA1" )
-											   : QString::fromUtf8( "\xE2\x97\x8B" );
-	return QStringLiteral("%1 %2  [%3]")
-		.arg( shield, label )
+	const auto seat = object->property( "ikebackSeat" ).toString().trimmed();
+	const auto studentName = object->property( "ikebackStudentName" ).toString().trimmed();
+	const auto protection = object->property( "ikebackProtected" ).toBool();
+	const auto shield = protection ? QStringLiteral(":/classroom/icons/shield-on.png") :
+									 QStringLiteral(":/classroom/icons/shield-off.png");
+	const auto displayName = studentName.isEmpty() ? label : studentName;
+	const auto seatText = seat.isEmpty() ? displayName : QStringLiteral("%1 - %2").arg( seat, displayName );
+	return QStringLiteral("%1 - <img src=\"%2\" width=\"16\" height=\"16\"> - %3 分")
+		.arg( seatText.toHtmlEscaped(), shield )
 		.arg( score.toInt() );
 }
 }

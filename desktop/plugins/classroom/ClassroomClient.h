@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <QByteArray>
+#include <QHash>
+#include <QImage>
 #include <QJsonObject>
 #include <QObject>
 #include <QPair>
@@ -16,17 +19,19 @@
 #include <QWidget>
 
 class QCloseEvent;
-class QContextMenuEvent;
 class QLabel;
 class QLineEdit;
 class QMouseEvent;
 class QPushButton;
+class QShowEvent;
+class QTabWidget;
 class QTextBrowser;
 class QTimer;
 class ClassroomAiChatWidget;
 class ClassroomAiClient;
 class ClassroomCheckInDialog;
 class ClassroomScoreView;
+class ClassroomShopView;
 class ClassroomSilencePage;
 class QTextBrowser;
 
@@ -56,6 +61,15 @@ public:
 	void openAiAssistant();
 	void requestProtectedQuit();
 	void requestScore();
+	//! Opens the class shop window and asks the teacher machine for the catalog.
+	void openShop();
+	//! Full catalog (products + auctions) from the teacher machine; balance is
+	//! the student's own score total or a negative value when unknown.
+	void applyShopState( const QJsonObject& catalog, int balance );
+	//! Result of a redeem/bid. `catalog` is the state after the operation and
+	//! may be empty.
+	void shopReply( bool ok, const QString& message, int balance, const QJsonObject& catalog );
+	void applyShopImage( const QString& productId, const QString& imageId, const QByteArray& image );
 
 	QString className() const { return m_className; }
 	QString seat() const { return m_seat; }
@@ -71,10 +85,14 @@ Q_SIGNALS:
 	void checkInSubmitted( const QString& name );
 	//! Forwarded by the plugin to the teacher machine, which owns the API key.
 	void aiPromptRequested( const QString& prompt, const QVariantList& history );
+	//! Shop: the card asks for the catalog; the plugin attaches the identity.
+	void shopRequested();
+	void shopRedeemRequested( const QString& productId );
+	void shopBidRequested( const QString& auctionId, int amount );
+	void shopImageRequested( const QString& productId, const QString& imageId );
 
 protected:
 	void closeEvent( QCloseEvent* event ) override;
-	void contextMenuEvent( QContextMenuEvent* event ) override;
 	void mousePressEvent( QMouseEvent* event ) override;
 	void mouseMoveEvent( QMouseEvent* event ) override;
 
@@ -86,20 +104,26 @@ private:
 	void updateVisibility();
 	void placeOnScreen();
 	bool rosterAccepts( const QString& seat, const QString& name ) const;
+	ClassroomShopView* ensureShopView();
 
 	QLabel* m_identityLabel = nullptr;
 	QLabel* m_statusLabel = nullptr;
 	QLabel* m_lockLabel = nullptr;
+	QLabel* m_seatLabel = nullptr;
+	QLabel* m_nameLabel = nullptr;
 	QLineEdit* m_seatEdit = nullptr;
 	QLineEdit* m_nameEdit = nullptr;
 	QPushButton* m_loginButton = nullptr;
 	QPushButton* m_aiButton = nullptr;
 	QPushButton* m_scoreButton = nullptr;
+	QPushButton* m_shopButton = nullptr;
 	QPushButton* m_callButton = nullptr;
+	QPushButton* m_quitButton = nullptr;
 
 	ClassroomAiClient* m_aiClient = nullptr;
 	ClassroomAiChatWidget* m_aiChat = nullptr;
 	ClassroomScoreView* m_scoreView = nullptr;
+	ClassroomShopView* m_shopView = nullptr;
 	ClassroomSilencePage* m_silencePage = nullptr;
 	ClassroomSilencePage* m_lockOverlay = nullptr;
 	ClassroomCheckInDialog* m_checkIn = nullptr;
@@ -117,7 +141,6 @@ private:
 	bool m_allowSelfLogin = true;
 	bool m_aiEnabled = true;
 	bool m_exitProtection = true;
-	bool m_exitRequiresAdmin = true;
 	QString m_exitAdminUsername;
 	QPoint m_dragPosition;
 	//! The card must stay on screen for as long as the ikeback service runs.
@@ -168,6 +191,67 @@ public:
 
 private:
 	QTextBrowser* m_view = nullptr;
+};
+
+
+//! Class shop window on the student card: a catalog of products (redeem with
+//! classroom score) plus the auction area (highest bid wins). The teacher
+//! machine owns all data; the window only renders catalog JSON and sends
+//! redeem/bid requests through the plugin.
+class ClassroomShopView : public QWidget
+{
+	Q_OBJECT
+public:
+	explicit ClassroomShopView( QWidget* parent = nullptr );
+
+	//! Replaces the whole catalog. balance < 0 leaves the balance display
+	//! unchanged (broadcast states carry no per-student balance).
+	void applyCatalog( const QJsonObject& catalog, int balance );
+	void applyReply( bool ok, const QString& message, int balance, const QJsonObject& catalog );
+	void applyImage( const QString& productId, const QString& imageId, const QByteArray& image );
+	//! Who is signed in: needed to tell "you were outbid" from "you won".
+	void setIdentity( const QString& seat, const QString& student );
+	void setSignedIn( bool signedIn );
+
+Q_SIGNALS:
+	void refreshRequested();
+	void redeemRequested( const QString& productId );
+	void bidRequested( const QString& auctionId, int amount );
+	void imageRequested( const QString& productId, const QString& imageId );
+	//! Something worth showing even while the shop window is closed.
+	void noticeRaised( const QString& text );
+
+protected:
+	void showEvent( QShowEvent* event ) override;
+	void closeEvent( QCloseEvent* event ) override;
+	void mousePressEvent( QMouseEvent* event ) override;
+	void mouseMoveEvent( QMouseEvent* event ) override;
+
+private:
+	void rebuild();
+	void requestMissingImages();
+	QWidget* buildProductCard( const QJsonObject& product );
+	QWidget* buildAuctionCard( const QJsonObject& auction );
+	static QImage decodeImage( const QByteArray& image );
+
+	QLabel* m_balanceLabel = nullptr;
+	QLabel* m_statusLabel = nullptr;
+	QTabWidget* m_tabs = nullptr;
+	QWidget* m_productsArea = nullptr;
+	QWidget* m_auctionsArea = nullptr;
+	QJsonObject m_catalog;
+	int m_balance = -1;
+	QString m_seat;
+	QString m_student;
+	bool m_signedIn = false;
+	//! auction id -> (was open, leading seat) of the previous catalog.
+	QHash<QString, QPair<bool, QString>> m_auctionStates;
+	QHash<QString, QPair<QString, QImage>> m_images;
+	QHash<QString, QString> m_requestedImages;
+	QHash<QString, QString> m_failedImages;
+	QTimer* m_actionTimer = nullptr;
+	bool m_actionPending = false;
+	QPoint m_dragPosition;
 };
 
 

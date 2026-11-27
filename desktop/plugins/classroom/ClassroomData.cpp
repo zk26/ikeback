@@ -74,7 +74,6 @@ QJsonObject ClassroomSettings::fromConfiguration( const ClassroomConfiguration& 
 	return { { SettingKey::enabled(), configuration.enabled() },
 			 { SettingKey::dataDirectory(), configuration.dataDirectory() },
 			 { SettingKey::exitProtection(), configuration.exitProtection() },
-			 { SettingKey::exitRequiresAdmin(), configuration.exitRequiresAdmin() },
 			 { SettingKey::exitAdminUsername(), configuration.exitAdminUsername() },
 			 { SettingKey::allowSelfLogin(), configuration.allowSelfLogin() },
 			 { SettingKey::aiEnabled(), configuration.aiEnabled() },
@@ -90,10 +89,6 @@ QJsonObject ClassroomSettings::fromConfiguration( const ClassroomConfiguration& 
 			 { QStringLiteral("sessionKey"), configuration.sessionKey() },
 			 { QStringLiteral("interestCategories"), configuration.interestCategories() },
 			 { QStringLiteral("retentionDays"), configuration.retentionDays() },
-			 { SettingKey::scoreBaseScore(), configuration.scoreBaseScore() },
-			 { SettingKey::uwfEnabled(), configuration.uwfEnabled() },
-			 { SettingKey::internetGuard(), configuration.internetGuard() },
-			 { SettingKey::usbInputBlock(), configuration.usbInputBlock() },
 			 { SettingKey::bridgePort(), configuration.bridgePort() },
 			 { SettingKey::bridgeEnabled(), configuration.bridgeEnabled() },
 			 { SettingKey::syncEnabled(), configuration.syncEnabled() },
@@ -118,14 +113,16 @@ QJsonObject ClassroomSettings::forStudents( const QJsonObject& object )
 	// which gates the protected exit and the configurator on student machines.
 	const auto adminKey = object.value( SettingKey::adminKey() ).toString();
 	result.remove( SettingKey::adminKey() );
+	auto adminKeyHash = object.value( SettingKey::adminKeyHash() ).toString();
 	if( adminKey.isEmpty() == false )
 	{
-		result.insert( SettingKey::adminKeyHash(), ClassroomSecrets::adminKeyHash( adminKey ) );
+		adminKeyHash = ClassroomSecrets::adminKeyHash( adminKey );
 	}
-	else
+	if( adminKeyHash.isEmpty() )
 	{
-		result.remove( SettingKey::adminKeyHash() );
+		adminKeyHash = ClassroomSecrets::defaultAdminKeyHash();
 	}
+	result.insert( SettingKey::adminKeyHash(), adminKeyHash );
 	// 下发给学生的肃静文案必须是中文；旧配置中的英文一律回退为「肃静」。
 	const auto silenceText = result.value( SettingKey::silencePageText() ).toString().trimmed();
 	bool hasChinese = false;

@@ -38,6 +38,7 @@ static QString trText( const char* text )
 		{ "Seat", QStringLiteral("座位") },
 		{ "Delta", QStringLiteral("变动") },
 		{ "Reason", QStringLiteral("原因") },
+		{ "Status", QStringLiteral("状态") },
 		{ "Operator", QStringLiteral("操作人") },
 		{ "Score details", QStringLiteral("积分明细") },
 		{ "Could not create the destination directory.", QStringLiteral("无法创建目标目录。") }
@@ -112,6 +113,19 @@ static int cellDelta( const ClassroomScoreBook& book, const QString& lessonId, c
 
 static QString attendanceMark( const ClassroomScoreBook& book, const QString& lessonId, const QString& seat )
 {
+	const auto attendance = book.attendanceFor( lessonId, seat );
+	if( attendance.lessonId.isEmpty() == false )
+	{
+		switch( attendance.status )
+		{
+		case ClassroomAttendance::Present: return QStringLiteral("\u221A");
+		case ClassroomAttendance::Late: return QStringLiteral("迟到");
+		case ClassroomAttendance::Leave: return QStringLiteral("请假");
+		case ClassroomAttendance::Custom: return attendance.reason.isEmpty() ? QStringLiteral("自定义") : attendance.reason;
+		default: return QStringLiteral("缺勤");
+		}
+	}
+
 	QString mark = QStringLiteral("\u221A");
 	for( const auto& entry : book.entriesForCell( lessonId, seat ) )
 	{
@@ -196,6 +210,51 @@ QString detailsWorksheet( const QVector<DetailRow>& rows )
 		xml += QStringLiteral("<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%1</Data></Cell>")
 				   .arg( cellText( row.author ) );
 		xml += QStringLiteral("</Row>\n");
+	}
+	xml += QStringLiteral("</Table></Worksheet>\n");
+	return xml;
+}
+QString attendanceWorksheet( const ClassroomScoreBook& book,
+							 const ClassroomTermReport::Options& options )
+{
+	const auto lessons = filteredLessons( book, options );
+	const QStringList headers{ trText("Class"), trText("Lesson"), trText("Seat"), trText("Name"),
+							   trText("Status"), trText("Reason"), trText("Time") };
+	QString xml = QStringLiteral("<Worksheet ss:Name=\"考勤明细\"><Table>\n<Row>");
+	for( const auto& header : headers )
+	{
+		xml += QStringLiteral("<Cell ss:StyleID=\"head\"><Data ss:Type=\"String\">%1</Data></Cell>")
+				   .arg( cellText( header ) );
+	}
+	xml += QStringLiteral("</Row>\n");
+	for( const auto& attendance : book.attendance() )
+	{
+		if( attendance.className.isEmpty() == false && attendance.className != options.className ) { continue; }
+		QString lessonTitle;
+		bool allowed = false;
+		for( const auto& lesson : lessons )
+		{
+			if( lesson.id == attendance.lessonId )
+			{
+				lessonTitle = lessonHeader( lesson );
+				allowed = true;
+				break;
+			}
+		}
+		if( allowed == false ) { continue; }
+		xml += QStringLiteral("<Row>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%1</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%2</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%3</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%4</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%5</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%6</Data></Cell>"
+							  "<Cell ss:StyleID=\"cell\"><Data ss:Type=\"String\">%7</Data></Cell>"
+							  "</Row>\n")
+				   .arg( cellText( attendance.className ), cellText( lessonTitle ), cellText( attendance.seat ),
+						 cellText( attendance.student ), cellText( book.attendanceText( attendance.lessonId, attendance.seat ) ),
+						 cellText( attendance.reason ),
+						 cellText( attendance.checkInTime.isValid() ? attendance.checkInTime.toString( QStringLiteral("yyyy-MM-dd HH:mm") ) : QString{} ) );
 	}
 	xml += QStringLiteral("</Table></Worksheet>\n");
 	return xml;
@@ -342,6 +401,7 @@ QByteArray ClassroomTermReport::toSpreadsheetMl( const ClassroomRoster& roster,
 	if( options.includeDetails )
 	{
 		xml += detailsWorksheet( detailRows( book ) );
+		xml += attendanceWorksheet( book, options );
 	}
 
 	if( options.includeRules && book.rules().published )

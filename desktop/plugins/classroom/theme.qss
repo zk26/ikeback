@@ -1,0 +1,272 @@
+QWidget#classroomClient, QWidget#classroomAi, QWidget#classroomShop,
+QWidget#classroomCheckIn, QWidget#classroomScore, QWidget#classroomSignIn,
+QWidget#classroomSilence, QWidget#classroomConfiguration, QWidget#classroomConsole,
+QWidget#classroomSeatGrid, QWidget#classroomShopPanel, QWidget#classroomScorePanel {
+    background: %BACKGROUND%;
+    color: %TEXT%;
+}
+
+QWidget#classroomClient, QWidget#classroomAi, QWidget#classroomShop,
+QWidget#classroomCheckIn, QWidget#classroomScore, QWidget#classroomSignIn,
+QWidget#classroomConsole {
+    border: 1px solid %BORDER%;
+    border-radius: 16px;
+}
+
+QLabel {
+    color: %TEXT%;
+}
+
+QLabel[role="title"] {
+    font-size: 18px;
+    font-weight: bold;
+    color: %TEXT%;
+}
+
+QLabel[role="heading"] {
+    font-size: 14px;
+    font-weight: bold;
+    color: %TEXT%;
+}
+
+QLabel[role="hint"] {
+    font-size: 11px;
+    color: %MUTED%;
+}
+
+QLabel[role="balance"] {
+    font-size: 16px;
+    font-weight: bold;
+    color: %SUCCESS%;
+}
+
+QLabel[role="status"] {
+    font-size: 11px;
+    color: %MUTED%;
+}
+
+QLabel[state="success"] {
+    color: %SUCCESS%;
+    font-weight: bold;
+}
+
+QLabel[state="error"] {
+    color: %DANGER%;
+    font-weight: bold;
+}
+
+QLabel[state="warning"] {
+    color: %WARNING%;
+    font-weight: bold;
+}
+
+QPushButton {
+    min-height: 34px;
+    padding: 6px 12px;
+    border: 1px solid %BORDER%;
+    border-radius: 10px;
+    background: %PRIMARY%;
+    color: #4d3b2f;
+    font-weight: bold;
+}
+
+QPushButton:hover {
+    background: %PRIMARY_HOVER%;
+}
+
+QPushButton:pressed {
+    background: %ACCENT%;
+}
+
+QPushButton:disabled {
+    background: %DISABLED%;
+    color: %MUTED%;
+    border-color: %BORDER%;
+}
+
+QPushButton[secondary="true"] {
+    background: %SECONDARY%;
+    color: #21465b;
+}
+
+QPushButton[quiet="true"] {
+    background: %SURFACE%;
+    color: %DANGER%;
+    border-color: %BORDER%;
+}
+
+QPushButton[danger="true"] {
+    background: %DANGER%;
+    color: #ffffff;
+}
+
+QLineEdit, QSpinBox, QComboBox, QDateEdit, QPlainTextEdit, QTextEdit {
+    min-height: 30px;
+    padding: 4px 8px;
+    border: 1px solid %BORDER%;
+    border-radius: 9px;
+    background: %SURFACE%;
+    color: %TEXT%;
+    selection-background-color: %SECONDARY%;
+}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QDateEdit:focus,
+QPlainTextEdit:focus, QTextEdit:focus {
+    border: 2px solid %PRIMARY%;
+}
+
+QTableWidget, QTextBrowser, QListWidget {
+    border: 1px solid %BORDER%;
+    border-radius: 12px;
+    background: %SURFACE%;
+    color: %TEXT%;
+    alternate-background-color: %SURFACE_ALT%;
+}
+
+QHeaderView::section {
+    background: %SURFACE_ALT%;
+    color: %TEXT%;
+    border: 0px;
+    border-bottom: 1px solid %BORDER%;
+    padding: 6px;
+    font-weight: bold;
+}
+
+QTabWidget::pane {
+    border: 1px solid %BORDER%;
+    border-radius: 12px;
+    background: %SURFACE%;
+}
+
+QTabBar::tab {
+    background: %SURFACE_ALT%;
+    color: %TEXT%;
+    border: 1px solid %BORDER%;
+    border-bottom: 0px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    padding: 8px 12px;
+    min-width: 72px;
+}
+
+QTabBar::tab:selected {
+    background: %SURFACE%;
+    color: %TEXT%;
+    font-weight: bold;
+}
+
+QWidget#classroomSilence {
+    background: %SURFACE_ALT%;
+}
+
+QWidget#classroomSilence QLabel {
+    color: %TEXT%;
+    font-size: 72px;
+    font-weight: bold;
+}
+
+QFrame[seatCard="true"] {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 14px;
+}
+
+QLabel[seatThumbnail="true"] {
+    background: %SURFACE_ALT%;
+    border: 1px solid %BORDER%;
+    border-radius: 9px;
+}
+
+QLabel[seatCaption="true"] {
+    color: %TEXT%;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+QLabel[online="true"] {
+    color: %SUCCESS%;
+    font-weight: bold;
+}
+
+QLabel[online="false"] {
+    color: %DANGER%;
+    font-weight: bold;
+}
+
+QWidget[shopCard="true"] {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 14px;
+}
+
+QWidget[auctionCard="true"] {
+    background: %SURFACE%;
+    border: 1px solid %BORDER%;
+    border-radius: 14px;
+}
+
+QScrollArea {
+    border: 0px;
+    background: transparent;
+}
+
+QScrollBar:vertical {
+    background: %SURFACE_ALT%;
+    width: 10px;
+    margin: 2px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical {
+    background: %BORDER%;
+    min-height: 28px;
+    border-radius: 5px;
+}
+
+QScrollBar:horizontal {
+    background: %SURFACE_ALT%;
+    height: 10px;
+    margin: 2px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal {
+    background: %BORDER%;
+    min-width: 28px;
+    border-radius: 5px;
+}
+
+QListWidget#classroomNavigation {
+    border: 1px solid %BORDER%;
+    border-radius: 14px;
+    background: %SURFACE_ALT%;
+    color: %TEXT%;
+    padding: 4px;
+    outline: 0px;
+}
+
+QListWidget#classroomNavigation::item {
+    min-height: 36px;
+    padding: 6px 10px;
+    margin: 2px 0px;
+    border-radius: 9px;
+    color: %TEXT%;
+}
+
+QListWidget#classroomNavigation::item:selected {
+    background: %PRIMARY%;
+    color: #4d3b2f;
+    font-weight: bold;
+}
+
+QStackedWidget#classroomPages {
+    background: %BACKGROUND%;
+}
+
+QToolTip {
+    background: %SURFACE_ALT%;
+    color: %TEXT%;
+    border: 1px solid %BORDER%;
+    border-radius: 8px;
+    padding: 4px;
+}

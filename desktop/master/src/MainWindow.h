@@ -29,7 +29,9 @@
 #include "ComputerControlInterface.h"
 
 class QButtonGroup;
+class QStackedWidget;
 class QToolButton;
+class QToolBar;
 
 class IkebackMaster;
 
@@ -47,6 +49,8 @@ public:
 
 	static bool initAuthentication();
 	static bool initAccessControl();
+	static bool isFeatureSuppressed( const Feature& feature );
+	static bool isClassroomQuickAction( const Feature& feature );
 
 	IkebackMaster& masterCore()
 	{
@@ -54,6 +58,8 @@ public:
 	}
 
 	void reloadSubFeatures();
+	void setClassroomPage( QWidget* page );
+	void setClassroomMode( bool active );
 
 	ComputerControlInterfaceList selectedComputerControlInterfaces() const;
 
@@ -78,6 +84,7 @@ private:
 	}
 
 	void addFeaturesToToolBar();
+	void rebuildToolBar();
 	void addSubFeaturesToToolButton( QToolButton* button, const Feature& parentFeature );
 
 	void updateModeButtonGroup();
@@ -90,5 +97,9 @@ private:
 	IkebackMaster& m_master;
 
 	QButtonGroup* m_modeGroup;
+	QStackedWidget* m_centralStack = nullptr;
+	QToolBar* m_quickToolBar = nullptr;
+	QWidget* m_classroomPage = nullptr;
+	bool m_classroomMode = false;
 
 } ;

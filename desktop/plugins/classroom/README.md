@@ -19,7 +19,7 @@
 | `ClassroomConfigurationPage.h/.cpp` | Ikeback Configurator 配置页 |
 | `ClassroomMasterDialog.h/.cpp` | 教师端控制台（**常用工具** / 课堂 / 日志 / 分析 / AI / 监控 / 系统设备 / 积分报表 / 座位签到 / **课表与课堂**） |
 | `ClassroomScorePanel.h/.cpp` | 积分录入、规则发布、每生词云、期末报表导出（含逐条明细） |
-| `ClassroomSeatGrid.h/.cpp` | **座位网格 + 列表视图**：可拖拽网格显示实时缩略图与 `🛡 姓名 [积分]`；列表视图不抓屏、显示登录名/IP/在线/客户端保护/UWF/积分等全部信息 |
+| `ClassroomSeatGrid.h/.cpp` | **座位网格 + 列表视图**：可拖拽网格显示实时缩略图、姓名积分与在线/保护状态；支持自适应列数、缩放与卡片内就地加减分；列表视图不抓屏、显示登录名/IP/在线/客户端保护/UWF/积分等全部信息 |
 | `ClassroomClient.h/.cpp` | 学生端**不置顶、不可关闭**的悬浮卡片（姓名+座位号+查询积分/AI 两个按钮）、AI 聊天、积分弹窗、肃静页、签到弹窗、行为采集与模糊规则拦截 |
 | `ClassroomAiClient.h/.cpp` | OpenAI 兼容 HTTP 客户端 |
 | `ClassroomBridge.h/.cpp` | 教师机 HTTP/JSON + UDP 发现 + 课堂密钥挑战应答认证 |

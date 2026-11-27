@@ -41,11 +41,7 @@ AboutDialog::AboutDialog( QWidget *parent ) :
 
 	ui->versionLabel->setText( IkebackCore::versionString() );
 
-	QFile authors( QStringLiteral( ":/CONTRIBUTORS" ) );
-	if (authors.open(QFile::ReadOnly))
-	{
-		ui->authors->setPlainText(QString::fromUtf8(authors.readAll()));
-	}
+	connect( ui->sponsorButton, &QPushButton::clicked, this, &AboutDialog::openDonationWebsite );
 
 	QFile license( QStringLiteral( ":/core/COPYING" ) );
 	if (license.open(QFile::ReadOnly))

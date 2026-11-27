@@ -11,5 +11,15 @@
     <file>icons/plus.png</file>
     <file>icons/minus.png</file>
     <file>icons/install.png</file>
+    <file>icons/check-in.png</file>
+    <file>icons/class.png</file>
+    <file>icons/shop.png</file>
+    <file>icons/shield-on.png</file>
+    <file>icons/shield-off.png</file>
+    <file>icons/protection.png</file>
+    <file>icons/gateway-enable.png</file>
+    <file>icons/gateway-disable.png</file>
+    <file>icons/remote-install.png</file>
+    <file>theme.qss</file>
   </qresource>
 </RCC>

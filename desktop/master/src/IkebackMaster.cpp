@@ -167,6 +167,18 @@ void IkebackMaster::reloadSubFeatures()
 }
 
 
+void IkebackMaster::setClassroomPage( QWidget* page )
+{
+	if( m_mainWindow ) { m_mainWindow->setClassroomPage( page ); }
+}
+
+
+void IkebackMaster::setClassroomMode( bool active )
+{
+	if( m_mainWindow ) { m_mainWindow->setClassroomMode( active ); }
+}
+
+
 
 const ComputerControlInterfaceList& IkebackMaster::allComputerControlInterfaces() const
 {
@@ -203,7 +215,10 @@ ComputerControlInterfaceList IkebackMaster::filteredComputerControlInterfaces() 
 
 void IkebackMaster::runFeature( const Feature& feature )
 {
-	const auto computerControlInterfaces = filteredComputerControlInterfaces();
+	const auto filteredInterfaces = filteredComputerControlInterfaces();
+	const auto selectedInterfaces = selectedComputerControlInterfaces();
+	const auto computerControlInterfaces = feature.testFlag( Feature::Flag::Mode ) || selectedInterfaces.isEmpty() ?
+		filteredInterfaces : selectedInterfaces;
 
 	if( feature.testFlag( Feature::Flag::Mode ) )
 	{

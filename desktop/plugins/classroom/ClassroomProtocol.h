@@ -135,6 +135,11 @@ inline Feature::Uid operationLogFeatureUid()
 	return Feature::Uid{ QStringLiteral("d3f1c0de-7a41-4b8e-9c12-000000000007") };
 }
 
+inline Feature::Uid endLessonFeatureUid()
+{
+	return Feature::Uid{ QStringLiteral("d3f1c0de-7a41-4b8e-9c12-000000000008") };
+}
+
 // winbase.h (pulled in transitively on Windows) defines `ReportEvent` as a
 // macro for the Win32 event-log API (ReportEventW). Neutralize it so the
 // enum member keeps its documented, macro-proof name regardless of whether
@@ -232,7 +237,38 @@ enum class Command
 	DeployFileChunk,
 
 	// student -> teacher: real installer exit result (ALWAYS append)
-	InstallResult
+	InstallResult,
+
+	// 5.3.0 class shop and auction (ALWAYS append: numeric values are the
+	// wire protocol). The teacher machine owns the shop book and validates
+	// every request against the student's real score; student machines only
+	// render the catalog. Identities travel in the usual ClassName / Seat /
+	// Student / Host / Ip arguments.
+	//   ShopState  teacher -> student: Argument::ShopJson = whole catalog of
+	//              the student's class without pictures; Argument::TotalScore
+	//              = that student's current balance, or -1 when unknown.
+	//   ShopQuery  student -> teacher: ask for ShopState (sent when the shop
+	//              window opens and on "refresh").
+	//   ShopRedeem student -> teacher: Argument::ProductId.
+	//   ShopBid    student -> teacher: Argument::AuctionId + Argument::Amount.
+	//   ShopReply  teacher -> student: Argument::ShopAction ("query"/"redeem"/
+	//              "bid"), Argument::Result ("ok"/"failed"), Argument::Message
+	//              and, when the catalog changed, a fresh ShopJson+TotalScore.
+	//   ShopImageQuery student -> teacher: Argument::ProductId + ShopImageId.
+	//   ShopImageReply teacher -> student: Argument::ShopImageData (PNG bytes).
+	ShopState,
+	ShopQuery,
+	ShopRedeem,
+	ShopBid,
+	ShopReply,
+	ShopImageQuery,
+	ShopImageReply,
+
+	// Portable folder deployment (append only). Files land in C:\IkebackApps.
+	DeployPackageBegin,
+	DeployPackageChunk,
+	DeployPackageCommit,
+	DeployPackageResult
 };
 
 enum class Argument
@@ -310,7 +346,28 @@ enum class Argument
 	// 5.2.2 remote software deployment (installer chunk transfer)
 	FileName,
 	FileData,
-	FileSize
+	FileSize,
+
+	// 5.3.0 class shop and auction (ALWAYS append: numeric values are the
+	// wire protocol). ShopJson carries the catalog of one class without pictures
+	// as compact UTF-8 JSON bytes (QVariant strings are limited to 64 KiB).
+	ShopJson,
+	ProductId,
+	AuctionId,
+	Amount,
+	ShopAction,
+	ShopImageId,
+	ShopImageData,
+
+	// Portable folder deployment (append only).
+	DeploymentId,
+	ManifestJson,
+	RelativePath,
+	FileSha256,
+	FileOffset,
+	ShortcutName,
+	ShortcutTarget,
+	DeployPhase
 };
 
 inline FeatureMessage message( Command command )
@@ -352,6 +409,20 @@ inline QString appBlock()     { return QStringLiteral("app-block"); }
 inline QString webBlock()     { return QStringLiteral("web-block"); }
 inline QString software()     { return QStringLiteral("software"); }
 inline QString website()      { return QStringLiteral("website"); }
+inline QString shop()         { return QStringLiteral("shop"); }
+inline QString auction()      { return QStringLiteral("auction"); }
+}
+
+//! Subcommands carried in Argument::ShopAction, and the two Argument::Result
+//! values of a ShopReply. Plain strings: they are new in 5.3.0, so no deployed
+//! worker can misread them.
+namespace ShopAction
+{
+inline QString query()   { return QStringLiteral("query"); }
+inline QString redeem()  { return QStringLiteral("redeem"); }
+inline QString bid()     { return QStringLiteral("bid"); }
+inline QString ok()      { return QStringLiteral("ok"); }
+inline QString failed()  { return QStringLiteral("failed"); }
 }
 
 namespace SettingKey
@@ -368,14 +439,9 @@ inline QString captureInterval()   { return QStringLiteral("captureInterval"); }
 inline QString captureWindowTitle(){ return QStringLiteral("captureWindowTitle"); }
 inline QString captureProcess()    { return QStringLiteral("captureProcess"); }
 inline QString exitProtection()    { return QStringLiteral("exitProtection"); }
-inline QString exitRequiresAdmin() { return QStringLiteral("exitRequiresAdmin"); }
 inline QString exitAdminUsername() { return QStringLiteral("exitAdminUsername"); }
 inline QString allowSelfLogin()    { return QStringLiteral("allowSelfLogin"); }
 inline QString dataDirectory()     { return QStringLiteral("dataDirectory"); }
-inline QString scoreBaseScore()    { return QStringLiteral("scoreBaseScore"); }
-inline QString uwfEnabled()         { return QStringLiteral("uwfEnabled"); }
-inline QString internetGuard()      { return QStringLiteral("internetGuard"); }
-inline QString usbInputBlock()      { return QStringLiteral("usbInputBlock"); }
 inline QString bridgePort()         { return QStringLiteral("bridgePort"); }
 inline QString bridgeEnabled()      { return QStringLiteral("bridgeEnabled"); }
 //! Boolean only: tells a student worker that the teacher has started a lesson.

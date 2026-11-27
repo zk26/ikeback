@@ -22,16 +22,20 @@
  *
  */
 
+#include <QAction>
 #include <QCloseEvent>
 #include <QFileDialog>
 #include <QJsonDocument>
 #include <QKeyEvent>
+#include <QLabel>
 #include <QHostAddress>
 #include <QMenu>
 #include <QMessageBox>
-#include <QStringList>
 #include <QSplitter>
+#include <QStackedWidget>
+#include <QStringList>
 #include <QVector>
+#include <QWidgetAction>
 
 #include "AboutDialog.h"
 #include "AccessControlProvider.h"
@@ -64,6 +68,22 @@ MainWindow::MainWindow( IkebackMaster &masterCore, QWidget* parent ) :
 	m_modeGroup( new QButtonGroup( this ) )
 {
 	ui->setupUi( this );
+	setWindowIcon( QIcon( QStringLiteral(":/master/app-icon.png") ) );
+	setStyleSheet( QStringLiteral(
+		"QMainWindow { background: #FFF9EA; color: #4C566A; }"
+		"QToolBar { background: #FFF3D6; border: 0; spacing: 3px; padding: 4px; }"
+		"QToolBar::separator { background: #E8CF9D; width: 6px; margin: 5px 2px; }"
+		"QToolButton { color: #4C566A; border: 1px solid transparent; border-radius: 9px; padding: 5px 8px; }"
+		"QToolButton:hover { background: #FFE7AD; border-color: #F2C96D; }"
+		"QToolButton:checked { background: #DDF4EE; border-color: #65C9B8; color: #247F71; }"
+		"QPushButton { background: #FFDF8E; color: #584A32; border: 1px solid #E9BE5C; border-radius: 8px; padding: 6px 12px; }"
+		"QPushButton:hover { background: #FFD16D; }"
+		"QLineEdit, QComboBox, QSpinBox { background: #FFFFFF; color: #4C566A; border: 1px solid #E5CFA5; border-radius: 7px; padding: 4px; }"
+		"QTableView { background: #FFFDF7; alternate-background-color: #FFF5DE; gridline-color: #EEDDBB; selection-background-color: #DDF4EE; selection-color: #247F71; }"
+		"QHeaderView::section { background: #FFE9B5; color: #584A32; border: 0; padding: 6px; }"
+		"QStatusBar { background: #FFF3D6; color: #6B6255; }"
+		"QLabel[role=\"heading\"] { color: #D8892B; font-weight: bold; }"
+		"QLabel[role=\"hint\"] { color: #8C8272; }" ) );
 
 	restoreState( QByteArray::fromBase64( m_master.userConfig().windowState().toUtf8() ) );
 	restoreGeometry( QByteArray::fromBase64( m_master.userConfig().windowGeometry().toUtf8() ) );
@@ -193,6 +213,11 @@ MainWindow::MainWindow( IkebackMaster &masterCore, QWidget* parent ) :
 
 	ui->centralLayout->addWidget( mainSplitter );
 
+	m_centralStack = new QStackedWidget( this );
+	m_centralStack->setObjectName( QStringLiteral("ikebackCentralStack") );
+	m_centralStack->addWidget( ui->centralWidget );
+	setCentralWidget( m_centralStack );
+
 	if( IkebackCore::config().autoOpenComputerSelectPanel() )
 	{
 		ui->computerSelectPanelButton->setChecked( true );
@@ -273,6 +298,14 @@ MainWindow::MainWindow( IkebackMaster &masterCore, QWidget* parent ) :
 
 	addToolBar( Qt::TopToolBarArea, ui->toolBar );
 
+	m_quickToolBar = new MainToolBar( this );
+	m_quickToolBar->setObjectName( QStringLiteral("ikebackQuickToolBar") );
+	m_quickToolBar->setWindowTitle( tr( "Classroom tools" ) );
+	m_quickToolBar->toggleViewAction()->setEnabled( false );
+	m_quickToolBar->layout()->setSpacing( 2 );
+	m_quickToolBar->hide();
+	addToolBar( Qt::TopToolBarArea, m_quickToolBar );
+
 	addFeaturesToToolBar();
 	reloadSubFeatures();
 
@@ -345,6 +378,23 @@ bool MainWindow::initAccessControl()
 
 
 
+bool MainWindow::isFeatureSuppressed( const Feature& feature )
+{
+	static const QStringList names{
+		QStringLiteral("UserLogin"), QStringLiteral("UserLogoff"),
+		QStringLiteral("StartApp"), QStringLiteral("OpenWebsite"),
+		QStringLiteral("ClassroomSignOut"), QStringLiteral("ClassroomQuickTools")
+	};
+	return feature.testFlag( Feature::Flag::Meta ) || names.contains( feature.name(), Qt::CaseInsensitive );
+}
+
+
+bool MainWindow::isClassroomQuickAction( const Feature& feature )
+{
+	return feature.uid().toString().startsWith( QStringLiteral("d3f1c0de-7a41-4b8e-9c14-"), Qt::CaseInsensitive );
+}
+
+
 void MainWindow::reloadSubFeatures()
 {
 	for( const auto& feature : m_master.features() )
@@ -355,6 +405,31 @@ void MainWindow::reloadSubFeatures()
 			addSubFeaturesToToolButton( button, feature );
 		}
 	}
+}
+
+
+void MainWindow::setClassroomPage( QWidget* page )
+{
+	if( m_centralStack == nullptr || page == nullptr ) { return; }
+	if( m_classroomPage && m_classroomPage != page )
+	{
+		m_centralStack->removeWidget( m_classroomPage );
+	}
+	if( m_centralStack->indexOf( page ) < 0 ) { m_centralStack->addWidget( page ); }
+	m_classroomPage = page;
+	if( m_classroomMode ) { m_centralStack->setCurrentWidget( page ); }
+}
+
+
+void MainWindow::setClassroomMode( bool active )
+{
+	if( m_classroomMode == active ) { return; }
+	m_classroomMode = active;
+	if( m_centralStack )
+	{
+		m_centralStack->setCurrentWidget( active && m_classroomPage ? m_classroomPage : ui->centralWidget );
+	}
+	rebuildToolBar();
 }
 
 
@@ -463,46 +538,88 @@ void MainWindow::showAboutDialog()
 
 
 
+void MainWindow::rebuildToolBar()
+{
+	if( ui->toolBar == nullptr ) { return; }
+	const auto clearToolBar = []( QToolBar* toolBar ) {
+		if( toolBar == nullptr ) { return; }
+		const auto actions = toolBar->actions();
+		for( auto* action : actions )
+		{
+			toolBar->removeAction( action );
+			delete action;
+		}
+		qDeleteAll( toolBar->findChildren<ToolButton*>( Qt::FindDirectChildrenOnly ) );
+	};
+	clearToolBar( ui->toolBar );
+	clearToolBar( m_quickToolBar );
+	delete m_modeGroup;
+	m_modeGroup = new QButtonGroup( this );
+	addFeaturesToToolBar();
+	reloadSubFeatures();
+}
+
+
 void MainWindow::addFeaturesToToolBar()
 {
-	// ikeback: put the everyday actions first. Everything else wraps onto a
-	// second row or goes into Qt's ">>" overflow menu. Names that are not in
-	// the list below simply land in the second group, so no feature is lost.
-	// 按课堂使用反馈移除三个按钮：iKeback（独立控制台）、注销、常用工具。
-	// 「登录」保留；快速工具以独立按钮形式存在，控制台仍可由其他按钮打开。
+	if( m_classroomMode && m_classroomPage )
+	{
+		struct ClassroomPageButton
+		{
+			const char* label;
+			const char* page;
+			const char* icon;
+		};
+		static const ClassroomPageButton pageButtons[] = {
+			{ "座位与签到", "seats", ":/classroom/icons/check-in.png" },
+			{ "班级管理", "class", ":/classroom/icons/class.png" },
+			{ "积分", "score", ":/classroom/icons/plus.png" },
+			{ "课程记录", "course", ":/core/document-edit.png" },
+			{ "商城", "shop", ":/classroom/icons/shop.png" },
+			{ "等级规则", "levels", ":/core/help-about.png" }
+		};
+		for( const auto& entry : pageButtons )
+		{
+			auto* button = new ToolButton( QIcon( QString::fromLatin1( entry.icon ) ),
+										   tr( entry.label ), {}, tr( entry.label ) );
+			button->setObjectName( QStringLiteral("classroomPage_%1").arg( QString::fromLatin1( entry.page ) ) );
+			connect( button, &QToolButton::clicked, this, [this, page = QString::fromLatin1( entry.page )]() {
+				if( m_classroomPage )
+				{
+					QMetaObject::invokeMethod( m_classroomPage, "showPage", Q_ARG( QString, page ) );
+				}
+			} );
+			button->addTo( ui->toolBar );
+		}
+		ui->toolBar->addSeparator();
+	}
+
+	// Everyday actions stay visible. Mode buttons are always primary so their
+	// checked state remains in the existing QButtonGroup; everything else is
+	// available from one overflow menu instead of a second toolbar row.
 	static const QStringList primaryNames{
 		QStringLiteral("monitoring"), QStringLiteral("demo"), QStringLiteral("lock"),
-		QStringLiteral("remoteview"), QStringLiteral("remoteaccess"),
-		QStringLiteral("textmessage"), QStringLiteral("screenshot"),
-		QStringLiteral("classroom"), QStringLiteral("ikeback"),
-		QStringLiteral("ClassroomSignIn"), QStringLiteral("ClassroomCheckIn")
-	};
-
-	// ikeback 5.2.0: Ikeback's native UserLogin/UserLogoff actions open a
-	// Windows username+password dialog. ikeback signs students in by NAME and
-	// SEAT instead, so those two upstream buttons must not be shown at all.
-	// 5.2.0: desktopservices' StartApp / OpenWebsite duplicated the ikeback
-	// console's "Open software" / "Open website" actions. They now live in the
-	// "Quick tools" menu only, so hide the upstream copies (no lost function).
-	static const QStringList supersededNames{
-		QStringLiteral("UserLogin"), QStringLiteral("UserLogoff"),
-		QStringLiteral("StartApp"), QStringLiteral("OpenWebsite"),
-		// 这三个按钮从工具栏彻底移除，而不是挪到溢出菜单。
-		QStringLiteral("ClassroomConsole"), QStringLiteral("ClassroomSignOut"),
-		QStringLiteral("ClassroomQuickTools")
+		QStringLiteral("remoteaccess"), QStringLiteral("textmessage"),
+		QStringLiteral("ClassroomConsole"), QStringLiteral("ClassroomSignIn"),
+		QStringLiteral("ClassroomCheckIn")
 	};
 
 	QVector<Feature> primary;
+	QVector<Feature> quick;
 	QVector<Feature> secondary;
 	for( const auto& feature : m_master.features() )
 	{
-		if( feature.testFlag( Feature::Flag::Meta ) ||
-			supersededNames.contains( feature.name(), Qt::CaseInsensitive ) )
+		if( isFeatureSuppressed( feature ) )
 		{
 			continue;
 		}
 
-		if( primaryNames.contains( feature.name(), Qt::CaseInsensitive ) )
+		if( isClassroomQuickAction( feature ) )
+		{
+			quick.append( feature );
+		}
+		else if( primaryNames.contains( feature.name(), Qt::CaseInsensitive ) ||
+				 feature.testFlag( Feature::Flag::Mode ) )
 		{
 			primary.append( feature );
 		}
@@ -512,7 +629,7 @@ void MainWindow::addFeaturesToToolBar()
 		}
 	}
 
-	const auto addFeature = [this]( const Feature& feature )
+	const auto addFeature = [this]( const Feature& feature, QToolBar* toolBar )
 	{
 		auto btn = new ToolButton( QIcon( feature.iconUrl() ),
 									  feature.displayName(),
@@ -528,7 +645,7 @@ void MainWindow::addFeaturesToToolBar()
 			}
 		});
 		btn->setObjectName( feature.name() );
-		btn->addTo( ui->toolBar );
+		btn->addTo( toolBar );
 
 		if( feature.testFlag( Feature::Flag::Mode ) )
 		{
@@ -539,15 +656,82 @@ void MainWindow::addFeaturesToToolBar()
 
 	for( const auto& feature : primary )
 	{
-		addFeature( feature );
+		addFeature( feature, ui->toolBar );
 	}
-	if( primary.isEmpty() == false && secondary.isEmpty() == false )
+
+	if( m_classroomMode && m_quickToolBar && quick.isEmpty() == false )
 	{
-		ui->toolBar->addSeparator();
+		m_quickToolBar->setVisible( true );
+		auto* heading = new QLabel( tr( "课堂快捷工具" ), m_quickToolBar );
+		heading->setProperty( "role", QStringLiteral("heading") );
+		auto* headingAction = new QWidgetAction( m_quickToolBar );
+		headingAction->setDefaultWidget( heading );
+		m_quickToolBar->addAction( headingAction );
+		int group = -1;
+		for( int index = 0; index < quick.size(); ++index )
+		{
+			const auto nextGroup = index < 2 ? 0 : index < 5 ? 1 : index < 8 ? 2 : index < 11 ? 3 : 4;
+			if( nextGroup != group )
+			{
+				if( group >= 0 ) { m_quickToolBar->addSeparator(); }
+				const auto labels = QStringList{ tr( "保护与管控" ), tr( "网络与静音" ),
+					tr( "课堂秩序" ), tr( "积分与部署" ), tr( "批量工具" ) };
+				auto* label = new QLabel( labels.at( nextGroup ), m_quickToolBar );
+				label->setProperty( "role", QStringLiteral("hint") );
+				auto* action = new QWidgetAction( m_quickToolBar );
+				action->setDefaultWidget( label );
+				m_quickToolBar->addAction( action );
+				group = nextGroup;
+			}
+			addFeature( quick.at( index ), m_quickToolBar );
+		}
 	}
-	for( const auto& feature : secondary )
+	else if( m_quickToolBar )
 	{
-		addFeature( feature );
+		m_quickToolBar->hide();
+	}
+	if( secondary.isEmpty() == false )
+	{
+		auto* more = new ToolButton( QIcon( QStringLiteral(":/core/icon22.png") ),
+									 tr( "More" ), {}, tr( "More classroom actions" ) );
+		more->setObjectName( QStringLiteral("ikebackMoreActions") );
+		more->setPopupMode( QToolButton::InstantPopup );
+		auto* menu = new QMenu( more );
+		more->setMenu( menu );
+		for( const auto& feature : secondary )
+		{
+			const auto subFeatures = m_master.subFeatures( feature.uid() );
+			if( subFeatures.isEmpty() == false )
+			{
+				auto* submenu = menu->addMenu( QIcon( feature.iconUrl() ), feature.displayName() );
+				submenu->setToolTipsVisible( true );
+				for( const auto& subFeature : subFeatures )
+				{
+					auto* subAction = submenu->addAction( QIcon( subFeature.iconUrl() ), subFeature.displayName() );
+					subAction->setShortcut( subFeature.shortcut() );
+					subAction->setToolTip( subFeature.description() );
+					if( subFeature.testFlag( Feature::Flag::Option ) )
+					{
+						subAction->setCheckable( true );
+						subAction->setChecked( subFeature.testFlag( Feature::Flag::Checked ) );
+					}
+					connect( subAction, &QAction::triggered, this, [this, subFeature]() {
+						m_master.runFeature( subFeature );
+						updateModeButtonGroup();
+					} );
+				}
+				continue;
+			}
+			auto* action = menu->addAction( QIcon( feature.iconUrl() ), feature.displayName() );
+			action->setShortcut( feature.shortcut() );
+			action->setToolTip( feature.description() );
+			connect( action, &QAction::triggered, this, [this, feature]() {
+				m_master.runFeature( feature );
+				updateModeButtonGroup();
+				if( feature.testFlag( Feature::Flag::Mode ) ) { reloadSubFeatures(); }
+			} );
+		}
+		more->addTo( ui->toolBar );
 	}
 }
 

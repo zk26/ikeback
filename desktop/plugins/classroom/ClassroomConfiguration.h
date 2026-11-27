@@ -15,7 +15,6 @@
 	OP( ClassroomConfiguration, m_configuration, QString, dataDirectory, setDataDirectory, "DataDirectory", "Classroom", QStringLiteral("%APPDATA%/ikeback"), Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, QString, sessionKey, setSessionKey, "SessionKey", "Classroom", QString(), Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, bool, exitProtection, setExitProtection, "ExitProtection", "Classroom", true, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, exitRequiresAdmin, setExitRequiresAdmin, "ExitRequiresAdmin", "Classroom", true, Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, QString, exitAdminUsername, setExitAdminUsername, "ExitAdminUsername", "Classroom", QStringLiteral("Administrator"), Configuration::Property::Flag::Advanced ) \
 	OP( ClassroomConfiguration, m_configuration, bool, allowSelfLogin, setAllowSelfLogin, "AllowSelfLogin", "Classroom", true, Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, bool, aiEnabled, setAiEnabled, "AiEnabled", "Classroom", true, Configuration::Property::Flag::Standard ) \
@@ -25,16 +24,12 @@
 	OP( ClassroomConfiguration, m_configuration, QString, aiSystemPrompt, setAiSystemPrompt, "AiSystemPrompt", "Classroom", QString(), Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, int, aiTimeout, setAiTimeout, "AiTimeout", "Classroom", 60, Configuration::Property::Flag::Advanced ) \
 	OP( ClassroomConfiguration, m_configuration, bool, monitoringEnabled, setMonitoringEnabled, "MonitoringEnabled", "Classroom", true, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, int, captureInterval, setCaptureInterval, "CaptureInterval", "Classroom", 5, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, captureWindowTitle, setCaptureWindowTitle, "CaptureWindowTitle", "Classroom", true, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, captureProcess, setCaptureProcess, "CaptureProcess", "Classroom", true, Configuration::Property::Flag::Standard ) \
+	OP( ClassroomConfiguration, m_configuration, int, captureInterval, setCaptureInterval, "CaptureInterval", "Classroom", 5, Configuration::Property::Flag::Advanced ) \
+	OP( ClassroomConfiguration, m_configuration, bool, captureWindowTitle, setCaptureWindowTitle, "CaptureWindowTitle", "Classroom", true, Configuration::Property::Flag::Advanced ) \
+	OP( ClassroomConfiguration, m_configuration, bool, captureProcess, setCaptureProcess, "CaptureProcess", "Classroom", true, Configuration::Property::Flag::Advanced ) \
 	OP( ClassroomConfiguration, m_configuration, QString, interestCategories, setInterestCategories, "InterestCategories", "Classroom", QString(), Configuration::Property::Flag::Advanced ) \
-	OP( ClassroomConfiguration, m_configuration, int, scoreBaseScore, setScoreBaseScore, "ScoreBaseScore", "Classroom", 100, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, uwfEnabled, setUwfEnabled, "UwfEnabled", "Classroom", false, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, internetGuard, setInternetGuard, "InternetGuard", "Classroom", false, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, usbInputBlock, setUsbInputBlock, "UsbInputBlock", "Classroom", true, Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, int, bridgePort, setBridgePort, "BridgePort", "Classroom", Classroom::defaultBridgePort(), Configuration::Property::Flag::Standard ) \
-	OP( ClassroomConfiguration, m_configuration, bool, bridgeEnabled, setBridgeEnabled, "BridgeEnabled", "Classroom", false, Configuration::Property::Flag::Standard ) \
+	OP( ClassroomConfiguration, m_configuration, int, bridgePort, setBridgePort, "BridgePort", "Classroom", Classroom::defaultBridgePort(), Configuration::Property::Flag::Advanced ) \
+	OP( ClassroomConfiguration, m_configuration, bool, bridgeEnabled, setBridgeEnabled, "BridgeEnabled", "Classroom", false, Configuration::Property::Flag::Advanced ) \
 	OP( ClassroomConfiguration, m_configuration, bool, syncEnabled, setSyncEnabled, "SyncEnabled", "Classroom", true, Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, QString, silencePageText, setSilencePageText, "SilencePageText", "Classroom", QStringLiteral("肃静"), Configuration::Property::Flag::Standard ) \
 	OP( ClassroomConfiguration, m_configuration, QString, wordCloudStopWords, setWordCloudStopWords, "WordCloudStopWords", "Classroom", QString(), Configuration::Property::Flag::Advanced ) \

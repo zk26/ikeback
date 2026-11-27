@@ -7,9 +7,11 @@
 #include <QtGlobal>
 
 #include <QDebug>
+#include <QDir>
 #include <QFileInfo>
 #include <QLibrary>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QStringList>
 
 #include "ClassroomProtocol.h"
@@ -24,6 +26,7 @@
 #endif
 #include <windows.h>
 #include <objbase.h>
+#include <shlobj.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #endif
@@ -49,6 +52,79 @@ static QString s_lastError;
 		return false;
 	}
 	return true;
+}
+
+
+bool ClassroomSystem::createDesktopShortcut( const QString& name, const QString& target,
+											  const QString& arguments, const QString& workingDirectory )
+{
+#ifdef Q_OS_WIN
+	const auto shortcutName = QFileInfo( name ).fileName();
+	if( shortcutName.isEmpty() || shortcutName.contains( QLatin1Char(':') ) ||
+		target.isEmpty() || QFileInfo( target ).isFile() == false )
+	{
+		s_lastError = QStringLiteral("Invalid shortcut name or target");
+		return false;
+	}
+	using CoInitializeExFn = HRESULT ( WINAPI* )( LPVOID, DWORD );
+	using CoUninitializeFn = void ( WINAPI* )();
+	using CoCreateInstanceFn = HRESULT ( WINAPI* )( REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID* );
+	QLibrary ole32( QStringLiteral("ole32.dll") );
+	if( ole32.load() == false ) { s_lastError = ole32.errorString(); return false; }
+	const auto coInit = reinterpret_cast<CoInitializeExFn>( ole32.resolve( "CoInitializeEx" ) );
+	const auto coUninit = reinterpret_cast<CoUninitializeFn>( ole32.resolve( "CoUninitialize" ) );
+	const auto coCreate = reinterpret_cast<CoCreateInstanceFn>( ole32.resolve( "CoCreateInstance" ) );
+	if( coInit == nullptr || coUninit == nullptr || coCreate == nullptr )
+	{
+		s_lastError = QStringLiteral("COM functions are unavailable");
+		return false;
+	}
+	const auto initResult = coInit( nullptr, COINIT_APARTMENTTHREADED );
+	if( FAILED( initResult ) && initResult != S_FALSE )
+	{
+		s_lastError = QStringLiteral("CoInitializeEx failed: %1" ).arg( initResult );
+		return false;
+	}
+	static const GUID clsidShellLink = { 0x00021401, 0x0000, 0x0000,
+		{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+	static const GUID iidPersistFile = { 0x0000010b, 0x0000, 0x0000,
+		{ 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+	IShellLinkW* link = nullptr;
+	IPersistFile* persist = nullptr;
+	bool ok = false;
+	if( SUCCEEDED( coCreate( clsidShellLink, nullptr, CLSCTX_INPROC_SERVER,
+							 iidPersistFile, reinterpret_cast<void**>( &persist ) ) ) && persist )
+	{
+		if( SUCCEEDED( persist->QueryInterface( __uuidof( IShellLinkW ),
+											   reinterpret_cast<void**>( &link ) ) ) && link )
+		{
+			const auto targetPath = QDir::toNativeSeparators( QFileInfo( target ).absoluteFilePath() ).toStdWString();
+			const auto argumentText = arguments.toStdWString();
+			const auto workPath = QDir::toNativeSeparators( workingDirectory ).toStdWString();
+			link->SetPath( targetPath.c_str() );
+			link->SetArguments( argumentText.c_str() );
+			link->SetWorkingDirectory( workPath.c_str() );
+			link->SetDescription( name.toStdWString().c_str() );
+			const auto desktop = QStandardPaths::writableLocation( QStandardPaths::DesktopLocation );
+			const auto shortcutPath = QDir::toNativeSeparators(
+				QDir( desktop ).filePath( shortcutName.endsWith( QStringLiteral(".lnk"), Qt::CaseInsensitive ) ?
+					shortcutName : shortcutName + QStringLiteral(".lnk") ) ).toStdWString();
+			ok = SUCCEEDED( persist->Save( shortcutPath.c_str(), TRUE ) );
+			if( ok == false ) { s_lastError = QStringLiteral("Could not save desktop shortcut"); }
+		}
+	}
+	if( link ) { link->Release(); }
+	if( persist ) { persist->Release(); }
+	coUninit();
+	return ok;
+#else
+	Q_UNUSED(name)
+	Q_UNUSED(target)
+	Q_UNUSED(arguments)
+	Q_UNUSED(workingDirectory)
+	s_lastError = QStringLiteral("Desktop shortcuts are only available on Windows");
+	return false;
+#endif
 }
 
 

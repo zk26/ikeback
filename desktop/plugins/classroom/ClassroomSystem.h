@@ -30,6 +30,8 @@ public:
 	static bool setMute( bool muted );
 	static bool setInternetBlock( bool blocked, const QString& teacherIp );
 	static QString softwareInstallCommand( const QString& packagePath );
+	static bool createDesktopShortcut( const QString& name, const QString& target,
+									   const QString& arguments, const QString& workingDirectory );
 
 	static QString lastError();
 };

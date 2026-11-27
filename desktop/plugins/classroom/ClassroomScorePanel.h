@@ -36,12 +36,15 @@ public:
 						 QWidget* parent = nullptr );
 
 	void setClassName( const QString& className );
+	void setCurrentLessonId( const QString& lessonId );
+	Q_INVOKABLE void showRules();
 	void refresh();
 	void showCall( const QString& ip, const QString& seat, const QString& student );
 
 	//! Used by the seat grid: current total for a seat, and quick +/- scoring.
 	int scoreForSeat( const QString& seat ) const;
-	void addEntryForSeat( const QString& seat, int delta, const QString& label,
+	QString levelForSeat( const QString& seat ) const;
+	bool addEntryForSeat( const QString& seat, int delta, const QString& label,
 						  const QString& richText = QString{} );
 
 private:
@@ -69,6 +72,7 @@ private:
 	mutable ClassroomScoreBook m_book;
 	QString m_className;
 	QString m_lessonId;
+	bool m_lessonPinned = false;
 
 	QTabWidget* m_tabs = nullptr;
 	QDateEdit* m_lessonDate = nullptr;
@@ -82,6 +86,8 @@ private:
 	QCheckBox* m_publish = nullptr;
 	QTextEdit* m_rulesEditor = nullptr;
 	QPlainTextEdit* m_quickActions = nullptr;
+	QComboBox* m_levelScheme = nullptr;
+	QTableWidget* m_levelTable = nullptr;
 
 	QComboBox* m_cloudStudent = nullptr;
 	QLabel* m_cloudView = nullptr;

@@ -11,6 +11,7 @@
 
 #include <QDockWidget>
 #include <QDateTime>
+#include <QHash>
 #include <QJsonObject>
 #include <QMap>
 #include <QObject>
@@ -84,6 +85,14 @@ Q_SIGNALS:
 
 private:
 	QString dataDirectory() const;
+	//! Master-side shop requests from students (query / redeem / bid). All
+	//! validation happens here on the teacher machine; answers go back as
+	//! ShopState / ShopReply messages through the sending control interface.
+	void handleShopRequest( const FeatureMessage& message,
+							const ComputerControlInterface::Pointer& computerControlInterface );
+	//! Sends the current catalog of `className` to every connected student
+	//! (via the console, which owns the control interface list).
+	void broadcastShopState( const QString& className );
 	ClassroomRoster* roster();
 	ClassroomLogStore* store();
 	ClassroomSettings* settings();
@@ -127,6 +136,7 @@ private:
 	const Feature m_quickToolsFeature;
 	const Feature m_checkInFeature;
 	const Feature m_operationLogFeature;
+	const Feature m_endLessonFeature;
 	FeatureList m_features;
 	//! Same order as the white list in buildQuickActionFeatures(); the index is
 	//! also the UID suffix.
@@ -174,10 +184,23 @@ private:
 	QMap<QString, QDateTime> m_discoveredHosts;
 	//! Worker-side staging file for remote software deployment.
 	QFile* m_deployFile = nullptr;
+	QFile* m_packageFile = nullptr;
+	QString m_packageId;
+	QString m_packageRelativePath;
+	QString m_packageStagingRoot;
+	QJsonObject m_packageManifest;
+	qint64 m_packageOffset = 0;
+	void sendPackageResult( const QString& phase, bool ok, const QString& detail );
+	bool verifyDeployedPackage( const QJsonObject& state, QString* error ) const;
+	void resumePackageDeployment();
+	void resetPackageReceive();
 	//! Worker-side installer process so its real exit code can be reported.
 	QProcess* m_installProcess = nullptr;
 	//! Master-side watcher so roster imports from the configurator show up at once.
 	QFileSystemWatcher* m_rosterWatcher = nullptr;
+	//! Machine address -> reported class, seat and student identity.
+	QHash<QString, QVector<QString>> m_studentIdentityByAddress;
 	//! ip -> live classroom display name, more reliable than a stale roster IP.
 	QMap<QString, QString> m_studentDisplayByIp;
+	QMap<QString, bool> m_studentProtectionByAddress;
 };

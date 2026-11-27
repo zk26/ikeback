@@ -18,6 +18,8 @@
 #include <QDateEdit>
 #include <QDateTime>
 #include <QDebug>
+#include <QCryptographicHash>
+#include <QDirIterator>
 #include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -40,18 +42,22 @@
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPair>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QProgressBar>
+#include <QRegularExpression>
 #include <QPushButton>
 #include <QTcpSocket>
 #include <QScrollArea>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QScopedValueRollback>
 #include <QSpinBox>
+#include <QStackedWidget>
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -72,8 +78,11 @@
 #include "ClassroomScore.h"
 #include "ClassroomScorePanel.h"
 #include "ClassroomSeatGrid.h"
+#include "ClassroomShop.h"
+#include "ClassroomShopPanel.h"
 #include "ClassroomSecrets.h"
 #include "ClassroomSystem.h"
+#include "ClassroomTheme.h"
 #include "ComputerControlInterface.h"
 #include "FeatureManager.h"
 #include "FeatureProviderInterface.h"
@@ -104,10 +113,19 @@ ClassroomMasterDialog::ClassroomMasterDialog( IkebackMasterInterface& master,
 	m_refreshTimer( new QTimer( this ) )
 {
 	setWindowTitle( Classroom::productName() );
-	setWindowIcon( QIcon( QStringLiteral(":/core/icon32.png") ) );
+	setObjectName( QStringLiteral("classroomConsole") );
+	setWindowIcon( QIcon( QStringLiteral(":/master/app-icon.png") ) );
 	resize( 1024, 720 );
+	Classroom::Theme::apply( this );
 
-	m_tabs = new QTabWidget( this );
+	m_navigation = new QListWidget( this );
+	m_navigation->setObjectName( QStringLiteral("classroomNavigation") );
+	m_navigation->setFixedWidth( 190 );
+	m_navigation->setEditTriggers( QAbstractItemView::NoEditTriggers );
+	m_navigation->setSelectionBehavior( QAbstractItemView::SelectRows );
+	m_navigation->setFrameShape( QFrame::NoFrame );
+	m_tabs = new QStackedWidget( this );
+	m_tabs->setObjectName( QStringLiteral("classroomPages") );
 	setupClassTab();
 	setupLogTab();
 	setupAnalysisTab();
@@ -116,10 +134,11 @@ ClassroomMasterDialog::ClassroomMasterDialog( IkebackMasterInterface& master,
 	setupSystemTab();
 
 	m_scorePanel = new ClassroomScorePanel( dataDirectory(), m_roster, m_store, settingsJson(), m_tabs );
-	m_tabs->addTab( m_scorePanel, tr( "Score & reports" ) );
+	addPage( m_scorePanel, tr( "Score & reports" ), -1, QStringLiteral("score") );
 
 	setupSeatTab();
 	setupTimetableTab();
+	setupShopTab();
 	// Created last so it can reuse widgets from the other tabs, but inserted as
 	// the FIRST tab: these are the actions a teacher uses every lesson.
 	setupToolsTab();
@@ -131,9 +150,27 @@ ClassroomMasterDialog::ClassroomMasterDialog( IkebackMasterInterface& master,
 	footer->addStretch( 1 );
 	footer->addWidget( closeButton );
 
-	auto* layout = new QVBoxLayout( this );
-	layout->addWidget( m_tabs, 1 );
-	layout->addLayout( footer );
+	auto* layout = new QHBoxLayout( this );
+	layout->setContentsMargins( 8, 8, 8, 8 );
+	layout->setSpacing( 8 );
+	layout->addWidget( m_navigation );
+	auto* contentLayout = new QVBoxLayout;
+	contentLayout->setContentsMargins( 0, 0, 0, 0 );
+	contentLayout->addWidget( m_tabs, 1 );
+	contentLayout->addLayout( footer );
+	layout->addLayout( contentLayout, 1 );
+
+	connect( m_navigation, &QListWidget::currentRowChanged, this, [this]( int row ) {
+		if( row >= 0 && row < m_tabs->count() ) { m_tabs->setCurrentIndex( row ); }
+	} );
+	connect( m_tabs, &QStackedWidget::currentChanged, this, [this]( int index ) {
+		if( index >= 0 && index < m_navigation->count() )
+		{
+			QSignalBlocker blocker( m_navigation );
+			m_navigation->setCurrentRow( index );
+		}
+	} );
+	m_navigation->setCurrentRow( 0 );
 
 	// Run in the teacher's interactive account: DPAPI blobs are bound to this
 	// user, so the one-time enc: -> dpapi: migration must happen here.
@@ -146,6 +183,7 @@ ClassroomMasterDialog::ClassroomMasterDialog( IkebackMasterInterface& master,
 	replayIdentityEvents();
 	refreshRosterTable();
 	m_scorePanel->setClassName( currentClassName() );
+	if( m_shopPanel ) { m_shopPanel->setClassName( currentClassName() ); }
 	if( m_bridge ) { m_bridge->setClassName( currentClassName() ); }
 	if( m_seatGrid ) { m_seatGrid->setClassName( currentClassName() ); }
 	refreshSeatGrid();
@@ -180,9 +218,7 @@ ClassroomMasterDialog::~ClassroomMasterDialog()
 
 QString ClassroomMasterDialog::dataDirectory() const
 {
-	const auto configured = m_settings.object().value( SettingKey::dataDirectory() ).
-							toString( m_configuration.dataDirectory() );
-	return IkebackCore::filesystem().expandPath( configured );
+	return IkebackCore::filesystem().expandPath( m_configuration.dataDirectory() );
 }
 
 
@@ -227,9 +263,15 @@ QString ClassroomMasterDialog::currentSessionId()
 QString ClassroomMasterDialog::ipOfInterface( const ComputerControlInterface* controlInterface )
 {
 	if( controlInterface == nullptr ) { return {}; }
+	const auto address = controlInterface->computer().hostAddress().toString();
+	if( address.isEmpty() == false && address != QLatin1String("0.0.0.0") &&
+		address != QLatin1String("::") )
+	{
+		return address;
+	}
 	const auto host = controlInterface->computer().hostName();
 	if( host.isEmpty() == false ) { return host; }
-	return controlInterface->computer().hostAddress().toString();
+	return address;
 }
 
 
@@ -238,6 +280,7 @@ QStringList ClassroomMasterDialog::onlineIps() const
 	QStringList ips;
 	for( const auto& controlInterface : m_master.allComputerControlInterfaces() )
 	{
+		if( controlInterface->state() != ComputerControlInterface::State::Connected ) { continue; }
 		const auto ip = ipOfInterface( controlInterface.data() );
 		if( ip.isEmpty() == false ) { ips.append( ip ); }
 	}
@@ -351,6 +394,20 @@ void ClassroomMasterDialog::appendTeacherEvent( const QString& type, const QStri
 }
 
 
+void ClassroomMasterDialog::addPage( QWidget* page, const QString& label, int index, const QString& key )
+{
+	if( key.isEmpty() == false ) { page->setProperty( "ikebackPageKey", key ); }
+	if( index < 0 || index > m_tabs->count() )
+	{
+		m_tabs->addWidget( page );
+		m_navigation->addItem( label );
+		return;
+	}
+	m_tabs->insertWidget( index, page );
+	m_navigation->insertItem( index, label );
+}
+
+
 void ClassroomMasterDialog::setupClassTab()
 {
 	auto* page = new QWidget( m_tabs );
@@ -382,6 +439,7 @@ void ClassroomMasterDialog::setupClassTab()
 		refreshRosterTable();
 		refreshStatus();
 		if( m_scorePanel ) { m_scorePanel->setClassName( currentClassName() ); }
+		if( m_shopPanel ) { m_shopPanel->setClassName( currentClassName() ); }
 		if( m_bridge ) { m_bridge->setClassName( currentClassName() ); }
 		if( m_seatGrid ) { m_seatGrid->setClassName( currentClassName() ); }
 		m_checkInNames.clear();
@@ -480,7 +538,7 @@ void ClassroomMasterDialog::setupClassTab()
 	layout->addLayout( quickRow );
 	connect( quickButton, &QPushButton::clicked, this, [this]() { quickLoginByIp(); } );
 
-	m_tabs->addTab( page, tr( "Class & sign-in" ) );
+	addPage( page, tr( "Class & sign-in" ), -1, QStringLiteral("class") );
 }
 
 
@@ -667,14 +725,29 @@ void ClassroomMasterDialog::registerComputers( const QVector<ClassroomStudent>& 
 	}
 
 	QSet<QString> writtenAddresses;
+	QMap<QString, QUuid> existingUids;
+	for( const auto& value : objects )
+	{
+		const auto object = value.toObject();
+		if( QUuid( object.value( QStringLiteral("ParentUid") ).toString() ) == locationUid &&
+			object.value( QStringLiteral("Type") ).toInt() == static_cast<int>( NetworkObject::Type::Host ) )
+		{
+			const auto address = object.value( QStringLiteral("HostAddress") ).toString();
+			if( address.isEmpty() == false )
+			{
+				existingUids.insert( address.toLower(), QUuid( object.value( QStringLiteral("Uid") ).toString() ) );
+			}
+		}
+	}
 	QJsonArray newObjects = otherObjects;
 	for( const auto& student : students )
 	{
-		if( student.ip.isEmpty() || writtenAddresses.contains( student.ip ) ) { continue; }
+		if( student.ip.isEmpty() || writtenAddresses.contains( student.ip.toLower() ) ) { continue; }
 		const auto displayName = QStringLiteral("%1 %2").arg( student.seat, student.name ).trimmed();
+		const auto uid = existingUids.value( student.ip.toLower(), QUuid::createUuid() );
 		newObjects.append( NetworkObject( NetworkObject::Type::Host, displayName, student.ip, {}, {},
-										  QUuid::createUuid(), locationUid ).toJson() );
-		writtenAddresses.insert( student.ip );
+										  uid, locationUid ).toJson() );
+		writtenAddresses.insert( student.ip.toLower() );
 	}
 
 	if( newObjects == objects ) { return; }
@@ -873,6 +946,80 @@ void ClassroomMasterDialog::exportRoster()
 	{
 		QMessageBox::warning( this, windowTitle(), error );
 	}
+}
+
+
+void ClassroomMasterDialog::showPage( const QString& pageName )
+{
+	if( pageName == QStringLiteral("levels") && m_scorePanel )
+	{
+		m_tabs->setCurrentWidget( m_scorePanel );
+		QMetaObject::invokeMethod( m_scorePanel, "showRules" );
+		return;
+	}
+	for( int index = 0; index < m_tabs->count(); ++index )
+	{
+		auto* page = m_tabs->widget( index );
+		if( page && page->property( "ikebackPageKey" ).toString() == pageName )
+		{
+			m_tabs->setCurrentWidget( page );
+			return;
+		}
+	}
+}
+
+
+void ClassroomMasterDialog::beginLesson()
+{
+	if( currentClassName().isEmpty() )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "请先创建或选择一个班级。" ) );
+		return;
+	}
+	if( m_lessonActive )
+	{
+		showPage( QStringLiteral("seats") );
+		return;
+	}
+	m_lessonActive = true;
+	m_sessionId.clear();
+	currentSessionId();
+	generateKey();
+	const auto topic = m_lessonTopic && m_lessonTopic->text().trimmed().isEmpty() == false ?
+						   m_lessonTopic->text().trimmed() : QStringLiteral("开始上课");
+	ClassroomScoreBook book( dataDirectory() );
+	book.load( currentClassName() );
+	m_currentLessonId = book.ensureLesson( QDate::currentDate(), topic );
+	if( m_scorePanel ) { m_scorePanel->setCurrentLessonId( m_currentLessonId ); }
+	pushSettings();
+	pushRoster();
+	pushKey();
+	startCheckIn();
+	showPage( QStringLiteral("seats") );
+	appendTeacherEvent( EventType::connection(), tr( "课堂已开始：%1" ).arg( currentClassName() ) );
+}
+
+
+void ClassroomMasterDialog::endLesson()
+{
+	if( m_lessonActive == false ) { return; }
+	m_lessonActive = false;
+	m_currentLessonId.clear();
+	appendTeacherEvent( EventType::connection(), tr( "课堂已结束：%1" ).arg( currentClassName() ) );
+	setToolStatus( tr( "当前课堂已结束，可返回监控模式。" ) );
+}
+
+
+void ClassroomMasterDialog::startCheckInFromToolBar()
+{
+	m_master.setClassroomMode( true );
+	if( m_lessonActive == false )
+	{
+		beginLesson();
+		return;
+	}
+	showPage( QStringLiteral("seats") );
+	startCheckIn();
 }
 
 
@@ -1150,8 +1297,9 @@ void ClassroomMasterDialog::setupLogTab()
 	m_logMachine->addItem( tr( "All computers" ) );
 	m_logType = new QComboBox( page );
 	m_logType->addItems( { tr( "All" ), QStringLiteral("login"), QStringLiteral("logout"), QStringLiteral("switch"),
-						   QStringLiteral("app"), QStringLiteral("window"), QStringLiteral("web"), QStringLiteral("ai"),
-						   QStringLiteral("key-failed"), QStringLiteral("quit-attempt"), QStringLiteral("lock") } );
+							   QStringLiteral("app"), QStringLiteral("window"), QStringLiteral("web"), QStringLiteral("ai"),
+							   QStringLiteral("shop"), QStringLiteral("auction"), QStringLiteral("key-failed"),
+							   QStringLiteral("quit-attempt"), QStringLiteral("lock") } );
 	m_logKeyword = new QLineEdit( page );
 	m_logKeyword->setPlaceholderText( tr( "Keyword" ) );
 	filterRow->addWidget( new QLabel( tr( "From:" ), page ) );
@@ -1194,7 +1342,7 @@ void ClassroomMasterDialog::setupLogTab()
 	m_logTable->setEditTriggers( QAbstractItemView::NoEditTriggers );
 	layout->addWidget( m_logTable, 1 );
 
-	m_tabs->addTab( page, tr( "Activity logs" ) );
+	addPage( page, tr( "Activity logs" ) );
 }
 
 
@@ -1336,7 +1484,7 @@ void ClassroomMasterDialog::setupAnalysisTab()
 	m_analysisTable->setEditTriggers( QAbstractItemView::NoEditTriggers );
 	layout->addWidget( m_analysisTable, 1 );
 
-	m_tabs->addTab( page, tr( "Interest analysis" ) );
+	addPage( page, tr( "Interest analysis" ) );
 }
 
 
@@ -1467,11 +1615,9 @@ void ClassroomMasterDialog::setupAiTab()
 	layout->addLayout( form );
 
 	auto* buttons = new QHBoxLayout;
-	auto* saveButton = new QPushButton( tr( "Save on this computer" ), page );
-	auto* pushButton = new QPushButton( tr( "Save and push to students" ), page );
+	auto* saveButton = new QPushButton( tr( "保存并下发到学生机" ), page );
 	auto* testButton = new QPushButton( tr( "Test connection" ), page );
 	buttons->addWidget( saveButton );
-	buttons->addWidget( pushButton );
 	buttons->addWidget( testButton );
 	buttons->addStretch( 1 );
 	layout->addLayout( buttons );
@@ -1481,11 +1627,10 @@ void ClassroomMasterDialog::setupAiTab()
 	layout->addWidget( m_aiTestResult );
 	layout->addStretch( 1 );
 
-	connect( saveButton, &QPushButton::clicked, this, [this]() { saveSettingsFromWidgets(); } );
-	connect( pushButton, &QPushButton::clicked, this, [this]() { saveSettingsFromWidgets(); pushSettings(); } );
+	connect( saveButton, &QPushButton::clicked, this, [this]() { saveSettingsFromWidgets(); pushSettings(); } );
 	connect( testButton, &QPushButton::clicked, this, [this]() { testAiConnection(); } );
 
-	m_tabs->addTab( page, tr( "AI settings" ) );
+	addPage( page, tr( "AI settings" ) );
 }
 
 
@@ -1494,12 +1639,10 @@ void ClassroomMasterDialog::setupMonitorTab()
 	auto* page = new QWidget( m_tabs );
 	auto* layout = new QVBoxLayout( page );
 	auto* form = new QFormLayout;
-	m_dataDirectory = new QLineEdit( page );
 	m_monitoringEnabled = new QCheckBox( tr( "Record application, window title and browsing behaviour" ), page );
 	m_captureWindowTitle = new QCheckBox( tr( "Record active window titles" ), page );
 	m_captureProcess = new QCheckBox( tr( "Record active process names" ), page );
 	m_exitProtection = new QCheckBox( tr( "Prevent students from exiting the client" ), page );
-	m_exitRequiresAdmin = new QCheckBox( tr( "Exiting requires the administrator account" ), page );
 	m_allowSelfLogin = new QCheckBox( tr( "Students may sign in themselves (seat + name)" ), page );
 	m_exitAdminUsername = new QLineEdit( page );
 	m_adminKey = new QLineEdit( page );
@@ -1511,13 +1654,11 @@ void ClassroomMasterDialog::setupMonitorTab()
 	m_retentionDays = new QSpinBox( page );
 	m_retentionDays->setRange( 1, 3650 );
 	m_retentionDays->setSuffix( tr( " days" ) );
-	form->addRow( tr( "Data directory:" ), m_dataDirectory );
 	form->addRow( m_monitoringEnabled );
 	form->addRow( m_captureWindowTitle );
 	form->addRow( m_captureProcess );
 	form->addRow( tr( "Sampling interval:" ), m_captureInterval );
 	form->addRow( m_exitProtection );
-	form->addRow( m_exitRequiresAdmin );
 	form->addRow( tr( "Administrator account:" ), m_exitAdminUsername );
 	form->addRow( tr( "超级管理员密钥:" ), m_adminKey );
 	form->addRow( m_allowSelfLogin );
@@ -1525,13 +1666,11 @@ void ClassroomMasterDialog::setupMonitorTab()
 	layout->addLayout( form );
 
 	auto* buttons = new QHBoxLayout;
-	auto* saveButton = new QPushButton( tr( "Save on this computer" ), page );
-	auto* pushButton = new QPushButton( tr( "Save and push to students" ), page );
+	auto* saveButton = new QPushButton( tr( "保存并下发到学生机" ), page );
 	auto* keyButton = new QPushButton( tr( "Generate new mobile bridge key" ), page );
 	auto* rosterButton = new QPushButton( tr( "Push roster" ), page );
 	auto* openButton = new QPushButton( tr( "Open data directory" ), page );
 	buttons->addWidget( saveButton );
-	buttons->addWidget( pushButton );
 	buttons->addWidget( keyButton );
 	buttons->addWidget( rosterButton );
 	buttons->addWidget( openButton );
@@ -1539,8 +1678,25 @@ void ClassroomMasterDialog::setupMonitorTab()
 	layout->addLayout( buttons );
 	layout->addStretch( 1 );
 
-	connect( saveButton, &QPushButton::clicked, this, [this]() { saveSettingsFromWidgets(); } );
-	connect( pushButton, &QPushButton::clicked, this, [this]() { saveSettingsFromWidgets(); pushSettings(); } );
+	connect( saveButton, &QPushButton::clicked, this, [this]() {
+		saveSettingsFromWidgets();
+		bool connected = false;
+		for( const auto& controlInterface : m_master.allComputerControlInterfaces() )
+		{
+			if( controlInterface->state() == ComputerControlInterface::State::Connected )
+			{
+				connected = true;
+				break;
+			}
+		}
+		if( connected == false )
+		{
+			QMessageBox::warning( this, windowTitle(),
+								  tr( "当前没有在线学生机。设置已保存，但保护密码尚未下发；请连接学生机后再保存一次。" ) );
+			return;
+		}
+		pushSettings();
+	} );
 	connect( keyButton, &QPushButton::clicked, this, [this]() { generateKey(); } );
 	connect( rosterButton, &QPushButton::clicked, this, [this]() { pushRoster(); } );
 	connect( openButton, &QPushButton::clicked, this, [this]() {
@@ -1548,7 +1704,7 @@ void ClassroomMasterDialog::setupMonitorTab()
 		QDesktopServices::openUrl( QUrl::fromLocalFile( dataDirectory() ) );
 	} );
 
-	m_tabs->addTab( page, tr( "Monitoring & lock" ) );
+	addPage( page, tr( "Monitoring & lock" ) );
 }
 
 
@@ -1562,15 +1718,15 @@ void ClassroomMasterDialog::refreshSettingsWidgets()
 	m_aiSystemPrompt->setPlainText( object.value( SettingKey::aiSystemPrompt() ).toString() );
 	m_aiTimeout->setValue( object.value( SettingKey::aiTimeout() ).toInt( 60 ) );
 
-	m_dataDirectory->setText( object.value( SettingKey::dataDirectory() ).toString() );
 	m_monitoringEnabled->setChecked( object.value( SettingKey::monitoringEnabled() ).toBool( true ) );
 	m_captureWindowTitle->setChecked( object.value( SettingKey::captureWindowTitle() ).toBool( true ) );
 	m_captureProcess->setChecked( object.value( SettingKey::captureProcess() ).toBool( true ) );
 	m_exitProtection->setChecked( object.value( SettingKey::exitProtection() ).toBool( true ) );
-	m_exitRequiresAdmin->setChecked( object.value( SettingKey::exitRequiresAdmin() ).toBool( true ) );
+	m_protectionOn = m_exitProtection->isChecked();
 	m_allowSelfLogin->setChecked( object.value( SettingKey::allowSelfLogin() ).toBool( true ) );
 	m_exitAdminUsername->setText( object.value( SettingKey::exitAdminUsername() ).toString() );
-	m_adminKey->setText( object.value( SettingKey::adminKey() ).toString() );
+	const auto adminKey = object.value( SettingKey::adminKey() ).toString();
+	m_adminKey->setText( adminKey.isEmpty() ? ClassroomSecrets::defaultAdminKey() : adminKey );
 	m_captureInterval->setValue( object.value( SettingKey::captureInterval() ).toInt( 5 ) );
 	m_retentionDays->setValue( object.value( QStringLiteral("retentionDays") ).toInt( 180 ) );
 }
@@ -1586,15 +1742,14 @@ void ClassroomMasterDialog::saveSettingsFromWidgets()
 	object.insert( SettingKey::aiSystemPrompt(), m_aiSystemPrompt->toPlainText() );
 	object.insert( SettingKey::aiTimeout(), m_aiTimeout->value() );
 
-	object.insert( SettingKey::dataDirectory(), m_dataDirectory->text().trimmed() );
 	object.insert( SettingKey::monitoringEnabled(), m_monitoringEnabled->isChecked() );
 	object.insert( SettingKey::captureWindowTitle(), m_captureWindowTitle->isChecked() );
 	object.insert( SettingKey::captureProcess(), m_captureProcess->isChecked() );
 	object.insert( SettingKey::exitProtection(), m_exitProtection->isChecked() );
-	object.insert( SettingKey::exitRequiresAdmin(), m_exitRequiresAdmin->isChecked() );
 	object.insert( SettingKey::allowSelfLogin(), m_allowSelfLogin->isChecked() );
 	object.insert( SettingKey::exitAdminUsername(), m_exitAdminUsername->text().trimmed() );
-	object.insert( SettingKey::adminKey(), m_adminKey->text() );
+	const auto adminKey = m_adminKey->text().isEmpty() ? ClassroomSecrets::defaultAdminKey() : m_adminKey->text();
+	object.insert( SettingKey::adminKey(), adminKey );
 	object.insert( SettingKey::captureInterval(), m_captureInterval->value() );
 	object.insert( QStringLiteral("retentionDays"), m_retentionDays->value() );
 	object.insert( SettingKey::bridgeEnabled(), m_bridgeEnabled->isChecked() );
@@ -1626,7 +1781,11 @@ void ClassroomMasterDialog::testAiConnection()
 
 void ClassroomMasterDialog::showCall( const QString& ip, const QString& seat, const QString& student )
 {
-	if( m_scorePanel ) { m_scorePanel->showCall( ip, seat, student ); }
+	if( m_scorePanel )
+	{
+		m_tabs->setCurrentWidget( m_scorePanel );
+		m_scorePanel->showCall( ip, seat, student );
+	}
 	if( m_systemStatus )
 	{
 		m_systemStatus->setText( tr( "来自 %1 的呼叫（%2，座位 %3）" ).arg( student, ip, seat ) );
@@ -1663,6 +1822,21 @@ void ClassroomMasterDialog::recordStudentIdentity( const QString& className, con
 }
 
 
+void ClassroomMasterDialog::recordProtectionState( const QString& ip, bool enabled )
+{
+	if( ip.trimmed().isEmpty() ) { return; }
+	m_protectionStatus.insert( ip.trimmed(), enabled );
+	refreshSeatGrid();
+}
+
+
+void ClassroomMasterDialog::restoreProtectionStates( const QMap<QString, bool>& states )
+{
+	m_protectionStatus = states;
+	refreshSeatGrid();
+}
+
+
 void ClassroomMasterDialog::replayIdentityEvents()
 {
 	const auto events = m_store.load( QDate::currentDate().addDays( -7 ), QDate::currentDate() );
@@ -1689,6 +1863,7 @@ void ClassroomMasterDialog::reloadRoster()
 	refreshRosterTable();
 	refreshStatus();
 	if( m_scorePanel ) { m_scorePanel->setClassName( currentClassName() ); }
+	if( m_shopPanel ) { m_shopPanel->setClassName( currentClassName() ); }
 	if( m_bridge ) { m_bridge->setClassName( currentClassName() ); }
 	if( m_seatGrid ) { m_seatGrid->setClassName( currentClassName() ); }
 	refreshCheckIn();
@@ -1799,84 +1974,155 @@ void ClassroomMasterDialog::deployInstaller()
 {
 	if( m_deployPhase != DeployPhase::Idle )
 	{
-		QMessageBox::information( this, windowTitle(), tr( "已有一次远程安装正在进行，请等待其完成。" ) );
+		QMessageBox::information( this, windowTitle(), tr( "已有一次远程部署正在进行，请等待其完成。" ) );
 		return;
 	}
-	if( m_toolScope && m_toolScope->currentIndex() == 1 && selectedIps().isEmpty() )
+	if( m_toolScope && m_toolScope->currentIndex() == 1 && selectedIps().isEmpty() && m_actionTargetsActive == false )
 	{
-		QMessageBox::information( this, windowTitle(), tr( "请先在名单中选择要安装的学生机。" ) );
+		QMessageBox::information( this, windowTitle(), tr( "请先选择要部署的学生机。" ) );
 		return;
 	}
 
-	const auto path = QFileDialog::getOpenFileName(
-		this, tr( "选择要下发安装的软件包" ), QString{},
-		tr( "安装包 (*.exe *.msi);;所有文件 (*)" ) );
-	if( path.isEmpty() ) { return; }
-
-	if( ClassroomSystem::softwareInstallCommand( path ).isEmpty() )
+	const auto folder = QFileDialog::getExistingDirectory( this, tr( "选择绿色软件文件夹" ), QString{},
+		QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks );
+	if( folder.isEmpty() ) { return; }
+	const auto folderName = QFileInfo( folder ).fileName();
+	if( folderName.isEmpty() || folderName == QStringLiteral("." ) || folderName == QStringLiteral(".." ) ||
+		folderName.contains( QRegularExpression( QStringLiteral("[<>:\"/\\|?*]") ) ) )
 	{
-		QMessageBox::warning( this, windowTitle(),
-							  tr( "只支持 .exe 与 .msi 安装包，且路径中不能包含引号。" ) );
+		QMessageBox::warning( this, windowTitle(), tr( "文件夹名称含有非法字符，请重命名后再试。" ) );
+		return;
+	}
+
+	QJsonArray files;
+	QStringList executables;
+	qint64 totalBytes = 0;
+	QDirIterator iterator( folder, QDir::Files | QDir::NoDotAndDotDot, QDirIterator::Subdirectories );
+	while( iterator.hasNext() )
+	{
+		const auto path = iterator.next();
+		const auto info = QFileInfo( path );
+		if( info.isSymLink() )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "为安全起见，文件夹中不能包含符号链接：%1" ).arg( path ) );
+			return;
+		}
+		if( files.size() >= 5000 || info.size() > 512LL * 1024 * 1024 || totalBytes + info.size() > 2LL * 1024 * 1024 * 1024 )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "文件夹超过部署限制：最多 5000 个文件、总大小 2 GiB、单文件 512 MiB。" ) );
+			return;
+		}
+		QFile file( path );
+		if( file.open( QIODevice::ReadOnly ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "无法读取文件：%1" ).arg( path ) );
+			return;
+		}
+		QCryptographicHash hash( QCryptographicHash::Sha256 );
+		while( file.atEnd() == false )
+		{
+			const auto chunk = file.read( 1024 * 1024 );
+			if( chunk.isEmpty() && file.error() != QFileDevice::NoError )
+			{
+				QMessageBox::warning( this, windowTitle(), tr( "无法读取文件：%1" ).arg( path ) );
+				return;
+			}
+			hash.addData( chunk );
+		}
+		const auto relative = QDir::fromNativeSeparators( QDir( folder ).relativeFilePath( path ) );
+		files.append( QJsonObject{ { QStringLiteral("path"), relative },
+			{ QStringLiteral("size"), info.size() }, { QStringLiteral("sha256"), QString::fromLatin1( hash.result().toHex() ) } } );
+		if( info.suffix().compare( QStringLiteral("exe"), Qt::CaseInsensitive ) == 0 ) { executables.append( relative ); }
+		totalBytes += info.size();
+	}
+	if( executables.isEmpty() )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "文件夹中没有可启动的 .exe，请检查后再试。" ) );
 		return;
 	}
 
 	QDialog dialog( this );
-	dialog.setWindowTitle( tr( "远程装软件" ) );
+	dialog.setWindowTitle( tr( "部署绿色软件文件夹" ) );
 	auto* form = new QFormLayout( &dialog );
-	form->addRow( tr( "安装包:" ), new QLabel( QFileInfo( path ).fileName(), &dialog ) );
+	form->addRow( tr( "文件夹：" ), new QLabel( folderName, &dialog ) );
+	form->addRow( tr( "文件数量/大小：" ), new QLabel( tr( "%1 个 / %2 MiB" ).arg( files.size() ).arg( totalBytes / 1024.0 / 1024.0, 0, 'f', 1 ), &dialog ) );
+	auto* entryCombo = new QComboBox( &dialog );
+	entryCombo->addItems( executables );
+	form->addRow( tr( "启动程序：" ), entryCombo );
 	auto* argsEdit = new QLineEdit( &dialog );
-	argsEdit->setPlaceholderText( tr( "可选：额外静默参数，例如 /S 或 /quiet" ) );
-	form->addRow( tr( "静默参数:" ), argsEdit );
-	auto* uwfCheck = new QCheckBox(
-		tr( "自动处理 UWF 还原（关闭还原 → 重启 → 安装 → 恢复还原 → 重启）" ), &dialog );
-	uwfCheck->setChecked( true );
-	form->addRow( uwfCheck );
+	argsEdit->setPlaceholderText( tr( "可选：程序启动参数" ) );
+	form->addRow( tr( "启动参数：" ), argsEdit );
+	auto* shortcutEdit = new QLineEdit( folderName, &dialog );
+	form->addRow( tr( "桌面快捷方式名称：" ), shortcutEdit );
 	auto* scope = new QComboBox( &dialog );
 	scope->addItem( tr( "所有学生机" ) );
 	scope->addItem( tr( "仅选中的学生机" ) );
-	form->addRow( tr( "范围:" ), scope );
+	if( m_toolScope ) { scope->setCurrentIndex( m_toolScope->currentIndex() ); }
+	if( m_actionTargetsActive ) { scope->setCurrentIndex( 1 ); scope->setEnabled( false ); }
+	form->addRow( tr( "范围：" ), scope );
+	form->addRow( {}, new QLabel( tr( "文件将部署到 C:\\IkebackApps\\%1。流程会关闭 UWF、重启、复制并核验、创建桌面快捷方式、恢复 UWF，然后再次重启并核验。" ).arg( folderName ), &dialog ) );
 	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
 	form->addRow( buttons );
 	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
 	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
 	if( dialog.exec() != QDialog::Accepted ) { return; }
-
-	if( m_deploySource ) { m_deploySource->close(); m_deploySource->deleteLater(); m_deploySource = nullptr; }
-	m_deploySource = new QFile( path, this );
-	if( m_deploySource->open( QFile::ReadOnly ) == false )
+	if( QFileInfo( shortcutEdit->text() ).fileName() != shortcutEdit->text().trimmed() || shortcutEdit->text().trimmed().isEmpty() )
 	{
-		QMessageBox::warning( this, windowTitle(), tr( "无法读取安装包文件，请检查文件是否被占用。" ) );
-		m_deploySource->deleteLater();
-		m_deploySource = nullptr;
+		QMessageBox::warning( this, windowTitle(), tr( "快捷方式名称不能包含路径分隔符。" ) );
 		return;
 	}
-	m_deployArgs = argsEdit->text().trimmed();
-	m_deployUwfFlow = uwfCheck->isChecked();
-	m_deployWaitTicks = 0;
 	if( m_toolScope ) { m_toolScope->setCurrentIndex( scope->currentIndex() ); }
-	m_deployExpected = toolTargets().size();
+	m_deployTargets = m_actionTargetsActive ? m_actionTargets : ComputerControlInterfaceList{};
+	if( m_deployTargets.isEmpty() )
+	{
+		for( const auto& controlInterface : m_master.allComputerControlInterfaces() )
+		{
+			const auto ip = ipOfInterface( controlInterface.data() );
+			if( toolTargets().contains( ip ) ) { m_deployTargets.append( controlInterface ); }
+		}
+	}
+	m_deployExpected = m_deployTargets.size();
+	if( m_deployExpected == 0 )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "没有可部署的学生机。" ) );
+		return;
+	}
+	m_deployId = QUuid::createUuid().toString( QUuid::WithoutBraces );
+	m_deployFolder = folderName;
+	m_deploySourceFolder = folder;
+	m_deployFiles = files;
+	m_deployArgs = argsEdit->text().trimmed();
+	m_deployManifest = QJsonObject{
+		{ QStringLiteral("id"), m_deployId }, { QStringLiteral("folder"), folderName },
+		{ QStringLiteral("files"), files },
+		{ QStringLiteral("shortcut"), QJsonObject{ { QStringLiteral("name"), shortcutEdit->text().trimmed() },
+			{ QStringLiteral("target"), entryCombo->currentText() }, { QStringLiteral("arguments"), m_deployArgs } } } };
+	m_deployFileIndex = 0;
+	m_deployFileOffset = 0;
+	m_deployTotalBytes = totalBytes;
+	m_deploySentBytes = 0;
 	m_deploySuccess = 0;
 	m_deployFailure = 0;
 	m_deployReported.clear();
+	m_deployVerified.clear();
+	m_deployVerifySuccess = 0;
+	m_deployVerifyFailure = 0;
 	m_deployInstallSummary.clear();
+	m_deployWaitTicks = 0;
 
-	// 安装期间弹出不可关闭的进度窗口（窗口模态）：看得到阶段，且无法误操作其他设置。
 	m_deployProgressDialog = new QDialog( this );
-	m_deployProgressDialog->setWindowTitle( tr( "远程安装进度" ) );
-	// 应用级模态：安装完成前整个教师端都不能操作，避免中途改设置打断流程。
+	m_deployProgressDialog->setWindowTitle( tr( "远程部署进度" ) );
 	m_deployProgressDialog->setWindowModality( Qt::ApplicationModal );
 	m_deployProgressDialog->setWindowFlags( m_deployProgressDialog->windowFlags() & ~Qt::WindowCloseButtonHint );
-	m_deployProgressDialog->setMinimumWidth( 440 );
+	m_deployProgressDialog->setMinimumWidth( 500 );
 	auto* progressLayout = new QVBoxLayout( m_deployProgressDialog );
-	m_deployProgressLabel = new QLabel( tr( "准备安装..." ), m_deployProgressDialog );
+	m_deployProgressLabel = new QLabel( tr( "准备部署..." ), m_deployProgressDialog );
 	m_deployProgressLabel->setWordWrap( true );
 	m_deployProgressBar = new QProgressBar( m_deployProgressDialog );
 	m_deployProgressBar->setRange( 0, 100 );
-	m_deployProgressBar->setValue( 0 );
-	auto* progressHint = new QLabel( tr( "安装非常重要：请等待全部学生机完成，期间请勿关闭教师端或操作其他按钮。" ),
-									 m_deployProgressDialog );
+	auto* progressHint = new QLabel( tr( "部署期间请勿关闭教师端；学生会自动重启两次。" ), m_deployProgressDialog );
 	progressHint->setWordWrap( true );
-	progressHint->setStyleSheet( QStringLiteral("color:#c0392b; font-weight:bold;") );
+	progressHint->setProperty( "state", QStringLiteral("error") );
 	progressLayout->addWidget( m_deployProgressLabel );
 	progressLayout->addWidget( m_deployProgressBar );
 	progressLayout->addWidget( progressHint );
@@ -1888,14 +2134,11 @@ void ClassroomMasterDialog::deployInstaller()
 		m_deployProgressBar = nullptr;
 	} );
 
-	// The whole install runs through OUR feature channel (chunked file
-	// transfer + local silent install) instead of the old StartApp with a
-	// teacher-local path which never existed on the student machines.
-	m_deployPhase = m_deployUwfFlow ? DeployPhase::DisableUwf : DeployPhase::Transfer;
-	appendTeacherEvent( EventType::install(),
-						tr( "远程装软件开始：%1（%2）" ).arg( path, m_deployUwfFlow ? tr( "含 UWF 流程" ) : tr( "直接安装" ) ) );
-	setToolStatus( tr( "远程装软件已开始：%1" ).arg( QFileInfo( path ).fileName() ) );
-
+	m_deployUwfFlow = true;
+	m_deployPhase = DeployPhase::DisableUwf;
+	appendTeacherEvent( EventType::install(), tr( "部署文件夹开始：%1（%2 个文件，%3 台）" )
+		.arg( folder ).arg( files.size() ).arg( m_deployExpected ) );
+	setToolStatus( tr( "远程部署已开始：%1" ).arg( folderName ) );
 	if( m_deployTimer == nullptr )
 	{
 		m_deployTimer = new QTimer( this );
@@ -1912,113 +2155,173 @@ void ClassroomMasterDialog::advanceDeploy()
 	{
 	case DeployPhase::DisableUwf:
 		setUwfFilter( false );
-		setToolStatus( tr( "远程装软件 [1/7]：正在关闭 UWF 写保护，随后学生机将自动重启..." ) );
+		setToolStatus( tr( "远程部署 [1/8]：正在关闭 UWF，随后自动重启..." ) );
 		m_deployPhase = DeployPhase::RebootAfterDisable;
 		m_deployWaitTicks = 0;
 		break;
 
 	case DeployPhase::RebootAfterDisable:
-		// Give uwfmgr a moment to persist the configuration before rebooting.
 		if( ++m_deployWaitTicks < 3 ) { break; }
-		sendToAll( Classroom::message( Command::UwfRestart ) );
-		appendTeacherEvent( EventType::uwf(), tr( "远程装软件：已发送重启命令（关闭还原后）" ) );
-		setToolStatus( tr( "远程装软件 [2/7]：学生机重启中，等待重新上线..." ) );
+		sendToTargets( Classroom::message( Command::UwfRestart ) );
+		appendTeacherEvent( EventType::uwf(), tr( "远程部署：第一次重启（关闭 UWF 后）" ) );
+		setToolStatus( tr( "远程部署 [2/8]：学生机第一次重启，等待上线..." ) );
 		m_deployPhase = DeployPhase::WaitOnline;
 		m_deployWaitTicks = 0;
 		break;
 
 	case DeployPhase::WaitOnline:
 	{
-		const auto online = onlineIps().size();
-		setToolStatus( tr( "远程装软件 [3/7]：等待学生机上线（当前 %1 台在线）..." ).arg( online ) );
+		const auto online = deployOnlineCount();
+		setToolStatus( tr( "远程部署 [3/8]：等待学生机上线（%1/%2）..." ).arg( online ).arg( m_deployExpected ) );
 		++m_deployWaitTicks;
-		// 超时仍无学生上线时直接判失败，不再继续走完流程谎报成功。
-		if( m_deployWaitTicks >= 75 && online == 0 )
-		{
-			finishDeploy( tr( "远程安装失败：超时后仍没有学生机上线，未下发安装包。" ) );
-			break;
-		}
-		// At least 20s of settle time, then proceed as soon as somebody is
-		// back; hard cap of 150s so a dead machine cannot stall the class.
 		if( ( online > 0 && m_deployWaitTicks >= 10 ) || m_deployWaitTicks >= 75 )
 		{
+			const auto onlineSet = onlineIps();
+			ComputerControlInterfaceList ready;
+			for( const auto& controlInterface : m_deployTargets )
+			{
+				if( onlineSet.contains( ipOfInterface( controlInterface.data() ) ) ) { ready.append( controlInterface ); }
+			}
+			m_deployTargets = ready;
+			m_deployExpected = ready.size();
+			if( ready.isEmpty() )
+			{
+				finishDeploy( tr( "远程部署失败：重启后超时仍没有目标学生机上线。" ) );
+				break;
+			}
+			auto begin = Classroom::message( Command::DeployPackageBegin );
+			begin.addArgument( Argument::DeploymentId, m_deployId )
+				 .addArgument( Argument::ManifestJson,
+					QJsonDocument( m_deployManifest ).toJson( QJsonDocument::Compact ) );
+			sendToTargets( begin );
 			m_deployPhase = DeployPhase::Transfer;
 			m_deployTimer->setInterval( 100 );
-			// Restart the source file in case a previous attempt read ahead.
-			if( m_deploySource ) { m_deploySource->seek( 0 ); }
-			auto begin = Classroom::message( Command::DeployFileBegin );
-			begin.addArgument( Argument::FileName, m_deploySource ? QFileInfo( m_deploySource->fileName() ).fileName() : QString{} )
-				 .addArgument( Argument::FileSize, m_deploySource ? m_deploySource->size() : 0 );
-			sendToTargets( begin );
-			setToolStatus( tr( "远程装软件 [4/7]：正在下发安装包到学生机..." ) );
+			setToolStatus( tr( "远程部署 [4/8]：正在向 %1 台在线学生机发送文件夹..." ).arg( m_deployExpected ) );
 		}
 		break;
 	}
 
 	case DeployPhase::Transfer:
 	{
-		if( m_deploySource == nullptr ) { finishDeploy( tr( "安装包读取失败" ) ); break; }
-		const auto chunk = m_deploySource->read( 256 * 1024 );
-		if( chunk.isEmpty() == false )
+		if( m_deployFileIndex >= m_deployFiles.size() )
 		{
-			auto message = Classroom::message( Command::DeployFileChunk );
-			message.addArgument( Argument::FileData, chunk );
-			sendToTargets( message );
-			const auto percent = m_deploySource->size() > 0 ?
-									 int( m_deploySource->pos() * 100 / m_deploySource->size() ) : 100;
-			setToolStatus( tr( "远程装软件 [4/7]：正在下发安装包 %1%" ).arg( percent ) );
-			setDeployProgress( tr( "正在下发安装包 %1%" ).arg( percent ), 55 + percent / 5 );
+			auto commit = Classroom::message( Command::DeployPackageCommit );
+			commit.addArgument( Argument::DeploymentId, m_deployId );
+			sendToTargets( commit );
+			setToolStatus( tr( "远程部署 [5/8]：文件发送完成，等待学生机校验并创建快捷方式..." ) );
+			m_deployPhase = DeployPhase::WaitInstall;
+			m_deployWaitTicks = 0;
+			m_deployTimer->setInterval( 2000 );
 			break;
 		}
-		m_deploySource->close();
-		auto install = Classroom::message( Command::UwfInstall );
-		install.addArgument( Argument::SoftwarePath, QFileInfo( m_deploySource->fileName() ).fileName() )
-			   .addArgument( Argument::SoftwareArgs, m_deployArgs );
-		sendToTargets( install );
-		appendTeacherEvent( EventType::install(), tr( "远程装软件：安装包已下发，等待学生机执行安装" ) );
-		setToolStatus( tr( "远程装软件 [5/7]：安装包已下发，学生机正在静默安装..." ) );
-		m_deployPhase = DeployPhase::WaitInstall;
-		m_deployWaitTicks = 0;
-		m_deployTimer->setInterval( 2000 );
+		const auto entry = m_deployFiles.at( m_deployFileIndex ).toObject();
+		const auto relative = entry.value( QStringLiteral("path") ).toString();
+		if( m_deploySource == nullptr )
+		{
+			m_deploySource = new QFile( QDir( m_deploySourceFolder ).filePath( relative ), this );
+			if( m_deploySource->open( QIODevice::ReadOnly ) == false )
+			{
+				finishDeploy( tr( "远程部署失败：无法读取 %1。" ).arg( relative ) );
+				break;
+			}
+		}
+		const auto chunk = m_deploySource->read( 256 * 1024 );
+		if( chunk.isEmpty() && m_deploySource->error() != QFileDevice::NoError )
+		{
+			finishDeploy( tr( "远程部署失败：读取 %1 时发生错误。" ).arg( relative ) );
+			break;
+		}
+		if( chunk.isEmpty() == false )
+		{
+			auto message = Classroom::message( Command::DeployPackageChunk );
+			message.addArgument( Argument::DeploymentId, m_deployId )
+				 .addArgument( Argument::RelativePath, relative )
+				 .addArgument( Argument::FileOffset, m_deployFileOffset )
+				 .addArgument( Argument::FileData, chunk );
+			sendToTargets( message );
+			m_deployFileOffset += chunk.size();
+			m_deploySentBytes += chunk.size();
+		}
+		else
+		{
+			const auto expectedSize = entry.value( QStringLiteral("size") ).toVariant().toLongLong();
+			if( m_deployFileOffset != expectedSize )
+			{
+				finishDeploy( tr( "远程部署失败：%1 的大小与清单不一致。" ).arg( relative ) );
+				break;
+			}
+			m_deploySource->close();
+			delete m_deploySource;
+			m_deploySource = nullptr;
+			++m_deployFileIndex;
+			m_deployFileOffset = 0;
+		}
+		const auto percent = m_deployTotalBytes > 0 ? int( m_deploySentBytes * 100 / m_deployTotalBytes ) : 100;
+		setDeployProgress( tr( "正在发送文件夹 %1%%（%2/%3 个文件）" ).arg( percent ).arg( m_deployFileIndex + 1 ).arg( m_deployFiles.size() ), 35 + percent / 2 );
 		break;
 	}
 
 	case DeployPhase::WaitInstall:
-		if( ++m_deployWaitTicks < 15 ) { break; } // 等 30s 收回执，不再视为安装成功
-		m_deployInstallSummary = installSummaryText();
-		if( m_deployUwfFlow )
+		if( ++m_deployWaitTicks >= 15 )
 		{
+			m_deployInstallSummary = installSummaryText();
 			m_deployPhase = DeployPhase::EnableUwf;
-		}
-		else
-		{
-			finishDeploy( m_deployInstallSummary );
+			m_deployWaitTicks = 0;
 		}
 		break;
 
 	case DeployPhase::EnableUwf:
 		setUwfFilter( true );
-		setToolStatus( tr( "远程装软件 [6/7]：正在恢复 UWF 写保护..." ) );
+		setToolStatus( tr( "远程部署 [6/8]：正在恢复 UWF 写保护..." ) );
 		m_deployPhase = DeployPhase::RebootAfterEnable;
 		m_deployWaitTicks = 0;
 		break;
 
 	case DeployPhase::RebootAfterEnable:
+		if( ++m_deployWaitTicks < 3 ) { break; }
+		sendToTargets( Classroom::message( Command::UwfRestart ) );
+		appendTeacherEvent( EventType::uwf(), tr( "远程部署：第二次重启（恢复 UWF 后）" ) );
+		setToolStatus( tr( "远程部署 [7/8]：学生机第二次重启，等待最终核验..." ) );
+		m_deployPhase = DeployPhase::WaitVerify;
+		m_deployWaitTicks = 0;
+		break;
+
+	case DeployPhase::WaitVerify:
 	{
-		if( ++m_deployWaitTicks < 3 )
+		++m_deployWaitTicks;
+		if( m_deployVerified.size() >= m_deployExpected )
 		{
-			setToolStatus( tr( "远程装软件 [7/7]：等待 UWF 配置生效..." ) );
-			break;
+			finishDeploy( m_deployInstallSummary + tr( "；重启后核验：%1 台通过，%2 台失败。" )
+				.arg( m_deployVerifySuccess ).arg( m_deployVerifyFailure ) );
 		}
-		sendToAll( Classroom::message( Command::UwfRestart ) );
-		const auto summary = m_deployInstallSummary.isEmpty() ? installSummaryText() : m_deployInstallSummary;
-		finishDeploy( summary + tr( "；UWF 还原已恢复，学生机将再次重启。" ) );
+		else if( m_deployWaitTicks >= 75 )
+		{
+			finishDeploy( m_deployInstallSummary + tr( "；重启后核验超时：%1/%2 台已确认，请检查操作记录。" )
+				.arg( m_deployVerified.size() ).arg( m_deployExpected ) );
+		}
+		else
+		{
+			setToolStatus( tr( "远程部署 [8/8]：等待重启后核验（%1/%2）..." )
+				.arg( m_deployVerified.size() ).arg( m_deployExpected ) );
+		}
 		break;
 	}
 
 	case DeployPhase::Idle:
 		break;
 	}
+}
+
+
+int ClassroomMasterDialog::deployOnlineCount() const
+{
+	const auto online = onlineIps();
+	int count = 0;
+	for( const auto& controlInterface : m_deployTargets )
+	{
+		if( online.contains( ipOfInterface( controlInterface.data() ) ) ) { ++count; }
+	}
+	return count;
 }
 
 
@@ -2065,6 +2368,46 @@ void ClassroomMasterDialog::recordInstallResult( const QString& ip, bool success
 }
 
 
+void ClassroomMasterDialog::recordPackageResult( const QString& ip, const QString& phase,
+												  bool success, const QString& detail )
+{
+	if( m_deployPhase == DeployPhase::Idle || ip.isEmpty() || toolTargets().contains( ip ) == false ) { return; }
+	if( phase == QStringLiteral("transfer") )
+	{
+		appendTeacherEvent( EventType::install(), tr( "部署传输失败 %1：%2" ).arg( ip, detail ) );
+		if( success == false ) { ++m_deployFailure; }
+		return;
+	}
+	const auto verifying = phase == QStringLiteral("verify" );
+	auto& reported = verifying ? m_deployVerified : m_deployReported;
+	if( reported.contains( ip ) ) { return; }
+	reported.insert( ip );
+	if( verifying )
+	{
+		if( success ) { ++m_deployVerifySuccess; } else { ++m_deployVerifyFailure; }
+	}
+	else
+	{
+		if( success ) { ++m_deploySuccess; } else { ++m_deployFailure; }
+		m_deployInstallSummary = installSummaryText();
+	}
+	appendTeacherEvent( EventType::install(),
+		tr( "部署%1回执 %2：%3（%4）" ).arg( verifying ? tr( "重启核验" ) : tr( "提交" ), ip,
+			success ? tr( "成功" ) : tr( "失败" ), detail ) );
+	if( verifying && m_deployPhase == DeployPhase::WaitVerify && m_deployVerified.size() >= m_deployExpected )
+	{
+		finishDeploy( m_deployInstallSummary + tr( "；重启后核验：%1 台通过，%2 台失败。" )
+			.arg( m_deployVerifySuccess ).arg( m_deployVerifyFailure ) );
+	}
+	else if( verifying == false && m_deployPhase == DeployPhase::WaitInstall &&
+			 m_deployReported.size() >= m_deployExpected )
+	{
+		m_deployPhase = DeployPhase::EnableUwf;
+		m_deployWaitTicks = 0;
+	}
+}
+
+
 void ClassroomMasterDialog::finishDeploy( const QString& result )
 {
 	if( m_deployTimer ) { m_deployTimer->stop(); }
@@ -2083,6 +2426,7 @@ void ClassroomMasterDialog::finishDeploy( const QString& result )
 		m_deployProgressBar = nullptr;
 	}
 	m_deployPhase = DeployPhase::Idle;
+	m_deployTargets.clear();
 	setToolStatus( result );
 	appendTeacherEvent( EventType::install(), result );
 	QMessageBox::information( this, windowTitle(), result );
@@ -2091,7 +2435,7 @@ void ClassroomMasterDialog::finishDeploy( const QString& result )
 
 void ClassroomMasterDialog::showQuickToolsTab()
 {
-	m_tabs->setCurrentIndex( 0 );
+	if( m_toolsPage ) { m_tabs->setCurrentWidget( m_toolsPage ); }
 }
 
 
@@ -2150,7 +2494,7 @@ void ClassroomMasterDialog::openOperationLog()
 			if( event.detail.contains( QStringLiteral("FAILED"), Qt::CaseInsensitive ) ||
 				event.detail.contains( QStringLiteral("failed"), Qt::CaseInsensitive ) )
 			{
-				detail->setForeground( QBrush( QColor( QStringLiteral("#c62828") ) ) );
+				detail->setForeground( QBrush( Classroom::Theme::color( Classroom::Theme::ColorRole::Danger ) ) );
 			}
 			table->setItem( row, 3, detail );
 		}
@@ -2208,6 +2552,26 @@ void ClassroomMasterDialog::syncNow()
 
 QStringList ClassroomMasterDialog::toolTargets() const
 {
+	if( m_deployPhase != DeployPhase::Idle && m_deployTargets.isEmpty() == false )
+	{
+		QStringList ips;
+		for( const auto& controlInterface : m_deployTargets )
+		{
+			const auto ip = ipOfInterface( controlInterface.data() );
+			if( ip.isEmpty() == false && ips.contains( ip ) == false ) { ips.append( ip ); }
+		}
+		return ips;
+	}
+	if( m_actionTargetsActive )
+	{
+		QStringList ips;
+		for( const auto& controlInterface : m_actionTargets )
+		{
+			const auto ip = ipOfInterface( controlInterface.data() );
+			if( ip.isEmpty() == false && ips.contains( ip ) == false ) { ips.append( ip ); }
+		}
+		return ips;
+	}
 	if( m_toolScope && m_toolScope->currentIndex() == 1 ) { return selectedIps(); }
 	return onlineIps();
 }
@@ -2215,6 +2579,22 @@ QStringList ClassroomMasterDialog::toolTargets() const
 
 void ClassroomMasterDialog::sendToTargets( const FeatureMessage& message )
 {
+	if( m_deployPhase != DeployPhase::Idle && m_deployTargets.isEmpty() == false )
+	{
+		for( const auto& controlInterface : m_deployTargets )
+		{
+			controlInterface->sendFeatureMessage( message );
+		}
+		return;
+	}
+	if( m_actionTargetsActive )
+	{
+		for( const auto& controlInterface : m_actionTargets )
+		{
+			controlInterface->sendFeatureMessage( message );
+		}
+		return;
+	}
 	if( m_toolScope && m_toolScope->currentIndex() == 1 )
 	{
 		const auto ips = selectedIps();
@@ -2248,6 +2628,7 @@ void ClassroomMasterDialog::setToolStatus( const QString& text )
 		case DeployPhase::WaitInstall: percent = 80; break;
 		case DeployPhase::EnableUwf: percent = 90; break;
 		case DeployPhase::RebootAfterEnable: percent = 96; break;
+		case DeployPhase::WaitVerify: percent = 98; break;
 		case DeployPhase::Idle: break;
 		}
 		setDeployProgress( text, percent );
@@ -2263,11 +2644,14 @@ void ClassroomMasterDialog::setToolStatus( const QString& text )
 
 void ClassroomMasterDialog::setClientProtection( bool enabled )
 {
-	// CLIENT protection: stop the student from quitting the ikeback worker /
-	// floating card. Completely unrelated to UWF or the uninstall guard.
+	// One teacher switch controls both cooperative exits and the bundled
+	// uninstaller. UWF remains an independent disk-protection feature.
 	auto message = Classroom::message( Command::SetExitProtection );
 	message.addArgument( Argument::Enabled, enabled );
-	sendToAll( message );
+	sendToTargets( message );
+	auto uninstallMessage = Classroom::message( Command::SetUninstallProtection );
+	uninstallMessage.addArgument( Argument::Enabled, enabled );
+	sendToTargets( uninstallMessage );
 
 	auto object = settingsJson();
 	object.insert( SettingKey::exitProtection(), enabled );
@@ -2276,10 +2660,11 @@ void ClassroomMasterDialog::setClientProtection( bool enabled )
 	if( m_exitProtection ) { m_exitProtection->setChecked( enabled ); }
 
 	setToolStatus( enabled ?
-		tr( "Client protection ON: students can no longer quit the ikeback card." ) :
-		tr( "Client protection OFF: the card may now be closed (use only for maintenance)." ) );
+		tr( "保护已开启：学生退出和本程序卸载都需要管理员密码。" ) :
+		tr( "保护已解除：学生可自由退出和卸载。" ) );
 	appendTeacherEvent( EventType::protection(),
-						enabled ? tr( "client protection enabled" ) : tr( "client protection disabled" ) );
+						enabled ? tr( "client and uninstall protection enabled" )
+								: tr( "client and uninstall protection disabled" ) );
 }
 
 
@@ -2291,11 +2676,11 @@ void ClassroomMasterDialog::setUwfFilter( bool enabled )
 	// Deliberately does NOT reboot: the teacher may need to install right now.
 	auto message = Classroom::message( Command::UwfSetFilter );
 	message.addArgument( Argument::Enabled, enabled );
-	sendToAll( message );
+	sendToTargets( message );
 
 	setToolStatus( enabled ?
-		tr( "UWF restore queued for all students. Takes effect after reboot; use Restart students if needed." ) :
-		tr( "UWF restore disabled for all students. Install your software now, then enable it again." ) );
+		tr( "已向 %1 台学生机下发启用 UWF，重启后生效。" ).arg( toolTargets().size() ) :
+		tr( "已向 %1 台学生机下发禁用 UWF，可以安装软件。" ).arg( toolTargets().size() ) );
 	appendTeacherEvent( EventType::uwf(),
 						enabled ? tr( "UWF restore enabled" ) : tr( "UWF restore disabled" ) );
 }
@@ -2325,7 +2710,7 @@ void ClassroomMasterDialog::applyFuzzyRules( const QString& key, const QString& 
 									   Command::SetAppBlockRules : Command::SetWebBlockRules );
 	message.addArgument( Argument::RulesJson,
 						 QString::fromUtf8( QJsonDocument( array ).toJson( QJsonDocument::Compact ) ) );
-	sendToAll( message );
+	sendToTargets( message );
 
 	setToolStatus( tr( "已应用 %1 条规则：%2" )
 				   .arg( rules.size() ).arg( rules.isEmpty() ? tr( "（无，拦截已解除）" ) : rules.join( QStringLiteral(", ") ) ) );
@@ -2734,8 +3119,45 @@ void ClassroomMasterDialog::setupTimetableTab()
 	lessonLayout->addWidget( refreshRecords );
 	layout->addWidget( lessonCard, 1 );
 
-	m_tabs->addTab( page, tr( "Timetable & lesson" ) );
+	addPage( page, tr( "Timetable & lesson" ), -1, QStringLiteral("course") );
 	refreshLessonRecords();
+}
+
+
+void ClassroomMasterDialog::setupShopTab()
+{
+	auto* scroll = new QScrollArea( m_tabs );
+	scroll->setWidgetResizable( true );
+	scroll->setFrameShape( QFrame::NoFrame );
+	m_shopPanel = new ClassroomShopPanel( dataDirectory(), m_roster, m_store, scroll );
+	scroll->setWidget( m_shopPanel );
+	// Every teacher-side mutation (product, auction, open/close) pushes the
+	// fresh catalog to all students; score changes also refresh the seat grid.
+	connect( m_shopPanel, &ClassroomShopPanel::shopChanged, this, [this]() {
+		broadcastShopState();
+		refreshSeatGrid();
+	} );
+	addPage( scroll, tr( "商城 & 竞拍" ), -1, QStringLiteral("shop") );
+}
+
+
+void ClassroomMasterDialog::broadcastShopState( const QString& className )
+{
+	const auto targetClass = className.isEmpty() ? currentClassName() : className;
+	if( targetClass.isEmpty() ) { return; }
+	ClassroomShopBook book( dataDirectory() );
+	if( book.load( targetClass ) == false ) { return; }
+	auto message = Classroom::message( Command::ShopState );
+	message.addArgument( Argument::ClassName, targetClass );
+	message.addArgument( Argument::ShopJson,
+						 QJsonDocument( book.catalogJson() ).toJson( QJsonDocument::Compact ) );
+	sendToAll( message );
+}
+
+
+void ClassroomMasterDialog::refreshShopPanel()
+{
+	if( m_shopPanel ) { m_shopPanel->refresh(); }
 }
 
 
@@ -2759,7 +3181,7 @@ void ClassroomMasterDialog::setupToolsTab()
 								 "UWF：Windows 写保护，重启即还原，装软件前请先关闭。"
 								 "两者是彼此独立的开关。" ), page );
 	note->setWordWrap( true );
-	note->setStyleSheet( QStringLiteral("color:#546e7a; font-size:11px;") );
+	note->setProperty( "role", QStringLiteral("hint") );
 	layout->addWidget( note );
 
 	// The buttons themselves live on the Ikeback Master tool bar (2.4.0: as
@@ -2870,13 +3292,13 @@ void ClassroomMasterDialog::setupToolsTab()
 		{ QStringLiteral("uwf.on"), tr( "Enable UWF" ), [this]() { setUwfFilter( true ); } },
 		{ QStringLiteral("uwf.off"), tr( "Disable UWF" ), [this]() { setUwfFilter( false ); } },
 		{ QStringLiteral("uwf.query"), tr( "Query UWF" ), [this]() {
-			sendToAll( Classroom::message( Command::UwfQuery ) );
+			sendToTargets( Classroom::message( Command::UwfQuery ) );
 			QTimer::singleShot( 2000, this, [this]() { refreshUwfStatus(); refreshSeatGrid(); } );
 			setToolStatus( tr( "UWF query sent; results appear in the seat list view and activity log." ) );
 		} },
 		{ QStringLiteral("uwf.restart"), tr( "Restart students" ), [this]() {
-			sendToAll( Classroom::message( Command::UwfRestart ) );
-			setToolStatus( tr( "Reboot command sent to all students." ) );
+			sendToTargets( Classroom::message( Command::UwfRestart ) );
+			setToolStatus( tr( "重启命令已下发。" ) );
 		} },
 		{ QStringLiteral("uwf.toggle"), tr( "UWF" ), [this]() {
 			m_uwfOn = !m_uwfOn;
@@ -2966,7 +3388,11 @@ void ClassroomMasterDialog::setupToolsTab()
 		{ QStringLiteral("score.p5"), QStringLiteral("+5"), [this]() { scoreWholeClass( 5 ); } },
 		{ QStringLiteral("score.p1"), tr( "全部加分" ), [this]() { showWholeClassScoreDialog( true ); } },
 		{ QStringLiteral("score.m1"), tr( "全部减分" ), [this]() { showWholeClassScoreDialog( false ); } },
-		{ QStringLiteral("score.m5"), QStringLiteral("-5"), [this]() { scoreWholeClass( -5 ); } } } );
+		{ QStringLiteral("score.m5"), QStringLiteral("-5"), [this]() { scoreWholeClass( -5 ); } },
+		{ QStringLiteral("shop.open"), tr( "积分商城" ), [this]() {
+			// 打开控制台并直达商城页签：上架商品、发起竞拍都在那里。
+			if( m_shopPanel ) { m_tabs->setCurrentWidget( m_shopPanel->parentWidget() ); }
+		} } } );
 
 	// Check-in has its own button on the Ikeback tool bar, so it is deliberately
 	// not repeated inside this menu.
@@ -2982,23 +3408,31 @@ void ClassroomMasterDialog::setupToolsTab()
 			send( Command::SetMute, m_muted );
 		} } } );
 
-	group( tr( "远程装软件" ), QStringLiteral(":/classroom/icons/install.png"), {
+	group( tr( "远程装软件" ), QStringLiteral(":/classroom/icons/remote-install.png"), {
 		{ QStringLiteral("remote.install"), tr( "远程装软件" ), [this]() { deployInstaller(); } } } );
 
 	auto* toolbarHint = new QLabel(
 		tr( "所有动作都可直接在主工具栏上点击（图标下方有名称）。"
 			"本页只保存这些动作的参数：肃静文案、禁用规则、软件路径与网址。" ), page );
 	toolbarHint->setWordWrap( true );
-	toolbarHint->setStyleSheet( QStringLiteral("color:#546e7a; font-size:11px;") );
+	toolbarHint->setProperty( "role", QStringLiteral("hint") );
 	layout->addWidget( toolbarHint );
 
 	layout->addStretch( 1 );
-	m_tabs->insertTab( 0, page, tr( "Quick tools" ) );
+	m_toolsPage = page;
+	addPage( page, tr( "Quick tools" ), 1 );
 }
 
 
-bool ClassroomMasterDialog::runQuickTool( const QString& id )
+bool ClassroomMasterDialog::runQuickTool( const QString& id, const ComputerControlInterfaceList& targets )
 {
+	if( targets.isEmpty() )
+	{
+		setToolStatus( tr( "没有可操作的学生机，请检查勾选与过滤条件。" ) );
+		return false;
+	}
+	QScopedValueRollback<ComputerControlInterfaceList> targetsRollback( m_actionTargets, targets );
+	QScopedValueRollback<bool> activeRollback( m_actionTargetsActive, true );
 	for( const auto& group : m_quickToolGroups )
 	{
 		for( const auto& action : group.actions )
@@ -3044,17 +3478,33 @@ void ClassroomMasterDialog::setupSeatTab()
 	m_seatGrid->setScoreProvider( [this]( const QString& seat ) -> int {
 		return m_scorePanel ? m_scorePanel->scoreForSeat( seat ) : 100;
 	} );
-	m_seatGrid->setScoreSink( [this]( const QString& seat, int delta, const QString& reason ) {
-		if( m_scorePanel )
+	m_seatGrid->setLevelProvider( [this]( const QString& seat ) -> QString {
+		return m_scorePanel ? m_scorePanel->levelForSeat( seat ) : QString{};
+	} );
+	m_seatGrid->setScoreSink( [this]( const QString& seat, int delta, const QString& reason ) -> bool {
+		if( m_scorePanel == nullptr ) { return false; }
+		if( m_scorePanel->addEntryForSeat( seat, delta,
+											 reason.isEmpty() ? QString::number( delta ) : reason ) == false )
 		{
-			m_scorePanel->addEntryForSeat( seat, delta,
-										   reason.isEmpty() ? QString::number( delta ) : reason );
+			return false;
 		}
 		appendTeacherEvent( EventType::quickScore(),
 							tr( "%1 points at seat %2: %3" ).arg( delta ).arg( seat, reason ), {} );
+		return true;
 	} );
 	// Shield icon = CLIENT protection (cannot quit the student card).
-	m_seatGrid->setProtectionProvider( [this]( const QString& ) {
+	m_seatGrid->setProtectionProvider( [this]( const QString& seat ) {
+		const auto* classItem = m_roster.findClass( currentClassName() );
+		if( classItem )
+		{
+			for( const auto& student : classItem->students )
+			{
+				if( student.seat == seat && m_protectionStatus.contains( student.ip ) )
+				{
+					return m_protectionStatus.value( student.ip );
+				}
+			}
+		}
 		return settingsJson().value( SettingKey::exitProtection() ).toBool( true );
 	} );
 	// List view additionally shows the per-machine UWF restore state.
@@ -3076,11 +3526,12 @@ void ClassroomMasterDialog::setupSeatTab()
 	scroller->setWidget( m_seatGrid );
 	layout->addWidget( scroller, 3 );
 
-	m_checkInTable = new QTableWidget( 0, 5, page );
+	m_checkInTable = new QTableWidget( 0, 6, page );
 	m_checkInTable->setHorizontalHeaderLabels( QStringList{ tr( "Seat" ), tr( "Roster name" ),
-														  tr( "Typed name" ), tr( "Status" ), tr( "Time" ) } );
+														  tr( "Typed name" ), tr( "Status" ),
+														  tr( "Reason" ), tr( "Time" ) } );
 	m_checkInTable->horizontalHeader()->setSectionResizeMode( QHeaderView::Stretch );
-	m_checkInTable->setEditTriggers( QAbstractItemView::NoEditTriggers );
+	m_checkInTable->setEditTriggers( QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed );
 	m_checkInTable->setMaximumHeight( 210 );
 	layout->addWidget( m_checkInTable, 1 );
 
@@ -3092,7 +3543,7 @@ void ClassroomMasterDialog::setupSeatTab()
 		refreshCheckIn();
 	} );
 
-	m_tabs->addTab( page, tr( "Seats & check-in" ) );
+	addPage( page, tr( "Seats & check-in" ), 0, QStringLiteral("seats") );
 }
 
 
@@ -3114,21 +3565,27 @@ void ClassroomMasterDialog::refreshSeatGrid()
 	for( const auto& controlInterface : m_master.allComputerControlInterfaces() )
 	{
 		const auto ip = ipOfInterface( controlInterface.data() );
+		const auto& computer = controlInterface->computer();
 		for( const auto& student : classItem->students )
 		{
-			if( student.ip == ip )
+			if( student.ip.compare( ip, Qt::CaseInsensitive ) != 0 &&
+				student.ip.compare( computer.hostName(), Qt::CaseInsensitive ) != 0 &&
+				student.ip.compare( computer.hostAddress().toString(), Qt::CaseInsensitive ) != 0 )
 			{
-				// Qualify through QObject: ComputerControlInterface hides the
-				// base setProperty() with a QUuid-keyed overload of its own.
-				auto* object = static_cast<QObject*>( controlInterface.data() );
-				object->setProperty( "ikebackScore", m_scorePanel->scoreForSeat( student.seat ) );
-				object->setProperty( "ikebackProtected",
-									 settingsJson().value( SettingKey::exitProtection() ).toBool( true ) );
+				continue;
+			}
+			// Qualify through QObject: ComputerControlInterface hides the
+			// base setProperty() with a QUuid-keyed overload of its own.
+			auto* object = static_cast<QObject*>( controlInterface.data() );
+			object->setProperty( "ikebackSeat", student.seat );
+			object->setProperty( "ikebackStudentName", student.name );
+			object->setProperty( "ikebackScore", m_scorePanel->scoreForSeat( student.seat ) );
+			object->setProperty( "ikebackProtected", m_protectionStatus.contains( student.ip ) ?
+				m_protectionStatus.value( student.ip ) : settingsJson().value( SettingKey::exitProtection() ).toBool( true ) );
 				break;
 			}
 		}
 	}
-}
 
 
 void ClassroomMasterDialog::startCheckIn()
@@ -3152,6 +3609,23 @@ void ClassroomMasterDialog::recordCheckIn( const QString& className, const QStri
 	if( seat.isEmpty() || className != currentClassName() ) { return; }
 	m_checkInNames.insert( seat, typedName );
 	m_checkInTimes.insert( seat, QDateTime::currentDateTime() );
+	if( m_currentLessonId.isEmpty() == false )
+	{
+		ClassroomScoreBook book( dataDirectory() );
+		book.load( currentClassName() );
+		const auto* student = m_roster.findStudent( currentClassName(), seat );
+		ClassroomAttendance attendance;
+		attendance.lessonId = m_currentLessonId;
+		attendance.className = currentClassName();
+		attendance.seat = seat;
+		attendance.student = student ? student->name : QString{};
+		attendance.status = student && typedName == student->name ?
+								ClassroomAttendance::Present : ClassroomAttendance::Custom;
+		attendance.reason = attendance.status == ClassroomAttendance::Custom ? tr( "姓名不符" ) : QString{};
+		attendance.author = tr( "Teacher" );
+		attendance.checkInTime = m_checkInTimes.value( seat );
+		book.setAttendance( attendance );
+	}
 	refreshCheckIn();
 }
 
@@ -3163,42 +3637,100 @@ void ClassroomMasterDialog::refreshCheckIn()
 	const auto* classItem = m_roster.findClass( currentClassName() );
 	const int rows = classItem ? classItem->students.size() : 0;
 	m_checkInTable->setRowCount( rows );
-	int present = 0;
-	int mismatched = 0;
+	m_checkInTable->setEnabled( m_lessonActive );
+	ClassroomScoreBook book( dataDirectory() );
+	if( m_currentLessonId.isEmpty() == false ) { book.load( currentClassName() ); }
+	int counts[5] = {};
+
+	const auto persist = [&]( const QString& seat, const QString& student, int status,
+							  const QString& reason, const QDateTime& checkInTime ) {
+		if( m_currentLessonId.isEmpty() ) { return; }
+		ClassroomAttendance attendance;
+		attendance.lessonId = m_currentLessonId;
+		attendance.className = currentClassName();
+		attendance.seat = seat;
+		attendance.student = student;
+		attendance.status = status;
+		attendance.reason = reason;
+		attendance.author = tr( "Teacher" );
+		attendance.checkInTime = checkInTime;
+		book.setAttendance( attendance );
+	};
 
 	for( int row = 0; row < rows; ++row )
 	{
 		const auto& student = classItem->students.at( row );
 		const auto typed = m_checkInNames.value( student.seat );
-		QString status = tr( "absent" );
-		if( typed.isEmpty() == false && typed == student.name )
+		const auto time = m_checkInTimes.value( student.seat );
+		const auto saved = book.attendanceFor( m_currentLessonId, student.seat );
+		int status = ClassroomAttendance::Absent;
+		QString reason;
+		if( saved.lessonId.isEmpty() == false )
 		{
-			status = tr( "present" );
-			++present;
+			status = saved.status;
+			reason = saved.reason;
 		}
 		else if( typed.isEmpty() == false )
 		{
-			status = tr( "name mismatch" );
-			++mismatched;
+			status = typed == student.name ? ClassroomAttendance::Present : ClassroomAttendance::Custom;
+			reason = status == ClassroomAttendance::Custom ? tr( "姓名不符" ) : QString{};
 		}
-		const auto time = m_checkInTimes.value( student.seat );
+		if( saved.lessonId.isEmpty() && m_currentLessonId.isEmpty() == false )
+		{
+			persist( student.seat, student.name, status, reason, time );
+		}
+		counts[qBound( 0, status, 4 )]++;
 
 		m_checkInTable->setItem( row, 0, new QTableWidgetItem( student.seat ) );
 		m_checkInTable->setItem( row, 1, new QTableWidgetItem( student.name ) );
 		m_checkInTable->setItem( row, 2, new QTableWidgetItem( typed ) );
-		m_checkInTable->setItem( row, 3, new QTableWidgetItem( status ) );
-		m_checkInTable->setItem( row, 4, new QTableWidgetItem(
+		m_checkInTable->setItem( row, 5, new QTableWidgetItem(
 			time.isValid() ? time.toString( QStringLiteral("HH:mm:ss") ) : QString{} ) );
+
+		auto* reasonEdit = new QLineEdit( m_checkInTable );
+		reasonEdit->setPlaceholderText( tr( "缺勤、迟到或自定义原因" ) );
+		reasonEdit->setText( reason );
+		m_checkInTable->setCellWidget( row, 4, reasonEdit );
+
+		auto* statusCombo = new QComboBox( m_checkInTable );
+		statusCombo->addItem( tr( "出勤" ), ClassroomAttendance::Present );
+		statusCombo->addItem( tr( "缺勤" ), ClassroomAttendance::Absent );
+		statusCombo->addItem( tr( "迟到" ), ClassroomAttendance::Late );
+		statusCombo->addItem( tr( "请假" ), ClassroomAttendance::Leave );
+		statusCombo->addItem( tr( "自定义" ), ClassroomAttendance::Custom );
+		statusCombo->setCurrentIndex( statusCombo->findData( status ) );
+		m_checkInTable->setCellWidget( row, 3, statusCombo );
+
+		const auto saveRow = [this, seat = student.seat, studentName = student.name,
+							  statusCombo, reasonEdit, lessonId = m_currentLessonId,
+							  className = currentClassName()]() {
+			ClassroomScoreBook freshBook( dataDirectory() );
+			freshBook.load( className );
+			ClassroomAttendance attendance;
+			attendance.lessonId = lessonId;
+			attendance.className = className;
+			attendance.seat = seat;
+			attendance.student = studentName;
+			attendance.status = statusCombo->currentData().toInt();
+			attendance.reason = reasonEdit->text().trimmed();
+			attendance.author = tr( "Teacher" );
+			attendance.checkInTime = m_checkInTimes.value( seat );
+			freshBook.setAttendance( attendance );
+		};
+		connect( statusCombo, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, saveRow );
+		connect( reasonEdit, &QLineEdit::editingFinished, this, saveRow );
 	}
 
 	if( m_checkInSummary )
 	{
 		m_checkInSummary->setText(
 			m_checkInStarted.isValid()
-				? tr( "Check-in %1: %2 present, %3 name mismatch, %4 absent (total %5)" )
+				? tr( "签到 %1：出勤 %2，缺勤 %3，迟到 %4，请假 %5，自定义 %6（共 %7 人）" )
 					  .arg( m_checkInStarted.toString( QStringLiteral("HH:mm:ss") ) )
-					  .arg( present ).arg( mismatched ).arg( rows - present - mismatched ).arg( rows )
-				: tr( "No check-in started." ) );
+					  .arg( counts[ClassroomAttendance::Present] ).arg( counts[ClassroomAttendance::Absent] )
+					  .arg( counts[ClassroomAttendance::Late] ).arg( counts[ClassroomAttendance::Leave] )
+					  .arg( counts[ClassroomAttendance::Custom] ).arg( rows )
+				: tr( "尚未开始签到。" ) );
 	}
 }
 
@@ -3332,7 +3864,7 @@ void ClassroomMasterDialog::setupSystemTab()
 		} } } );
 	addRow( tr( "UWF:" ), {
 		{ tr( "Query" ), [this]() {
-			sendToAll( Classroom::message( Command::UwfQuery ) );
+			sendToTargets( Classroom::message( Command::UwfQuery ) );
 			m_systemStatus->setText( tr( "Querying local UWF ..." ) );
 			// uwfmgr.exe may block for seconds; run it off the GUI thread and
 			// deliver the result through a watcher parented to this dialog.
@@ -3397,5 +3929,5 @@ void ClassroomMasterDialog::setupSystemTab()
 	// Show the local server/bridge state right away: the red "this computer"
 	// icon in the Ikeback window finally gets an explanation.
 	QTimer::singleShot( 400, this, &ClassroomMasterDialog::runConnectivityCheck );
-	m_tabs->addTab( page, tr( "System & devices" ) );
+	addPage( page, tr( "System & devices" ) );
 }

@@ -14,12 +14,15 @@
 #include <QWidget>
 #include <functional>
 
+class QComboBox;
 class QEvent;
 class QFrame;
 class QGridLayout;
 class QLabel;
+class QLineEdit;
 class QObject;
 class QPushButton;
+class QSpinBox;
 class QTableWidget;
 class QTimer;
 class ClassroomRoster;
@@ -43,7 +46,8 @@ public:
 
 	using ThumbnailProvider = std::function<QImage( const QString& ip )>;
 	using ScoreProvider = std::function<int( const QString& seat )>;
-	using ScoreSink = std::function<void( const QString& seat, int delta, const QString& reason )>;
+	using LevelProvider = std::function<QString( const QString& seat )>;
+	using ScoreSink = std::function<bool( const QString& seat, int delta, const QString& reason )>;
 	//! Client-process protection (student cannot quit the ikeback worker).
 	using ProtectionProvider = std::function<bool( const QString& seat )>;
 	//! OS-level UWF restore state, as text for the list view.
@@ -52,6 +56,7 @@ public:
 
 	void setThumbnailProvider( ThumbnailProvider provider ) { m_thumbnailProvider = std::move( provider ); }
 	void setScoreProvider( ScoreProvider provider ) { m_scoreProvider = std::move( provider ); }
+	void setLevelProvider( LevelProvider provider ) { m_levelProvider = std::move( provider ); }
 	void setScoreSink( ScoreSink sink ) { m_scoreSink = std::move( sink ); }
 	void setProtectionProvider( ProtectionProvider provider ) { m_protectionProvider = std::move( provider ); }
 	void setUwfProvider( UwfProvider provider ) { m_uwfProvider = std::move( provider ); }
@@ -65,6 +70,7 @@ protected:
 	//! Drag-and-drop reordering of seat cards (installed as an event filter on
 	//! each card and its thumbnail; the score button keeps its normal clicks).
 	bool eventFilter( QObject* watched, QEvent* event ) override;
+	void resizeEvent( QResizeEvent* event ) override;
 
 private:
 	struct SeatCard
@@ -72,7 +78,13 @@ private:
 		QFrame* root = nullptr;
 		QLabel* thumbnail = nullptr;
 		QPushButton* score = nullptr;
+		QPushButton* scoreConfirm = nullptr;
+		QPushButton* scoreCancel = nullptr;
+		QSpinBox* scoreDelta = nullptr;
+		QLineEdit* scoreReason = nullptr;
+		QWidget* scoreEditor = nullptr;
 		QLabel* caption = nullptr;
+		QLabel* state = nullptr;
 		QString ip;
 		QString expectedName;
 		QString seat;
@@ -86,14 +98,20 @@ private:
 	void refresh();
 	void refreshList();
 	void chooseDelta( const QString& seat );
+	void commitScore( const QString& seat );
+	void cancelScore( const QString& seat );
+	void reflow();
+	int columnCount() const;
+	void updateZoom( int index );
 	void swapSeats( const QString& from, const QString& to );
-	QString protectionIcon( const QString& seat ) const;
+	QString protectionText( const QString& seat ) const;
 
 	ClassroomRoster& m_roster;
 	QString m_className;
 	QStringList m_onlineIps;
 	ThumbnailProvider m_thumbnailProvider;
 	ScoreProvider m_scoreProvider;
+	LevelProvider m_levelProvider;
 	ScoreSink m_scoreSink;
 	ProtectionProvider m_protectionProvider;
 	UwfProvider m_uwfProvider;
@@ -104,9 +122,13 @@ private:
 	QGridLayout* m_grid = nullptr;
 	QTableWidget* m_table = nullptr;
 	QPushButton* m_viewButton = nullptr;
+	QComboBox* m_zoomCombo = nullptr;
 	QLabel* m_summary = nullptr;
 	QTimer* m_timer = nullptr;
 	QMap<QString, SeatCard> m_cards;
+	QString m_activeScoreSeat;
+	int m_thumbWidth = 126;
+	int m_thumbHeight = 79;
 
 	//! Persisted custom order. The file is shared with the mobile bridge.
 	QStringList m_order;

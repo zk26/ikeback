@@ -21,6 +21,7 @@ Unicode true
 !include "LogicLib.nsh"
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
+!include "nsDialogs.nsh"
 
 !ifndef VERSION
   !define VERSION "5.2.1"
@@ -45,7 +46,7 @@ Unicode true
 
 ; Visible product name. Install paths, service names and registry keys keep the
 ; lowercase "ikeback" identifier so upgrades and the CLI stay compatible.
-!define APP_NAME "iKeback"
+!define APP_NAME "ikee课堂"
 !define PUBLISHER "zk26"
 !define WEB_SITE "https://github.com/zk26/ikeback"
 !define INSTALL_TYPE "SetShellVarContext all"
@@ -82,11 +83,67 @@ ShowUninstDetails show
 !define MUI_ICON "desktop\nsis\installer.ico"
 !define MUI_UNICON "desktop\nsis\uninstaller.ico"
 
+!if "${ROLE}" == "teacher"
+  !define MUI_WELCOMEPAGE_TITLE "欢迎使用 ikee课堂教师端"
+  !define MUI_WELCOMEPAGE_TEXT "使用引导：$\r$\n1. 安装教师端，并允许 Windows 服务正常运行。$\r$\n2. 打开 ikee课堂，点击“开始上课”，全班签到会自动开始。$\r$\n3. 在座位页可直接修改考勤、积分和等级；课程、考勤与原因可导出 Excel。$\r$\n4. 商城与竞拍会保留每名学生 80 分，仅使用超出部分。$\r$\n5. 远程装软件请选择绿色软件文件夹，程序会部署到 C:\IkebackApps 并重启两次。"
+!else
+  !define MUI_WELCOMEPAGE_TITLE "欢迎使用 ikee课堂学生端"
+  !define MUI_WELCOMEPAGE_TEXT "使用引导：$\r$\n1. 安装后保持学生端运行，等待教师端连接。$\r$\n2. 上课后在悬浮卡输入姓名并签到，即可查看成绩、商城和竞拍。$\r$\n3. 商城仅使用超过 80 分的积分，基础分会保留。$\r$\n4. 默认退出与卸载密码为 Admin@123，教师可在保护设置中修改。$\r$\n5. 保护开启时，断开教师连接也不会自动解锁；需教师解除保护或输入管理员密码。"
+!endif
+
+!if "${ROLE}" == "student"
+Var ExitPasswordEdit
+Var Dialog
+!endif
+
+!if "${ROLE}" == "student"
+Function un.ExitPasswordPagePre
+  SetRegView 64
+  ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
+  ${If} $0 != 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Function un.ExitPasswordPageShow
+  nsDialogs::Create 1018
+  Pop $Dialog
+  ${If} $Dialog == error
+    Abort
+  ${EndIf}
+  ${NSD_CreateLabel} 0 0 100% 30u "学生端已开启保护。请输入管理员密码后再卸载。"
+  Pop $0
+  ${NSD_CreateText} 0 38u 100% 14u ""
+  Pop $ExitPasswordEdit
+  ${NSD_Edit_SetPasswordChar} $ExitPasswordEdit 0x25
+FunctionEnd
+
+Function un.ExitPasswordPageLeave
+  ${NSD_GetText} $ExitPasswordEdit $R1
+  StrCpy $R2 "$PLUGINSDIR\ikeback-exit-password.utf16"
+  FileOpen $R3 $R2 w
+  FileWriteUTF16LE $R3 "$R1"
+  FileClose $R3
+  nsExec::ExecToStack '"$INSTDIR\ikeback-cli.exe" --verify-exit-password "$R2"'
+  Pop $0
+  Delete $R2
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "管理员密码不正确，已取消卸载。"
+    Abort
+  ${EndIf}
+FunctionEnd
+!endif
+
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
+!if "${ROLE}" == "student"
+  !define MUI_PAGE_CUSTOMFUNCTION_PRE un.ExitPasswordPagePre
+  !define MUI_PAGE_CUSTOMFUNCTION_SHOW un.ExitPasswordPageShow
+  !define MUI_PAGE_CUSTOMFUNCTION_LEAVE un.ExitPasswordPageLeave
+!endif
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "SimpChinese"
@@ -401,6 +458,26 @@ SectionEnd
 Section -Post
   ${INSTALL_TYPE}
   SetOutPath "$INSTDIR"
+!if "${ROLE}" == "student"
+  ReadRegStr $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash"
+  ${If} $0 == ""
+    WriteRegStr ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash" "e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7"
+  ${EndIf}
+  ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
+  ${If} $0 != 1
+    WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 1
+  ${EndIf}
+  ; Portable software is copied here by the interactive student worker.
+  ; The elevated installer grants the built-in Users group modify access so
+  ; deployment also works when students do not have administrator rights.
+  CreateDirectory "C:\IkebackApps"
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "C:\IkebackApps" /grant "*S-1-5-32-545:(OI)(CI)M"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONEXCLAMATION "无法设置 C:\IkebackApps 的写入权限，远程部署可能失败。请手动允许 Users 修改该目录。"
+  ${EndIf}
+!endif
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME} Configurator.lnk" \
@@ -416,16 +493,30 @@ Section -Post
 SectionEnd
 
 ; ------------------------------------------------------------------- Uninstall
-Section Uninstall
-  ${INSTALL_TYPE}
-  ; Student uninstall protection: the Master writes this HKLM flag.
-  ; Only a teacher-side "unlock" command can clear it (see ClassroomPlugin).
+Function un.onInit
+!if "${ROLE}" == "student"
   SetRegView 64
   ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
   ${If} $0 == 1
-    MessageBox MB_OK|MB_ICONSTOP "教师端已开启卸载保护，请联系教师端解除保护后再卸载。"
-    Abort
+    IfSilent 0 +2
+      Quit
   ${EndIf}
+!endif
+FunctionEnd
+
+Section Uninstall
+  ${INSTALL_TYPE}
+  ; The password page verifies interactive uninstalls. Silent uninstalls have
+  ; no place to ask for the password, so they must fail closed while protected.
+!if "${ROLE}" == "student"
+  SetRegView 64
+  ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
+  ${If} $0 == 1
+    IfSilent +2 0
+      MessageBox MB_OK|MB_ICONSTOP "受保护的学生端不能静默卸载，请运行卸载器并输入管理员密码。"
+      Abort
+  ${EndIf}
+!endif
 
   ; The removal itself runs with details suppressed (sc/taskkill would print
   ; harmless "not found" noise), but the pane must not stay blank: print the

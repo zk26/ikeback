@@ -66,6 +66,8 @@ Q_SIGNALS:
 private:
 	void update();
 
+	bool eventFilter( QObject* object, QEvent* event ) override;
+
 	QModelIndex interfaceIndex( ComputerControlInterface* controlInterface ) const;
 	QVariant uidRoleData(const ComputerControlInterface::Pointer& controlInterface) const;
 

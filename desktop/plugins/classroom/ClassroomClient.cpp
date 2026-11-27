@@ -23,24 +23,29 @@
 
 #include <QApplication>
 #include <QBoxLayout>
+#include <QImage>
 #include <QJsonArray>
 #include <QCloseEvent>
-#include <QContextMenuEvent>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QCursor>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QGuiApplication>
 #include <QLabel>
 #include <QLineEdit>
-#include <QMenu>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPixmap>
 #include <QProcess>
 #include <QPushButton>
 #include <QScreen>
 #include <QScrollBar>
+#include <QScrollArea>
+#include <QSpinBox>
 #include <QStandardPaths>
+#include <QTabWidget>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QVariantMap>
@@ -50,6 +55,8 @@
 #include "ClassroomClient.h"
 #include "ClassroomProtocol.h"
 #include "ClassroomSecrets.h"
+#include "ClassroomShop.h"
+#include "ClassroomTheme.h"
 #include "CryptoCore.h"
 #include "PlatformCoreFunctions.h"
 #include "PlatformInputDeviceFunctions.h"
@@ -60,9 +67,56 @@
 
 static void keepOnTop( QWidget* widget )
 {
-	widget->setWindowFlags( Qt::Tool | Qt::CustomizeWindowHint | Qt::FramelessWindowHint |
-							Qt::WindowStaysOnTopHint );
+	widget->setWindowFlags( Qt::Window | Qt::WindowTitleHint | Qt::WindowSystemMenuHint |
+							Qt::WindowCloseButtonHint | Qt::WindowStaysOnTopHint );
 	IkebackCore::platform().coreFunctions().raiseWindow( widget, true );
+}
+
+
+static QScreen* screenForWidget( QWidget* widget )
+{
+	auto* screen = QGuiApplication::screenAt( QCursor::pos() );
+	if( screen == nullptr && widget ) { screen = widget->screen(); }
+	return screen ? screen : QGuiApplication::primaryScreen();
+}
+
+
+static void centerOnScreen( QWidget* widget )
+{
+	if( widget == nullptr ) { return; }
+	widget->adjustSize();
+	auto* screen = screenForWidget( widget );
+	if( screen == nullptr ) { return; }
+	const auto area = screen->availableGeometry();
+	const auto frameSize = widget->frameGeometry().size();
+	const auto clientSize = widget->size();
+	const auto frameAdjust = frameSize - clientSize;
+	const auto maximumClientSize = QSize( qMax( 1, area.width() - frameAdjust.width() ),
+										 qMax( 1, area.height() - frameAdjust.height() ) );
+	widget->resize( clientSize.boundedTo( maximumClientSize ) );
+	const auto centeredFrameSize = widget->frameGeometry().size();
+	widget->move( area.center().x() - centeredFrameSize.width() / 2,
+				  area.center().y() - centeredFrameSize.height() / 2 );
+}
+
+
+static void showCentered( QWidget* widget )
+{
+	centerOnScreen( widget );
+	widget->show();
+	widget->raise();
+	IkebackCore::platform().coreFunctions().raiseWindow( widget, true );
+}
+
+
+static QPoint clampedOnScreen( QWidget* widget, QPoint position )
+{
+	auto* screen = screenForWidget( widget );
+	if( screen == nullptr ) { return position; }
+	const auto area = screen->availableGeometry();
+	const int right = qMax( area.left(), area.right() - widget->width() + 1 );
+	const int bottom = qMax( area.top(), area.bottom() - widget->height() + 1 );
+	return { qBound( area.left(), position.x(), right ), qBound( area.top(), position.y(), bottom ) };
 }
 
 
@@ -145,28 +199,13 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	setWindowTitle( Classroom::productName() );
 	setAttribute( Qt::WA_DeleteOnClose, false );
 	keepFloating( this );
-
-	const auto dark = IkebackCore::useDarkMode();
-	setStyleSheet( QStringLiteral(
-		"QWidget#classroomClient { background: %1; border: 1px solid %2; border-radius: 10px; }"
-		"QLabel { color: %3; }"
-		"QLineEdit { padding: 6px 8px; border: 1px solid %2; border-radius: 6px; background: %4; color: %3; }"
-		"QLineEdit:focus { border-color: %5; }"
-		"QPushButton { padding: 6px 10px; border-radius: 6px; border: 1px solid %2; "
-		"background: %5; color: #ffffff; font-weight: bold; }"
-		"QPushButton:hover { background: %6; }"
-		"QPushButton:disabled { background: %2; color: %3; }" ).
-		arg( dark ? QStringLiteral("#2b2b2b") : QStringLiteral("#f5f7f9"),
-			 dark ? QStringLiteral("#555555") : QStringLiteral("#9fc4d0"),
-			 dark ? QStringLiteral("#f0f0f0") : QStringLiteral("#202020"),
-			 dark ? QStringLiteral("#333333") : QStringLiteral("#ffffff"),
-			 QStringLiteral("#1976d2"), QStringLiteral("#1565c0") ) );
+	Classroom::Theme::apply( this );
 
 	m_identityLabel = new QLabel( this );
-	m_identityLabel->setStyleSheet( QStringLiteral("font-size: 15px; font-weight: bold;") );
+	m_identityLabel->setProperty( "role", QStringLiteral("title") );
 	m_statusLabel = new QLabel( this );
 	m_statusLabel->setWordWrap( true );
-	m_statusLabel->setStyleSheet( QStringLiteral("font-size: 10px;") );
+	m_statusLabel->setProperty( "role", QStringLiteral("status") );
 	m_lockLabel = new QLabel( this );
 	m_lockLabel->setAlignment( Qt::AlignRight | Qt::AlignVCenter );
 
@@ -183,9 +222,10 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	// (IKEBACK-UI.md: labels always visible).
 	auto* seatLabel = new QLabel( tr( "座位号" ), this );
 	auto* nameLabel = new QLabel( tr( "姓名" ), this );
-	const auto labelStyle = QStringLiteral("font-size: 9px; opacity: 0.8;");
-	seatLabel->setStyleSheet( labelStyle );
-	nameLabel->setStyleSheet( labelStyle );
+	m_seatLabel = seatLabel;
+	m_nameLabel = nameLabel;
+	seatLabel->setProperty( "role", QStringLiteral("hint") );
+	nameLabel->setProperty( "role", QStringLiteral("hint") );
 
 	// No key field on the card: the bridge key stays on the teacher machine
 	// and the teacher's phone. Students sign in with seat + name only.
@@ -205,19 +245,24 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	m_aiButton = new QPushButton( tr( "AI 助手" ), this );
 	m_aiButton->setEnabled( false );
 	m_scoreButton = new QPushButton( tr( "我的成绩" ), this );
+	m_shopButton = new QPushButton( tr( "班级商城" ), this );
 	m_callButton = new QPushButton( tr( "呼叫老师" ), this );
+	m_quitButton = new QPushButton( tr( "退出学生端" ), this );
+	m_quitButton->setProperty( "quiet", true );
 
-	// The card exposes exactly TWO action buttons: score query and AI. The
-	// sign-in and call-teacher controls stay available but are only shown while
-	// nobody is signed in (call-teacher also lives in the context menu).
-	auto* buttonLayout = new QHBoxLayout;
-	buttonLayout->addWidget( m_loginButton );
-	buttonLayout->addWidget( m_callButton );
-	buttonLayout->addWidget( m_scoreButton );
-	buttonLayout->addWidget( m_aiButton );
+	auto* buttonLayout = new QGridLayout;
+	buttonLayout->setHorizontalSpacing( 6 );
+	buttonLayout->setVerticalSpacing( 6 );
+	buttonLayout->addWidget( m_loginButton, 0, 0 );
+	buttonLayout->addWidget( m_callButton, 0, 1 );
+	buttonLayout->addWidget( m_scoreButton, 0, 2 );
+	buttonLayout->addWidget( m_shopButton, 1, 0 );
+	buttonLayout->addWidget( m_aiButton, 1, 1 );
+	buttonLayout->addWidget( m_quitButton, 1, 2 );
+	for( int column = 0; column < 3; ++column ) { buttonLayout->setColumnStretch( column, 1 ); }
 
-	auto* hint = new QLabel( tr( "右键菜单：呼叫老师 / 受保护退出" ), this );
-	hint->setStyleSheet( QStringLiteral("font-size: 9px; opacity: 0.7;") );
+	auto* hint = new QLabel( tr( "退出与卸载是否受保护，由教师端统一管理。" ), this );
+	hint->setProperty( "role", QStringLiteral("hint") );
 
 	auto* mainLayout = new QVBoxLayout( this );
 	mainLayout->setContentsMargins( 10, 8, 10, 8 );
@@ -228,7 +273,7 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 	mainLayout->addLayout( buttonLayout );
 	mainLayout->addWidget( hint );
 
-	setFixedWidth( 360 );
+	setFixedWidth( 380 );
 	adjustSize();
 	placeOnScreen();
 	updateVisibility();
@@ -251,6 +296,8 @@ ClassroomClientWidget::ClassroomClientWidget( QWidget* parent ) :
 			 this, &ClassroomClientWidget::aiPromptRequested );
 	connect( m_scoreButton, &QPushButton::clicked, this, [this]() { Q_EMIT scoreRequested(); } );
 	connect( m_callButton, &QPushButton::clicked, this, [this]() { Q_EMIT callTeacherRequested(); } );
+	connect( m_shopButton, &QPushButton::clicked, this, &ClassroomClientWidget::openShop );
+	connect( m_quitButton, &QPushButton::clicked, this, &ClassroomClientWidget::requestQuit );
 }
 
 
@@ -259,32 +306,34 @@ void ClassroomClientWidget::updateVisibility()
 	const auto signedIn = m_loggedIn;
 	m_seatEdit->setVisible( signedIn == false );
 	m_nameEdit->setVisible( signedIn == false );
+	m_seatLabel->setVisible( signedIn == false );
+	m_nameLabel->setVisible( signedIn == false );
 	m_loginButton->setVisible( signedIn == false && m_allowSelfLogin );
 	// 呼叫老师必须在签到前后都能点：老师端靠这条消息定位学生座位。
 	m_callButton->setVisible( true );
 	m_scoreButton->setVisible( true );
+	m_shopButton->setVisible( true );
 	m_aiButton->setVisible( true );
+	m_quitButton->setVisible( true );
 	adjustSize();
 }
 
 
 void ClassroomClientWidget::placeOnScreen()
 {
-	if( auto* screen = QGuiApplication::primaryScreen() )
+	auto* screen = screenForWidget( this );
+	if( screen == nullptr ) { return; }
+	const auto area = screen->availableGeometry();
+	QPoint position;
+	if( m_loggedIn )
 	{
-		const auto area = screen->availableGeometry();
-		if( m_loggedIn )
-		{
-			// After sign-in the card moves to the top-right corner so it stays
-			// visible without covering the student's work.
-			move( area.right() - width() - 16, area.top() + 16 );
-		}
-		else
-		{
-			// Before sign-in the card is centered so every student sees it.
-			move( area.center().x() - width() / 2, area.center().y() - height() / 2 );
-		}
+		position = { area.right() - width() - 16, area.top() + 16 };
 	}
+	else
+	{
+		position = { area.center().x() - width() / 2, area.center().y() - height() / 2 };
+	}
+	move( clampedOnScreen( this, position ) );
 }
 
 
@@ -293,9 +342,9 @@ void ClassroomClientWidget::setSettings( const QJsonObject& settings )
 	m_allowSelfLogin = settings.value( Classroom::SettingKey::allowSelfLogin() ).toBool( true );
 	m_aiEnabled = settings.value( Classroom::SettingKey::aiEnabled() ).toBool( true );
 	m_exitProtection = settings.value( Classroom::SettingKey::exitProtection() ).toBool( true );
-	m_exitRequiresAdmin = settings.value( Classroom::SettingKey::exitRequiresAdmin() ).toBool( true );
 	m_exitAdminUsername = settings.value( Classroom::SettingKey::exitAdminUsername() ).toString();
 	m_adminKeyHash = settings.value( Classroom::SettingKey::adminKeyHash() ).toString();
+	if( m_adminKeyHash.isEmpty() ) { m_adminKeyHash = ClassroomSecrets::defaultAdminKeyHash(); }
 
 	// The API key, endpoint, model and system prompt stay on the teacher
 	// machine. The student worker only submits a prompt through the bridge of
@@ -350,6 +399,11 @@ void ClassroomClientWidget::setIdentity( const QString& className, const QString
 	updateVisibility();
 	updateStatus();
 	placeOnScreen();
+	if( m_shopView )
+	{
+		m_shopView->setIdentity( seat, student );
+		m_shopView->setSignedIn( true );
+	}
 	Q_EMIT identityChanged( m_seat, m_student, true );
 }
 
@@ -365,6 +419,7 @@ void ClassroomClientWidget::clearIdentity()
 	updateVisibility();
 	updateStatus();
 	placeOnScreen();
+	if( m_shopView ) { m_shopView->setSignedIn( false ); }
 	Q_EMIT identityChanged( {}, {}, false );
 }
 
@@ -403,13 +458,12 @@ void ClassroomClientWidget::updateStatus()
 	m_statusLabel->setText( tr( "班级：%1  |  课堂：%2" ).
 							arg( m_className.isEmpty() ? tr( "未选择" ) : m_className,
 								 m_keyConfigured ? tr( "已开始" ) : tr( "未开始" ) ) );
-	m_lockLabel->setText( m_locked ? tr( "已锁定" ) : tr( "未锁定" ) );
+	m_lockLabel->setText( m_exitProtection ? tr( "已保护" ) : tr( "未保护" ) );
 
-	// Prominent line: shield (client protection) + signed-in name + seat number.
-	const auto shield = QString::fromUtf8( "\xF0\x9F\x9B\xA1" );
+	const auto protection = m_exitProtection ? tr( "已保护" ) : tr( "未保护" );
 	m_identityLabel->setText( m_loggedIn ?
-		QStringLiteral("%1 %2  |  %3 %4").arg( shield ).arg( m_student ).arg( tr( "座位" ) ).arg( m_seat ) :
-		QStringLiteral("%1 %2").arg( shield ).arg( tr( "未签到" ) ) );
+		QStringLiteral("%1 · %2 · 座位 %3").arg( protection ).arg( m_student ).arg( m_seat ) :
+		QStringLiteral("%1 · 未签到").arg( protection ) );
 }
 
 
@@ -500,6 +554,69 @@ void ClassroomClientWidget::requestScore()
 }
 
 
+ClassroomShopView* ClassroomClientWidget::ensureShopView()
+{
+	if( m_shopView == nullptr )
+	{
+		m_shopView = new ClassroomShopView( this );
+		connect( m_shopView, &ClassroomShopView::refreshRequested,
+				 this, &ClassroomClientWidget::shopRequested );
+		connect( m_shopView, &ClassroomShopView::redeemRequested,
+				 this, &ClassroomClientWidget::shopRedeemRequested );
+		connect( m_shopView, &ClassroomShopView::bidRequested,
+				 this, &ClassroomClientWidget::shopBidRequested );
+		connect( m_shopView, &ClassroomShopView::imageRequested,
+				 this, &ClassroomClientWidget::shopImageRequested );
+		connect( m_shopView, &ClassroomShopView::noticeRaised, this, [this]( const QString& text ) {
+			QMessageBox::information( this, m_shopView->windowTitle(), text );
+		} );
+	}
+	m_shopView->setIdentity( m_seat, m_student );
+	m_shopView->setSignedIn( m_loggedIn );
+	return m_shopView;
+}
+
+
+void ClassroomClientWidget::openShop()
+{
+	auto* view = ensureShopView();
+	showCentered( view );
+	Q_EMIT shopRequested();
+}
+
+
+void ClassroomClientWidget::applyShopState( const QJsonObject& catalog, int balance )
+{
+	if( m_loggedIn == false ) { return; }
+	ensureShopView()->applyCatalog( catalog, balance );
+}
+
+
+void ClassroomClientWidget::applyShopImage( const QString& productId, const QString& imageId,
+											const QByteArray& image )
+{
+	if( m_shopView ) { m_shopView->applyImage( productId, imageId, image ); }
+}
+
+
+void ClassroomClientWidget::shopReply( bool ok, const QString& message, int balance,
+									   const QJsonObject& catalog )
+{
+	if( m_shopView )
+	{
+		m_shopView->applyReply( ok, message, balance, catalog );
+		if( m_shopView->isVisible() == false )
+		{
+			QMessageBox::information( this, m_shopView->windowTitle(), message );
+		}
+	}
+	else
+	{
+		QMessageBox::information( this, windowTitle(), message );
+	}
+}
+
+
 void ClassroomClientWidget::showAiChat()
 {
 	if( m_aiEnabled == false )
@@ -515,9 +632,7 @@ void ClassroomClientWidget::showAiChat()
 				 this, &ClassroomClientWidget::eventOccurred );
 	}
 	m_aiChat->setIdentityLabel( m_loggedIn ? QStringLiteral("%1 (%2)").arg( m_student, m_seat ) : tr( "未签到" ) );
-	m_aiChat->show();
-	m_aiChat->raise();
-	IkebackCore::platform().coreFunctions().raiseWindow( m_aiChat, true );
+	showCentered( m_aiChat );
 }
 
 
@@ -557,8 +672,8 @@ void ClassroomClientWidget::requestQuit()
 	{
 		keyEdit = new QLineEdit( &dialog );
 		keyEdit->setEchoMode( QLineEdit::Password );
-		keyEdit->setPlaceholderText( tr( "超级管理员密钥" ) );
-		form->addRow( tr( "超级管理员密钥：" ), keyEdit );
+		keyEdit->setPlaceholderText( tr( "管理员密码" ) );
+		form->addRow( tr( "管理员密码：" ), keyEdit );
 	}
 	else
 	{
@@ -574,6 +689,8 @@ void ClassroomClientWidget::requestQuit()
 	form->addRow( buttons );
 	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
 	connect( buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject );
+	Classroom::Theme::apply( &dialog );
+	centerOnScreen( &dialog );
 
 	if( dialog.exec() != QDialog::Accepted ) { return; }
 
@@ -584,10 +701,9 @@ void ClassroomClientWidget::requestQuit()
 	}
 	else
 	{
-		// Fallback: Windows administrator credentials. exitRequiresAdmin is
-		// kept in the configuration for backwards compatibility but no longer
-		// weakens this.
-		Q_UNUSED( m_exitRequiresAdmin )
+		// Fallback: Windows administrator credentials. The configured admin
+		// account name is honoured when it is set; the password is always
+		// verified against Windows itself.
 		const auto expectedUser = m_exitAdminUsername.trimmed();
 		const auto userMatches = expectedUser.isEmpty() ||
 								 username->text().trimmed().compare( expectedUser, Qt::CaseInsensitive ) == 0;
@@ -607,7 +723,7 @@ void ClassroomClientWidget::requestQuit()
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::quitAttempt(), tr( "rejected client exit" ), {} );
 		QMessageBox::warning( this, windowTitle(),
-							  useAdminKey ? tr( "超级管理员密钥不正确，本次尝试已记录。" )
+							  useAdminKey ? tr( "管理员密码不正确，本次尝试已记录。" )
 										  : tr( "管理员凭据无效，本次尝试已记录。" ) );
 	}
 }
@@ -631,6 +747,7 @@ void ClassroomClientWidget::reactivate()
 {
 	m_hideAllowed = false;
 	if( m_guardTimer && m_guardTimer->isActive() == false ) { m_guardTimer->start(); }
+	placeOnScreen();
 	show();
 	raise();
 }
@@ -647,25 +764,12 @@ void ClassroomClientWidget::closeEvent( QCloseEvent* event )
 		hide();
 		return;
 	}
-	// 卡片右上角的关闭键只拦截，不再弹出管理员对话框；反复点 X 曾导致
-	// 「受保护退出」一直堆叠弹出。受保护退出仅从右键菜单显式触发。
+	// 受保护时关闭请求只拦截，退出必须使用卡片上的“退出学生端”按钮。
 	event->ignore();
 	show();
 	raise();
-	m_statusLabel->setText( tr( "卡片不能关闭。如需退出，请右键选择「退出客户端（受保护）」。" ) );
+	m_statusLabel->setText( tr( "卡片受保护，不能直接关闭。请使用“退出学生端”并输入管理员密码。" ) );
 	QTimer::singleShot( 2500, this, &ClassroomClientWidget::updateStatus );
-}
-
-
-void ClassroomClientWidget::contextMenuEvent( QContextMenuEvent* event )
-{
-	QMenu menu( this );
-	menu.addAction( tr( "打开 AI 助手" ), this, &ClassroomClientWidget::showAiChat );
-	menu.addAction( tr( "查看我的成绩" ), this, [this]() { Q_EMIT scoreRequested(); } );
-	menu.addAction( tr( "呼叫老师" ), this, [this]() { Q_EMIT callTeacherRequested(); } );
-	menu.addSeparator();
-	menu.addAction( tr( "退出客户端（受保护）..." ), this, &ClassroomClientWidget::requestQuit );
-	menu.exec( event->globalPos() );
 }
 
 
@@ -683,7 +787,7 @@ void ClassroomClientWidget::mouseMoveEvent( QMouseEvent* event )
 {
 	if( event->buttons() & Qt::LeftButton )
 	{
-		move( mouseGlobalPoint( event ) - m_dragPosition );
+		move( clampedOnScreen( this, mouseGlobalPoint( event ) - m_dragPosition ) );
 	}
 	QWidget::mouseMoveEvent( event );
 }
@@ -696,8 +800,7 @@ void ClassroomClientWidget::setScoreHtml( const QString& html )
 		m_scoreView = new ClassroomScoreView( this );
 	}
 	m_scoreView->setHtml( html );
-	m_scoreView->show();
-	m_scoreView->raise();
+	showCentered( m_scoreView );
 }
 
 
@@ -728,8 +831,7 @@ void ClassroomClientWidget::showCheckIn()
 				 this, &ClassroomClientWidget::checkInSubmitted );
 	}
 	m_checkIn->prepare( m_className, m_seat );
-	m_checkIn->show();
-	m_checkIn->raise();
+	showCentered( m_checkIn );
 }
 
 
@@ -737,13 +839,15 @@ ClassroomCheckInDialog::ClassroomCheckInDialog( QWidget* parent ) :
 	QWidget( parent )
 {
 	setWindowTitle( tr( "课堂签到" ) );
-	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint );
+	setObjectName( QStringLiteral("classroomCheckIn") );
+	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint | Qt::WindowSystemMenuHint |
+					Qt::WindowCloseButtonHint );
 	resize( 460, 210 );
-	setStyleSheet( QStringLiteral("background:#ffffff;") );
+	Classroom::Theme::apply( this );
 
 	m_info = new QLabel( this );
 	m_info->setWordWrap( true );
-	m_info->setStyleSheet( QStringLiteral("color:#1f2d3d; font-size:15px; font-weight:bold;") );
+	m_info->setProperty( "role", QStringLiteral("heading") );
 
 	m_nameEdit = new QLineEdit( this );
 	connect( m_nameEdit, &QLineEdit::returnPressed, this, &ClassroomCheckInDialog::submit );
@@ -787,15 +891,15 @@ ClassroomScoreView::ClassroomScoreView( QWidget* parent ) :
 	QWidget( parent )
 {
 	setWindowTitle( tr( "我的成绩" ) );
-	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint );
+	setObjectName( QStringLiteral("classroomScore") );
+	setWindowFlags( Qt::Tool | Qt::WindowStaysOnTopHint | Qt::WindowSystemMenuHint |
+					Qt::WindowCloseButtonHint );
 	resize( 620, 620 );
+	Classroom::Theme::apply( this );
 	m_view = new QTextBrowser( this );
 	m_view->setOpenExternalLinks( false );
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_view );
-	auto* closeButton = new QPushButton( tr( "关闭" ), this );
-	layout->addWidget( closeButton );
-	connect( closeButton, &QPushButton::clicked, this, &QWidget::hide );
 }
 
 
@@ -810,6 +914,7 @@ ClassroomSilencePage::ClassroomSilencePage( QWidget* parent ) :
 {
 	// 覆盖所有显示器，且不再透传输入。
 	setWindowFlags( Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint );
+	setObjectName( QStringLiteral("classroomSilence") );
 	QRect allScreens;
 	for( auto* screen : QGuiApplication::screens() )
 	{
@@ -818,12 +923,12 @@ ClassroomSilencePage::ClassroomSilencePage( QWidget* parent ) :
 	if( allScreens.isEmpty() == false ) { setGeometry( allScreens ); }
 	setWindowState( Qt::WindowFullScreen );
 	setFocusPolicy( Qt::StrongFocus );
-	setStyleSheet( QStringLiteral("background:#0d1b2a;") );
+	Classroom::Theme::apply( this );
 	m_label = new QLabel( this );
 	m_label->setAlignment( Qt::AlignCenter );
 	m_label->setWordWrap( true );
-	m_label->setText( QStringLiteral("肃静") );
-	m_label->setStyleSheet( QStringLiteral("color:#f0f0f0; font-size:96px; font-weight:bold; letter-spacing:12px;") );
+	m_label->setText( QStringLiteral("Silence") );
+	m_label->setProperty( "role", QStringLiteral("title") );
 	auto* layout = new QVBoxLayout( this );
 	layout->addWidget( m_label );
 }
@@ -838,7 +943,7 @@ ClassroomSilencePage::~ClassroomSilencePage()
 void ClassroomSilencePage::setText( const QString& text )
 {
 	const auto value = chineseSilenceText( text );
-	m_label->setText( value.isEmpty() ? QStringLiteral("肃静") : value );
+	m_label->setText( value.isEmpty() ? tr( "Silence" ) : value );
 }
 
 
@@ -870,32 +975,11 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 	setAttribute( Qt::WA_DeleteOnClose, false );
 	keepOnTop( this );
 	setFixedSize( 420, 460 );
-
-	const auto dark = IkebackCore::useDarkMode();
-	setStyleSheet( QStringLiteral(
-		"QWidget#classroomAi { background: %1; border: 1px solid %2; border-radius: 6px; }"
-		"QLabel, QTextBrowser { color: %3; }" ).
-		arg( dark ? QStringLiteral("#2b2b2b") : QStringLiteral("#f5f7f9"),
-			 dark ? QStringLiteral("#555555") : QStringLiteral("#9fc4d0"),
-			 dark ? QStringLiteral("#f0f0f0") : QStringLiteral("#202020") ) );
 	setObjectName( QStringLiteral("classroomAi") );
+	Classroom::Theme::apply( this );
 
 	auto* title = new QLabel( tr( "AI 助手（由老师配置）" ), this );
-	title->setStyleSheet( QStringLiteral("font-weight: bold; padding: 4px;") );
-
-	// The window is frameless, so it needs an explicit close button.
-	auto* closeButton = new QPushButton( QStringLiteral("✕"), this );
-	// 32 px gives the frameless window's only close affordance a usable
-	// click target (24 px was easy to miss).
-	closeButton->setFixedSize( 32, 32 );
-	closeButton->setStyleSheet( QStringLiteral("QPushButton { border: none; font-size: 14px; }"
-											   "QPushButton:hover { background: #e81123; color: white; }") );
-	closeButton->setToolTip( tr( "关闭" ) );
-	connect( closeButton, &QPushButton::clicked, this, &QWidget::hide );
-
-	auto* titleRow = new QHBoxLayout;
-	titleRow->addWidget( title, 1 );
-	titleRow->addWidget( closeButton );
+	title->setProperty( "role", QStringLiteral("title") );
 
 	m_view = new QTextBrowser( this );
 	m_view->setReadOnly( true );
@@ -910,7 +994,7 @@ ClassroomAiChatWidget::ClassroomAiChatWidget( ClassroomAiClient* client, QWidget
 
 	auto* mainLayout = new QVBoxLayout( this );
 	mainLayout->setContentsMargins( 8, 8, 8, 8 );
-	mainLayout->addLayout( titleRow );
+	mainLayout->addWidget( title );
 	mainLayout->addWidget( m_view, 1 );
 	mainLayout->addLayout( inputLayout );
 
@@ -985,7 +1069,559 @@ void ClassroomAiChatWidget::mouseMoveEvent( QMouseEvent* event )
 {
 	if( event->buttons() & Qt::LeftButton )
 	{
-		move( mouseGlobalPoint( event ) - m_dragPosition );
+		move( clampedOnScreen( this, mouseGlobalPoint( event ) - m_dragPosition ) );
+	}
+	QWidget::mouseMoveEvent( event );
+}
+
+
+namespace {
+
+//! Removes and deletes every widget of a dynamic list layout.
+static void clearWidgetList( QLayout* layout )
+{
+	while( layout->count() > 0 )
+	{
+		auto* item = layout->takeAt( 0 );
+		if( item->widget() ) { item->widget()->hide(); item->widget()->deleteLater(); }
+		delete item;
+	}
+}
+
+} // namespace
+
+
+ClassroomShopView::ClassroomShopView( QWidget* parent ) :
+	QWidget( parent )
+{
+	setWindowTitle( Classroom::productName() + QLatin1Char(' ') + tr( "班级商城" ) );
+	setAttribute( Qt::WA_DeleteOnClose, false );
+	keepOnTop( this );
+	setFixedSize( 620, 660 );
+
+	setObjectName( QStringLiteral("classroomShop") );
+	Classroom::Theme::apply( this );
+
+	auto* title = new QLabel( tr( "班级商城（价高者得 · 积分兑换）" ), this );
+	title->setProperty( "role", QStringLiteral("title") );
+
+	m_balanceLabel = new QLabel( tr( "积分余额：..." ), this );
+	m_balanceLabel->setProperty( "role", QStringLiteral("balance") );
+	m_statusLabel = new QLabel( this );
+	m_statusLabel->setWordWrap( true );
+	m_statusLabel->setProperty( "role", QStringLiteral("status") );
+	auto* refreshButton = new QPushButton( tr( "刷新" ), this );
+	connect( refreshButton, &QPushButton::clicked, this, [this]() {
+		m_actionTimer->stop();
+		m_requestedImages.clear();
+		m_failedImages.clear();
+		Q_EMIT refreshRequested();
+	} );
+
+	m_actionTimer = new QTimer( this );
+	m_actionTimer->setSingleShot( true );
+	connect( m_actionTimer, &QTimer::timeout, this, [this]() {
+		m_statusLabel->setText( tr( "请求超时，请先刷新确认状态，再决定是否重试。" ) );
+		m_statusLabel->setProperty( "state", QStringLiteral("error") );
+	} );
+
+	auto* statusRow = new QHBoxLayout;
+	statusRow->addWidget( m_balanceLabel );
+	statusRow->addWidget( m_statusLabel, 1 );
+	statusRow->addWidget( refreshButton );
+
+	m_tabs = new QTabWidget( this );
+
+	auto* productsScroller = new QScrollArea( this );
+	productsScroller->setWidgetResizable( true );
+	productsScroller->setFrameShape( QFrame::NoFrame );
+	m_productsArea = new QWidget( productsScroller );
+	auto* productsLayout = new QVBoxLayout( m_productsArea );
+	productsLayout->setContentsMargins( 6, 6, 6, 6 );
+	productsLayout->setSpacing( 8 );
+	productsScroller->setWidget( m_productsArea );
+
+	auto* auctionsScroller = new QScrollArea( this );
+	auctionsScroller->setWidgetResizable( true );
+	auctionsScroller->setFrameShape( QFrame::NoFrame );
+	m_auctionsArea = new QWidget( auctionsScroller );
+	auto* auctionsLayout = new QVBoxLayout( m_auctionsArea );
+	auctionsLayout->setContentsMargins( 6, 6, 6, 6 );
+	auctionsLayout->setSpacing( 8 );
+	auctionsScroller->setWidget( m_auctionsArea );
+
+	m_tabs->addTab( productsScroller, tr( "商品" ) );
+	m_tabs->addTab( auctionsScroller, tr( "竞拍" ) );
+
+	auto* mainLayout = new QVBoxLayout( this );
+	mainLayout->setContentsMargins( 8, 8, 8, 8 );
+	mainLayout->addWidget( title );
+	mainLayout->addLayout( statusRow );
+	mainLayout->addWidget( m_tabs, 1 );
+
+	rebuild();
+}
+
+
+void ClassroomShopView::applyCatalog( const QJsonObject& catalog, int balance )
+{
+	// Detect what happened to the auctions the student took part in, so a
+	// student who never opened the window still learns about it through the
+	// card notice.
+	const auto auctions = catalog.value( QStringLiteral("auctions") ).toArray();
+	for( const auto& value : auctions )
+	{
+		const auto auction = value.toObject();
+		const auto id = auction.value( QStringLiteral("id") ).toString();
+		const auto open = auction.value( QStringLiteral("open") ).toBool( true );
+		const auto leader = auction.value( QStringLiteral("bidderSeat") ).toString();
+		const auto previous = m_auctionStates.value( id );
+		const auto name = auction.value( QStringLiteral("name") ).toString();
+		if( previous.first && open == false )
+		{
+			// 成交/流拍：只有实际拍到的人会收到提示。
+			if( m_signedIn && leader == m_seat && leader.isEmpty() == false )
+			{
+				Q_EMIT noticeRaised( tr( "你拍得了「%1」，请等待老师发货！" ).arg( name ) );
+			}
+		}
+		else if( previous.first && open && previous.second.isEmpty() == false &&
+				 previous.second == m_seat && leader != m_seat )
+		{
+			Q_EMIT noticeRaised( tr( "「%1」被 %2 出价 %3 分超越了，去看看吗？" )
+									 .arg( name, auction.value( QStringLiteral("bidderStudent") ).toString() )
+									 .arg( auction.value( QStringLiteral("currentBid") ).toInt() ) );
+		}
+		m_auctionStates.insert( id, { open, leader } );
+	}
+	while( m_auctionStates.size() > 64 ) { m_auctionStates.erase( m_auctionStates.begin() ); }
+
+	m_catalog = catalog;
+	if( balance >= 0 )
+	{
+		m_balance = balance;
+		if( m_actionPending )
+		{
+			m_actionTimer->stop();
+			m_actionPending = false;
+		}
+	}
+	else if( catalog.isEmpty() ) { m_balance = -1; }
+	QStringList productIds;
+	const auto products = catalog.value( QStringLiteral("products") ).toArray();
+	for( const auto& value : products ) { productIds.append( value.toObject().value( QStringLiteral("id") ).toString() ); }
+	for( auto it = m_requestedImages.begin(); it != m_requestedImages.end(); )
+	{
+		if( productIds.contains( it.key() ) == false ) { it = m_requestedImages.erase( it ); }
+		else { ++it; }
+	}
+	for( auto it = m_failedImages.begin(); it != m_failedImages.end(); )
+	{
+		if( productIds.contains( it.key() ) == false ) { it = m_failedImages.erase( it ); }
+		else { ++it; }
+	}
+	for( auto it = m_images.begin(); it != m_images.end(); )
+	{
+		if( productIds.contains( it.key() ) == false ) { it = m_images.erase( it ); }
+		else { ++it; }
+	}
+	rebuild();
+	requestMissingImages();
+}
+
+
+void ClassroomShopView::applyReply( bool ok, const QString& message, int balance,
+									const QJsonObject& catalog )
+{
+	m_actionTimer->stop();
+	m_actionPending = false;
+	m_balance = balance;
+	m_balanceLabel->setText( m_signedIn && m_balance >= 0 ?
+		tr( "积分余额：%1 · 可用：%2（保留 %3 分）" ).
+			arg( m_balance ).arg( ClassroomShopBook::spendableScore( m_balance ) ).
+			arg( ClassroomShopBook::ProtectedScore )
+															  : tr( "请先签到后再使用商场" ) );
+	m_statusLabel->setText( message );
+	m_statusLabel->setProperty( "state", ok ? QStringLiteral("success") : QStringLiteral("error") );
+	if( catalog.isEmpty() == false ) { applyCatalog( catalog, m_balance ); }
+	else { rebuild(); }
+}
+
+
+void ClassroomShopView::setIdentity( const QString& seat, const QString& student )
+{
+	if( seat != m_seat || student != m_student )
+	{
+		if( m_actionTimer ) { m_actionTimer->stop(); }
+		m_actionPending = false;
+		m_auctionStates.clear();
+		m_images.clear();
+		m_requestedImages.clear();
+		m_failedImages.clear();
+		m_catalog = QJsonObject{};
+		m_balance = -1;
+	}
+	m_seat = seat;
+	m_student = student;
+}
+
+
+void ClassroomShopView::setSignedIn( bool signedIn )
+{
+	if( signedIn != m_signedIn && signedIn == false )
+	{
+		if( m_actionTimer ) { m_actionTimer->stop(); }
+		m_actionPending = false;
+		m_balance = -1;
+		m_auctionStates.clear();
+		m_images.clear();
+		m_requestedImages.clear();
+		m_failedImages.clear();
+		m_catalog = QJsonObject{};
+	}
+	m_signedIn = signedIn;
+	rebuild();
+}
+
+
+QImage ClassroomShopView::decodeImage( const QByteArray& image )
+{
+	if( image.isEmpty() ) { return {}; }
+	return QImage::fromData( image );
+}
+
+
+void ClassroomShopView::applyImage( const QString& productId, const QString& imageId,
+									const QByteArray& image )
+{
+	const auto products = m_catalog.value( QStringLiteral("products") ).toArray();
+	for( const auto& value : products )
+	{
+		const auto product = value.toObject();
+		if( product.value( QStringLiteral("id") ).toString() != productId ) { continue; }
+		if( product.value( QStringLiteral("imageId") ).toString() != imageId ||
+			product.value( QStringLiteral("hasImage") ).toBool() == false )
+		{
+			m_requestedImages.remove( productId );
+			requestMissingImages();
+			return;
+		}
+		const auto decoded = decodeImage( image );
+		m_images.insert( productId, { imageId, decoded } );
+		m_requestedImages.remove( productId );
+		if( decoded.isNull() )
+		{
+			m_failedImages.insert( productId, imageId );
+			m_statusLabel->setText( tr( "商品图片加载失败，可点击刷新重试。" ) );
+			requestMissingImages();
+			return;
+		}
+		m_failedImages.remove( productId );
+		rebuild();
+		requestMissingImages();
+		return;
+	}
+	m_requestedImages.remove( productId );
+}
+
+
+void ClassroomShopView::requestMissingImages()
+{
+	if( isVisible() == false || m_signedIn == false ||
+		static_cast<int>( m_requestedImages.size() ) >= 6 )
+	{
+		return;
+	}
+	const auto products = m_catalog.value( QStringLiteral("products") ).toArray();
+	for( const auto& value : products )
+	{
+		if( static_cast<int>( m_requestedImages.size() ) >= 6 ) { break; }
+		const auto product = value.toObject();
+		if( product.value( QStringLiteral("hasImage") ).toBool() == false ) { continue; }
+		const auto productId = product.value( QStringLiteral("id") ).toString();
+		const auto imageId = product.value( QStringLiteral("imageId") ).toString();
+		const auto cached = m_images.value( productId );
+		if( cached.first == imageId && cached.second.isNull() == false ) { continue; }
+		if( m_failedImages.value( productId ) == imageId ) { continue; }
+		if( m_requestedImages.value( productId ) == imageId ) { continue; }
+		m_requestedImages.insert( productId, imageId );
+		Q_EMIT imageRequested( productId, imageId );
+	}
+}
+
+
+void ClassroomShopView::showEvent( QShowEvent* event )
+{
+	QWidget::showEvent( event );
+	centerOnScreen( this );
+	requestMissingImages();
+}
+
+
+QWidget* ClassroomShopView::buildProductCard( const QJsonObject& product )
+{
+	const auto name = product.value( QStringLiteral("name") ).toString();
+	const auto description = product.value( QStringLiteral("description") ).toString();
+	const auto price = product.value( QStringLiteral("price") ).toInt();
+	const auto stock = product.value( QStringLiteral("stock") ).toInt();
+	const auto open = m_catalog.value( QStringLiteral("open") ).toBool( true );
+	const auto productId = product.value( QStringLiteral("id") ).toString();
+	const auto imageId = product.value( QStringLiteral("imageId") ).toString();
+
+	auto* card = new QWidget;
+	card->setProperty( "shopCard", true );
+	auto* row = new QHBoxLayout( card );
+	row->setContentsMargins( 8, 8, 8, 8 );
+
+	const auto cached = m_images.value( productId );
+	const auto image = cached.first == imageId ? cached.second : QImage{};
+	if( image.isNull() == false )
+	{
+		auto* imageLabel = new QLabel( card );
+		imageLabel->setPixmap( QPixmap::fromImage( image.scaled( 96, 96, Qt::KeepAspectRatio, Qt::SmoothTransformation ) ) );
+		imageLabel->setFixedSize( 96, 96 );
+		imageLabel->setAlignment( Qt::AlignCenter );
+		row->addWidget( imageLabel );
+	}
+	else if( product.value( QStringLiteral("hasImage") ).toBool() )
+	{
+		auto* imageLabel = new QLabel( card );
+		imageLabel->setFixedSize( 96, 96 );
+		imageLabel->setAlignment( Qt::AlignCenter );
+		imageLabel->setText( tr( "图片加载中…" ) );
+		row->addWidget( imageLabel );
+	}
+
+	auto* column = new QVBoxLayout;
+	auto* nameLabel = new QLabel( name, card );
+	nameLabel->setProperty( "role", QStringLiteral("heading") );
+	nameLabel->setWordWrap( true );
+	column->addWidget( nameLabel );
+	if( description.isEmpty() == false )
+	{
+		auto* descriptionLabel = new QLabel( description, card );
+		descriptionLabel->setWordWrap( true );
+		descriptionLabel->setProperty( "role", QStringLiteral("hint") );
+		column->addWidget( descriptionLabel );
+	}
+	column->addWidget( new QLabel( stock > 0 ? tr( "价格 %1 分 · 库存 %2" ).arg( price ).arg( stock )
+											 : tr( "价格 %1 分 · 已兑完" ).arg( price ), card ) );
+
+	auto* redeemButton = new QPushButton( tr( "兑换" ), card );
+	redeemButton->setEnabled( m_actionPending == false && m_signedIn && m_balance >= 0 && open && stock > 0 );
+	if( m_signedIn == false ) { redeemButton->setToolTip( tr( "请先签到" ) ); }
+	else if( open == false ) { redeemButton->setToolTip( tr( "老师暂时关闭了商场" ) ); }
+	else if( stock <= 0 ) { redeemButton->setToolTip( tr( "已兑完" ) ); }
+	else if( ClassroomShopBook::spendableScore( m_balance ) < price )
+	{
+		redeemButton->setToolTip( tr( "可用积分不足（需保留 %1 分）" ).arg( ClassroomShopBook::ProtectedScore ) );
+	}
+	connect( redeemButton, &QPushButton::clicked, this, [this, productId, name, price]() {
+		// 确认框防误触，也挡住双击造成的重复兑换。
+		if( QMessageBox::question( this, windowTitle(),
+								   tr( "花费 %1 积分兑换「%2」？" ).arg( price ).arg( name ),
+								   QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes ) != QMessageBox::Yes )
+		{
+			return;
+		}
+		m_statusLabel->setText( tr( "已发送兑换请求…" ) );
+		m_actionPending = true;
+		m_actionTimer->start( 15000 );
+		rebuild();
+		Q_EMIT redeemRequested( productId );
+	} );
+
+	auto* bottomRow = new QHBoxLayout;
+	bottomRow->addWidget( redeemButton );
+	bottomRow->addStretch( 1 );
+	column->addLayout( bottomRow );
+
+	row->addLayout( column, 1 );
+	return card;
+}
+
+
+QWidget* ClassroomShopView::buildAuctionCard( const QJsonObject& auction )
+{
+	const auto name = auction.value( QStringLiteral("name") ).toString();
+	const auto open = auction.value( QStringLiteral("open") ).toBool( false );
+	const auto startPrice = auction.value( QStringLiteral("startPrice") ).toInt();
+	const auto currentBid = auction.value( QStringLiteral("currentBid") ).toInt();
+	const auto minNextBid = auction.value( QStringLiteral("minNextBid") ).toInt( startPrice );
+	const auto bidder = auction.value( QStringLiteral("bidderStudent") ).toString();
+	const auto bidderSeat = auction.value( QStringLiteral("bidderSeat") ).toString();
+
+	auto* card = new QWidget;
+	card->setProperty( "auctionCard", true );
+	auto* column = new QVBoxLayout( card );
+	column->setContentsMargins( 8, 8, 8, 8 );
+
+	auto* nameLabel = new QLabel( tr( "拍品：%1" ).arg( name ), card );
+	nameLabel->setProperty( "role", QStringLiteral("heading") );
+	nameLabel->setWordWrap( true );
+	column->addWidget( nameLabel );
+
+	if( open )
+	{
+		QString stateText;
+		if( currentBid > 0 )
+		{
+			stateText = tr( "当前出价 %1 分 · 领先：%2（座位 %3）" ).arg( currentBid ).arg( bidder, bidderSeat );
+		}
+		else
+		{
+			stateText = tr( "起拍价 %1 分 · 暂无出价 · 价高者得" ).arg( startPrice );
+		}
+		column->addWidget( new QLabel( stateText, card ) );
+
+		// 出价不扣分，成交时才扣；保留基础分，只能使用超出 80 分的部分。
+		auto* bidRow = new QHBoxLayout;
+		auto* bidSpin = new QSpinBox( card );
+		const auto available = ClassroomShopBook::spendableScore( m_balance );
+		const auto maximum = m_balance >= 0 ? qMin( available, static_cast<int>( ClassroomShopBook::MaxBid ) )
+											: static_cast<int>( ClassroomShopBook::MaxBid );
+		bidSpin->setRange( minNextBid, qMax( minNextBid, maximum ) );
+		bidSpin->setValue( minNextBid );
+		bidSpin->setToolTip( tr( "至少 %1 分" ).arg( minNextBid ) );
+		auto* bidButton = new QPushButton( tr( "出价" ), card );
+		bidButton->setEnabled( m_actionPending == false );
+		const auto auctionId = auction.value( QStringLiteral("id") ).toString();
+		const auto auctionName = name;
+		connect( bidButton, &QPushButton::clicked, this, [this, auctionId, auctionName, bidSpin]() {
+			if( bidSpin == nullptr ) { return; }
+			// 出价确认：防误触，也让学生意识到成交是要扣积分的。
+			if( QMessageBox::question( this, windowTitle(),
+									   tr( "为「%1」出价 %2 分？（结束时价高者得，成交才扣分）" )
+										   .arg( auctionName ).arg( bidSpin->value() ),
+									   QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes ) != QMessageBox::Yes )
+			{
+				return;
+			}
+			const auto amount = bidSpin->value();
+			m_statusLabel->setText( tr( "已发送出价 %1 分…" ).arg( amount ) );
+			m_actionPending = true;
+			m_actionTimer->start( 15000 );
+			rebuild();
+			Q_EMIT bidRequested( auctionId, amount );
+		} );
+		if( m_signedIn == false || available < minNextBid || minNextBid > ClassroomShopBook::MaxBid )
+		{
+			bidSpin->setEnabled( false );
+			bidButton->setEnabled( false );
+			bidButton->setToolTip( m_signedIn == false ? tr( "请先签到" ) :
+				( minNextBid > ClassroomShopBook::MaxBid ? tr( "出价超出范围" ) :
+					tr( "可用积分不足（当前可用 %1 分，需保留 %2 分）" ).
+						arg( available ).arg( ClassroomShopBook::ProtectedScore ) ) );
+		}
+		bidRow->addWidget( new QLabel( tr( "我的出价：" ), card ) );
+		bidRow->addWidget( bidSpin );
+		bidRow->addWidget( bidButton );
+		bidRow->addStretch( 1 );
+		column->addLayout( bidRow );
+
+		// 最近出价，让全班看到争夺过程。
+		const auto bids = auction.value( QStringLiteral("bids") ).toArray();
+		if( bids.isEmpty() == false )
+		{
+			QStringList lines;
+			for( int index = bids.size() - 1; index >= 0 && lines.size() < 5; --index )
+			{
+				const auto bid = bids.at( index ).toObject();
+				lines.append( QStringLiteral("%1  %2（座位 %3）出 %4 分")
+								  .arg( bid.value( QStringLiteral("time") ).toString(),
+										bid.value( QStringLiteral("student") ).toString(),
+										bid.value( QStringLiteral("seat") ).toString() )
+								  .arg( bid.value( QStringLiteral("amount") ).toInt() ) );
+			}
+			auto* bidsLabel = new QLabel( lines.join( QLatin1Char('\n') ), card );
+			bidsLabel->setProperty( "role", QStringLiteral("hint") );
+			column->addWidget( bidsLabel );
+		}
+	}
+	else if( currentBid > 0 )
+	{
+		column->addWidget( new QLabel( tr( "已结束 · %2（座位 %3）以 %1 分拍得" )
+										  .arg( currentBid ).arg( bidder, bidderSeat ), card ) );
+	}
+	else
+	{
+		column->addWidget( new QLabel( tr( "已结束 · 流拍（无人出价）" ), card ) );
+	}
+
+	return card;
+}
+
+
+void ClassroomShopView::rebuild()
+{
+	m_balanceLabel->setText( m_signedIn == false ? tr( "请先签到后再使用商城" ) :
+		( m_balance >= 0 ? tr( "积分余额：%1 · 可用：%2（保留 %3 分）" ).
+			arg( m_balance ).arg( ClassroomShopBook::spendableScore( m_balance ) ).
+			arg( ClassroomShopBook::ProtectedScore ) : tr( "积分余额：未知" ) ) );
+
+	// products tab
+	{
+		auto* layout = qobject_cast<QVBoxLayout*>( m_productsArea->layout() );
+		if( layout == nullptr ) { return; }
+		clearWidgetList( layout );
+		const auto open = m_catalog.value( QStringLiteral("open") ).toBool( true );
+		const auto products = m_catalog.value( QStringLiteral("products") ).toArray();
+		if( products.isEmpty() )
+		{
+			layout->addWidget( new QLabel( tr( "老师还没有上架商品。" ), m_productsArea ) );
+		}
+		else if( open == false )
+		{
+			layout->addWidget( new QLabel( tr( "老师暂时关闭了商场，稍后再来看看。" ), m_productsArea ) );
+		}
+		for( const auto& value : products )
+		{
+			layout->addWidget( buildProductCard( value.toObject() ) );
+		}
+		layout->addStretch( 1 );
+	}
+
+	// auctions tab
+	{
+		auto* layout = qobject_cast<QVBoxLayout*>( m_auctionsArea->layout() );
+		if( layout == nullptr ) { return; }
+		clearWidgetList( layout );
+		const auto auctions = m_catalog.value( QStringLiteral("auctions") ).toArray();
+		if( auctions.isEmpty() )
+		{
+			layout->addWidget( new QLabel( tr( "当前没有竞拍，老师发起后会出现在这里。" ), m_auctionsArea ) );
+		}
+		for( const auto& value : auctions )
+		{
+			layout->addWidget( buildAuctionCard( value.toObject() ) );
+		}
+		layout->addStretch( 1 );
+	}
+}
+
+
+void ClassroomShopView::closeEvent( QCloseEvent* event )
+{
+	event->ignore();
+	hide();
+}
+
+
+void ClassroomShopView::mousePressEvent( QMouseEvent* event )
+{
+	if( event->button() == Qt::LeftButton )
+	{
+		m_dragPosition = mouseGlobalPoint( event ) - frameGeometry().topLeft();
+	}
+	QWidget::mousePressEvent( event );
+}
+
+
+void ClassroomShopView::mouseMoveEvent( QMouseEvent* event )
+{
+	if( event->buttons() & Qt::LeftButton )
+	{
+		move( clampedOnScreen( this, mouseGlobalPoint( event ) - m_dragPosition ) );
 	}
 	QWidget::mouseMoveEvent( event );
 }

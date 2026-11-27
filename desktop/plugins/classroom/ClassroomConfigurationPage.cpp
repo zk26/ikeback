@@ -1,7 +1,12 @@
 /*
  * ClassroomConfigurationPage.cpp - Ikeback Configurator page for the classroom extension
  *
- * This file is part of the Ikeback classroom modification.
+ * The standard view shows only the settings a teacher actually needs; niche
+ * rows carry the Advanced flag and appear when the configurator is switched
+ * to the advanced view. Settings that never had any effect (base score, UWF /
+ * internet / USB presets, exit admin requirement) and the mobile bridge
+ * (owned by the teacher console) were removed. This file is part of the
+ * Ikeback classroom modification.
  */
 
 #include <QCheckBox>
@@ -18,6 +23,7 @@
 #include "ClassroomConfiguration.h"
 #include "ClassroomData.h"
 #include "ClassroomConfigurationPage.h"
+#include "ClassroomTheme.h"
 #include "Filesystem.h"
 #include "IkebackCore.h"
 #include "Configuration/UiMapping.h"
@@ -28,7 +34,9 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 	m_configuration( configuration )
 {
 	setWindowTitle( Classroom::productName() );
-	setWindowIcon( QIcon( QStringLiteral(":/core/icon32.png") ) );
+	setObjectName( QStringLiteral("classroomConfiguration") );
+	Classroom::Theme::apply( this );
+	setWindowIcon( QIcon( QStringLiteral(":/master/app-icon.png") ) );
 
 	auto* form = new QFormLayout( this );
 	const auto addWidget = [form]( QWidget* widget ) {
@@ -36,19 +44,25 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 		form->addWidget( widget );
 		return widget;
 	};
-	const auto addRow = [form]( const QString& label, QWidget* widget ) {
+	// Standard rows need an explicit label widget so that switching to the
+	// advanced view (or back) can hide label and field together.
+	const auto addRow = [form, this]( const QString& label, QWidget* widget ) {
+		auto* labelWidget = new QLabel( label, this );
+		Configuration::UiMapping::setFlags( labelWidget, Configuration::Property::Flag::Standard );
 		Configuration::UiMapping::setFlags( widget, Configuration::Property::Flag::Standard );
-		form->addRow( label, widget );
+		form->addRow( labelWidget, widget );
+		return widget;
+	};
+	const auto addAdvancedRow = [form, this]( const QString& label, QWidget* widget ) {
+		auto* labelWidget = new QLabel( label + tr( "（高级）" ), this );
+		Configuration::UiMapping::setFlags( labelWidget, Configuration::Property::Flag::Advanced );
+		Configuration::UiMapping::setFlags( widget, Configuration::Property::Flag::Advanced );
+		form->addRow( labelWidget, widget );
 		return widget;
 	};
 
 	m_enabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用班级管理功能" ), this ) ) );
-	m_dataDirectory = qobject_cast<QLineEdit*>( addRow( tr( "数据目录：" ), new QLineEdit( this ) ) );
-	m_sessionKey = qobject_cast<QLineEdit*>( addRow( tr( "课堂密钥（开始上课用）：" ), new QLineEdit( this ) ) );
-	m_sessionKey->setEchoMode( QLineEdit::Password );
 	m_exitProtection = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "保护学生端不被关闭" ), this ) ) );
-	m_exitRequiresAdmin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "退出时需要管理员凭据" ), this ) ) );
-	m_exitAdminUsername = qobject_cast<QLineEdit*>( addRow( tr( "管理员账户：" ), new QLineEdit( this ) ) );
 	m_allowSelfLogin = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "允许学生自行签到登录" ), this ) ) );
 
 	auto* importRosterButton = new QPushButton( tr( "批量导入名单（座位号 + 姓名）" ), this );
@@ -82,28 +96,22 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 	m_aiApiKey->setEchoMode( QLineEdit::Password );
 	m_aiModel = qobject_cast<QLineEdit*>( addRow( tr( "模型：" ), new QLineEdit( this ) ) );
 	m_aiSystemPrompt = qobject_cast<QLineEdit*>( addRow( tr( "系统提示词：" ), new QLineEdit( this ) ) );
-	m_aiTimeout = qobject_cast<QSpinBox*>( addRow( tr( "超时（秒）：" ), new QSpinBox( this ) ) );
+	m_aiTimeout = qobject_cast<QSpinBox*>( addAdvancedRow( tr( "超时（秒）：" ), new QSpinBox( this ) ) );
 	m_aiTimeout->setRange( 5, 600 );
 
 	form->addRow( new QLabel( tr( "行为监控" ), this ) );
 	m_monitoringEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "记录活动窗口和应用程序" ), this ) ) );
-	m_captureInterval = qobject_cast<QSpinBox*>( addRow( tr( "采样间隔（秒）：" ), new QSpinBox( this ) ) );
+	m_captureInterval = qobject_cast<QSpinBox*>( addAdvancedRow( tr( "采样间隔（秒）：" ), new QSpinBox( this ) ) );
 	m_captureInterval->setRange( 1, 300 );
-	m_retentionDays = qobject_cast<QSpinBox*>( addRow( tr( "日志保留天数：" ), new QSpinBox( this ) ) );
+	m_retentionDays = qobject_cast<QSpinBox*>( addAdvancedRow( tr( "日志保留天数：" ), new QSpinBox( this ) ) );
 	m_retentionDays->setRange( 1, 3650 );
 
-	form->addRow( new QLabel( tr( "评分、设备与手机桥接" ), this ) );
-	m_scoreBaseScore = qobject_cast<QSpinBox*>( addRow( tr( "基础分：" ), new QSpinBox( this ) ) );
-	m_scoreBaseScore->setRange( 0, 10000 );
-	m_uwfEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用 UWF 写保护集成" ), this ) ) );
-	m_internetGuard = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用网络防护（WFP）" ), this ) ) );
-	m_usbInputBlock = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "锁定时禁用 USB 输入" ), this ) ) );
-	m_bridgePort = qobject_cast<QSpinBox*>( addRow( tr( "手机桥接端口：" ), new QSpinBox( this ) ) );
-	m_bridgePort->setRange( 1024, 65535 );
-	m_bridgeEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用手机桥接" ), this ) ) );
-	m_syncEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用局域网自动同步" ), this ) ) );
+	form->addRow( new QLabel( tr( "课堂与同步" ), this ) );
 	m_silencePageText = qobject_cast<QLineEdit*>( addRow( tr( "肃静页文字：" ), new QLineEdit( this ) ) );
-	m_wordCloudStopWords = qobject_cast<QLineEdit*>( addRow( tr( "词云额外停用词：" ), new QLineEdit( this ) ) );
+	m_syncEnabled = qobject_cast<QCheckBox*>( addWidget( new QCheckBox( tr( "启用局域网自动同步（手机端）" ), this ) ) );
+	m_dataDirectory = qobject_cast<QLineEdit*>( addAdvancedRow( tr( "数据目录：" ), new QLineEdit( this ) ) );
+	m_exitAdminUsername = qobject_cast<QLineEdit*>( addAdvancedRow( tr( "管理员账户：" ), new QLineEdit( this ) ) );
+	m_wordCloudStopWords = qobject_cast<QLineEdit*>( addAdvancedRow( tr( "词云额外停用词：" ), new QLineEdit( this ) ) );
 
 	Configuration::UiMapping::setFlags( this, Configuration::Property::Flag::Standard );
 }
@@ -113,9 +121,7 @@ void ClassroomConfigurationPage::resetWidgets()
 {
 	m_enabled->setChecked( m_configuration.enabled() );
 	m_dataDirectory->setText( m_configuration.dataDirectory() );
-	m_sessionKey->setText( m_configuration.sessionKey() );
 	m_exitProtection->setChecked( m_configuration.exitProtection() );
-	m_exitRequiresAdmin->setChecked( m_configuration.exitRequiresAdmin() );
 	m_exitAdminUsername->setText( m_configuration.exitAdminUsername() );
 	m_allowSelfLogin->setChecked( m_configuration.allowSelfLogin() );
 	m_aiEnabled->setChecked( m_configuration.aiEnabled() );
@@ -127,12 +133,6 @@ void ClassroomConfigurationPage::resetWidgets()
 	m_monitoringEnabled->setChecked( m_configuration.monitoringEnabled() );
 	m_captureInterval->setValue( m_configuration.captureInterval() );
 	m_retentionDays->setValue( m_configuration.retentionDays() );
-	m_scoreBaseScore->setValue( m_configuration.scoreBaseScore() );
-	m_uwfEnabled->setChecked( m_configuration.uwfEnabled() );
-	m_internetGuard->setChecked( m_configuration.internetGuard() );
-	m_usbInputBlock->setChecked( m_configuration.usbInputBlock() );
-	m_bridgePort->setValue( m_configuration.bridgePort() );
-	m_bridgeEnabled->setChecked( m_configuration.bridgeEnabled() );
 	m_syncEnabled->setChecked( m_configuration.syncEnabled() );
 	m_silencePageText->setText( m_configuration.silencePageText() );
 	m_wordCloudStopWords->setText( m_configuration.wordCloudStopWords() );
@@ -147,12 +147,8 @@ void ClassroomConfigurationPage::connectWidgetsToProperties()
 		m_configuration.setEnabled( value ); changed(); } );
 	connect( m_dataDirectory, &QLineEdit::textChanged, this, [this, changed]( const QString& value ) {
 		m_configuration.setDataDirectory( value ); changed(); } );
-	connect( m_sessionKey, &QLineEdit::textChanged, this, [this, changed]( const QString& value ) {
-		m_configuration.setSessionKey( value ); changed(); } );
 	connect( m_exitProtection, &QCheckBox::toggled, this, [this, changed]( bool value ) {
 		m_configuration.setExitProtection( value ); changed(); } );
-	connect( m_exitRequiresAdmin, &QCheckBox::toggled, this, [this, changed]( bool value ) {
-		m_configuration.setExitRequiresAdmin( value ); changed(); } );
 	connect( m_exitAdminUsername, &QLineEdit::textChanged, this, [this, changed]( const QString& value ) {
 		m_configuration.setExitAdminUsername( value ); changed(); } );
 	connect( m_allowSelfLogin, &QCheckBox::toggled, this, [this, changed]( bool value ) {
@@ -175,18 +171,6 @@ void ClassroomConfigurationPage::connectWidgetsToProperties()
 		m_configuration.setCaptureInterval( value ); changed(); } );
 	connect( m_retentionDays, QOverload<int>::of( &QSpinBox::valueChanged ), this, [this, changed]( int value ) {
 		m_configuration.setRetentionDays( value ); changed(); } );
-	connect( m_scoreBaseScore, QOverload<int>::of( &QSpinBox::valueChanged ), this, [this, changed]( int value ) {
-		m_configuration.setScoreBaseScore( value ); changed(); } );
-	connect( m_uwfEnabled, &QCheckBox::toggled, this, [this, changed]( bool value ) {
-		m_configuration.setUwfEnabled( value ); changed(); } );
-	connect( m_internetGuard, &QCheckBox::toggled, this, [this, changed]( bool value ) {
-		m_configuration.setInternetGuard( value ); changed(); } );
-	connect( m_usbInputBlock, &QCheckBox::toggled, this, [this, changed]( bool value ) {
-		m_configuration.setUsbInputBlock( value ); changed(); } );
-	connect( m_bridgePort, QOverload<int>::of( &QSpinBox::valueChanged ), this, [this, changed]( int value ) {
-		m_configuration.setBridgePort( value ); changed(); } );
-	connect( m_bridgeEnabled, &QCheckBox::toggled, this, [this, changed]( bool value ) {
-		m_configuration.setBridgeEnabled( value ); changed(); } );
 	connect( m_syncEnabled, &QCheckBox::toggled, this, [this, changed]( bool value ) {
 		m_configuration.setSyncEnabled( value ); changed(); } );
 	connect( m_silencePageText, &QLineEdit::textChanged, this, [this, changed]( const QString& value ) {

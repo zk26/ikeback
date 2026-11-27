@@ -82,6 +82,8 @@ public:
 	QWidget* mainWindow() override;
 	Configuration::Object* userConfigurationObject() override;
 	void reloadSubFeatures() override;
+	void setClassroomPage( QWidget* page ) override;
+	void setClassroomMode( bool active ) override;
 
 	ComputerControlInterface& localSessionControlInterface() override
 	{

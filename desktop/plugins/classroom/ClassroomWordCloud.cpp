@@ -17,6 +17,7 @@
 #include <QSet>
 
 #include "ClassroomWordCloud.h"
+#include "ClassroomTheme.h"
 
 
 QStringList ClassroomWordCloud::defaultStopWords()
@@ -137,10 +138,15 @@ QVector<ClassroomWordCloud::Word> ClassroomWordCloud::tokenize( const QStringLis
 QVector<ClassroomWordCloud::PlacedWord> ClassroomWordCloud::layout( const QVector<Word>& words,
 																	 int width, int height )
 {
-	static const QStringList palette{
-		QStringLiteral("#1f6f8b"), QStringLiteral("#c0392b"), QStringLiteral("#27ae60"),
-		QStringLiteral("#8e44ad"), QStringLiteral("#d35400"), QStringLiteral("#2c3e50"),
-		QStringLiteral("#16a085"), QStringLiteral("#b03a2e")
+	const QVector<QColor> palette{
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Secondary ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Danger ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Success ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Accent ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Warning ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Text ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Primary ),
+		Classroom::Theme::color( Classroom::Theme::ColorRole::Muted )
 	};
 
 	QVector<PlacedWord> placed;
@@ -181,7 +187,7 @@ QVector<ClassroomWordCloud::PlacedWord> ClassroomWordCloud::layout( const QVecto
 			if( collides == false )
 			{
 				candidate = { word.text, left, top, boxWidth, boxHeight, fontSize,
-							  palette.at( colorIndex % palette.size() ) };
+							  palette.at( colorIndex % palette.size() ).name() };
 				break;
 			}
 		}
@@ -199,14 +205,16 @@ QByteArray ClassroomWordCloud::toSvg( const QVector<Word>& words, int width, int
 	svg += QStringLiteral("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
 	svg += QStringLiteral("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%1\" height=\"%2\" "
 						  "viewBox=\"0 0 %1 %2\">\n").arg( width ).arg( height );
-	svg += QStringLiteral("<rect width=\"100%\" height=\"100%\" fill=\"#ffffff\"/>\n");
+	svg += QStringLiteral("<rect width=\"100%\" height=\"100%\" fill=\"%1\"/>\n")
+				.arg( Classroom::Theme::color( Classroom::Theme::ColorRole::Surface ).name() );
 
 	if( words.isEmpty() )
 	{
 		const auto hint = QCoreApplication::translate( "ClassroomWordCloud", "No interest data yet" );
 		svg += QStringLiteral("<text x=\"%1\" y=\"%2\" text-anchor=\"middle\" font-size=\"20\" "
-							  "font-family=\"Microsoft YaHei,sans-serif\" fill=\"#888888\">%3</text>\n")
-					.arg( width / 2 ).arg( height / 2 ).arg( hint.toHtmlEscaped() );
+							  "font-family=\"Microsoft YaHei,sans-serif\" fill=\"%4\">%3</text>\n")
+					.arg( width / 2 ).arg( height / 2 ).arg( hint.toHtmlEscaped() )
+					.arg( Classroom::Theme::color( Classroom::Theme::ColorRole::Muted ).name() );
 		svg += QStringLiteral("</svg>\n");
 		return svg.toUtf8();
 	}
@@ -232,7 +240,7 @@ QByteArray ClassroomWordCloud::toSvg( const QVector<Word>& words, int width, int
 QPixmap ClassroomWordCloud::toPixmap( const QVector<Word>& words, int width, int height )
 {
 	QPixmap pixmap( width, height );
-	pixmap.fill( QColor( QStringLiteral("#ffffff") ) );
+	pixmap.fill( Classroom::Theme::color( Classroom::Theme::ColorRole::Surface ) );
 	QPainter painter( &pixmap );
 
 	if( words.isEmpty() )
@@ -241,7 +249,7 @@ QPixmap ClassroomWordCloud::toPixmap( const QVector<Word>& words, int width, int
 		QFont font( QStringLiteral("Microsoft YaHei") );
 		font.setPixelSize( 20 );
 		painter.setFont( font );
-		painter.setPen( QColor( QStringLiteral("#888888") ) );
+		painter.setPen( Classroom::Theme::color( Classroom::Theme::ColorRole::Muted ) );
 		painter.drawText( pixmap.rect(), Qt::AlignCenter, hint );
 		return pixmap;
 	}

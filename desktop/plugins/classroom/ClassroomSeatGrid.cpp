@@ -9,21 +9,25 @@
 #include <QtGlobal>
 
 #include <QAbstractItemView>
-#include <QCursor>
+#include <QComboBox>
 #include <QDrag>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHeaderView>
-#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QMenu>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QPushButton>
+#include <QResizeEvent>
+#include <QSettings>
+#include <QSpinBox>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTimer>
@@ -31,12 +35,12 @@
 
 #include "ClassroomData.h"
 #include "ClassroomSeatOrder.h"
+#include "ClassroomTheme.h"
 
 namespace
 {
-constexpr int Columns = 4;
-constexpr int ThumbWidth = 168;
-constexpr int ThumbHeight = 105;
+constexpr int CardSpacing = 10;
+constexpr int MinimumCardWidth = 150;
 }
 
 
@@ -44,12 +48,26 @@ ClassroomSeatGrid::ClassroomSeatGrid( ClassroomRoster& roster, QWidget* parent )
 	QWidget( parent ),
 	m_roster( roster )
 {
+	setObjectName( QStringLiteral("classroomSeatGrid") );
+	Classroom::Theme::apply( this );
 	auto* root = new QVBoxLayout( this );
 
 	auto* bar = new QHBoxLayout;
-	m_viewButton = new QPushButton( tr( "Switch to list view" ), this );
-	m_viewButton->setToolTip( tr( "List view shows every detail (including UWF state) without student screen captures" ) );
+	m_viewButton = new QPushButton( tr( "列表视图" ), this );
+	m_viewButton->setProperty( "secondary", true );
+	m_viewButton->setToolTip( tr( "列表视图显示全部详情（包括 UWF 状态），不显示学生屏幕画面" ) );
+	m_zoomCombo = new QComboBox( this );
+	m_zoomCombo->addItem( tr( "紧凑 50%" ), 50 );
+	m_zoomCombo->addItem( tr( "舒适 75%" ), 75 );
+	m_zoomCombo->addItem( tr( "大图 100%" ), 100 );
+	QSettings settings( QStringLiteral("ikeback"), QStringLiteral("classroom") );
+	const auto storedZoom = settings.value( QStringLiteral("seatZoom") ).toInt();
+	const auto savedZoom = qBound( 50, storedZoom > 0 ? storedZoom : 75, 100 );
+	const auto savedIndex = m_zoomCombo->findData( savedZoom );
+	m_zoomCombo->setCurrentIndex( savedIndex >= 0 ? savedIndex : 1 );
+	m_zoomCombo->setToolTip( tr( "座位卡片缩放" ) );
 	bar->addWidget( m_viewButton );
+	bar->addWidget( m_zoomCombo );
 	bar->addStretch( 1 );
 	root->addLayout( bar );
 
@@ -61,17 +79,17 @@ ClassroomSeatGrid::ClassroomSeatGrid( ClassroomRoster& roster, QWidget* parent )
 	m_gridPage = new QWidget( this );
 	auto* gridWrapper = new QVBoxLayout( m_gridPage );
 	m_grid = new QGridLayout;
-	m_grid->setSpacing( 10 );
+	m_grid->setSpacing( CardSpacing );
 	gridWrapper->addLayout( m_grid );
 	gridWrapper->addStretch( 1 );
 	root->addWidget( m_gridPage, 1 );
 
 	// List view: full information, deliberately NO student screen capture.
-	m_table = new QTableWidget( 0, 9, this );
+	m_table = new QTableWidget( 0, 10, this );
 	m_table->setHorizontalHeaderLabels( QStringList{
-		tr( "Seat" ), tr( "Roster name" ), tr( "Signed in" ), tr( "IP address" ),
-		tr( "Online" ), tr( "Client protection" ), tr( "UWF restore" ),
-		tr( "Score" ), tr( "Last activity" ) } );
+		tr( "座位" ), tr( "名册姓名" ), tr( "当前签到" ), tr( "IP 地址" ),
+		tr( "在线状态" ), tr( "退出保护" ), tr( "UWF 还原" ),
+		tr( "积分" ), tr( "等级" ), tr( "最近活动" ) } );
 	m_table->horizontalHeader()->setSectionResizeMode( QHeaderView::ResizeToContents );
 	m_table->setEditTriggers( QAbstractItemView::NoEditTriggers );
 	m_table->setSelectionBehavior( QAbstractItemView::SelectRows );
@@ -82,6 +100,9 @@ ClassroomSeatGrid::ClassroomSeatGrid( ClassroomRoster& roster, QWidget* parent )
 	connect( m_viewButton, &QPushButton::clicked, this, [this]() {
 		setViewMode( m_viewMode == ViewMode::Grid ? ViewMode::List : ViewMode::Grid );
 	} );
+	connect( m_zoomCombo, QOverload<int>::of( &QComboBox::currentIndexChanged ),
+			 this, &ClassroomSeatGrid::updateZoom );
+	updateZoom( m_zoomCombo->currentIndex() );
 
 	m_timer = new QTimer( this );
 	m_timer->setInterval( 2000 );
@@ -97,7 +118,7 @@ void ClassroomSeatGrid::setViewMode( ViewMode mode )
 	const auto grid = mode == ViewMode::Grid;
 	m_gridPage->setVisible( grid );
 	m_table->setVisible( grid == false );
-	m_viewButton->setText( grid ? tr( "Switch to list view" ) : tr( "Switch to grid view" ) );
+	m_viewButton->setText( grid ? tr( "列表视图" ) : tr( "表格视图" ) );
 	refresh();
 }
 
@@ -124,10 +145,11 @@ void ClassroomSeatGrid::rebuild()
 	while( m_grid->count() > 0 )
 	{
 		auto* item = m_grid->takeAt( 0 );
-		if( item->widget() ) { item->widget()->deleteLater(); }
+		if( item->widget() ) { item->widget()->hide(); item->widget()->deleteLater(); }
 		delete item;
 	}
 	m_cards.clear();
+	m_activeScoreSeat.clear();
 
 	const auto* classItem = m_className.isEmpty() ? nullptr : m_roster.findClass( m_className );
 	if( classItem == nullptr )
@@ -160,12 +182,13 @@ void ClassroomSeatGrid::rebuild()
 	Classroom::saveSeatOrder( m_className, m_order );
 
 	int index = 0;
+	const auto columns = columnCount();
 	for( const auto& student : ordered )
 	{
 		auto* card = new QFrame( this );
 		card->setFrameShape( QFrame::StyledPanel );
-		card->setStyleSheet( QStringLiteral("background:#ffffff; border:1px solid #dce3ea; border-radius:8px;") );
-		card->setFixedWidth( ThumbWidth + 16 );
+		card->setProperty( "seatCard", true );
+		card->setFixedWidth( m_thumbWidth + 16 );
 		card->setToolTip( tr( "Drag this card onto another one to swap positions" ) );
 		card->setProperty( "ikebackSeat", student.seat );
 		card->setAcceptDrops( true );
@@ -173,29 +196,63 @@ void ClassroomSeatGrid::rebuild()
 
 		auto* layout = new QVBoxLayout( card );
 		layout->setContentsMargins( 8, 8, 8, 8 );
+		layout->setSpacing( 6 );
 
 		auto* thumbnail = new QLabel( card );
-		thumbnail->setFixedSize( ThumbWidth, ThumbHeight );
+		thumbnail->setFixedSize( m_thumbWidth, m_thumbHeight );
 		thumbnail->setAlignment( Qt::AlignCenter );
-		thumbnail->setStyleSheet( QStringLiteral("background:#eef3f6; border-radius:4px;") );
+		thumbnail->setProperty( "seatThumbnail", true );
 		thumbnail->setProperty( "ikebackSeat", student.seat );
 		thumbnail->setAcceptDrops( true );
 		thumbnail->installEventFilter( this );
 		layout->addWidget( thumbnail );
 
-		auto* score = new QPushButton( card );
-		score->setToolTip( tr( "Click to add or deduct points (-5..+5)" ) );
-		layout->addWidget( score );
-
 		auto* caption = new QLabel( card );
 		caption->setWordWrap( true );
+		caption->setProperty( "seatCaption", true );
 		layout->addWidget( caption );
+
+		auto* state = new QLabel( card );
+		state->setWordWrap( true );
+		state->setProperty( "role", QStringLiteral("hint") );
+		layout->addWidget( state );
+
+		auto* score = new QPushButton( tr( "积分" ), card );
+		score->setProperty( "secondary", true );
+		score->setToolTip( tr( "Add or deduct points (-5..+5)" ) );
+		layout->addWidget( score );
+
+		auto* editor = new QWidget( card );
+		auto* editorLayout = new QVBoxLayout( editor );
+		editorLayout->setContentsMargins( 0, 0, 0, 0 );
+		editorLayout->setSpacing( 4 );
+		auto* deltaRow = new QHBoxLayout;
+		auto* delta = new QSpinBox( editor );
+		delta->setRange( -5, 5 );
+		delta->setValue( 1 );
+		delta->setSuffix( tr( " pts" ) );
+		deltaRow->addWidget( delta );
+		auto* confirm = new QPushButton( tr( "应用" ), editor );
+		auto* cancel = new QPushButton( tr( "Cancel" ), editor );
+		cancel->setProperty( "secondary", true );
+		deltaRow->addWidget( confirm );
+		deltaRow->addWidget( cancel );
+		editorLayout->addLayout( deltaRow );
+		auto* reason = new QLineEdit( editor );
+		reason->setPlaceholderText( tr( "Reason (optional)" ) );
+		editorLayout->addWidget( reason );
+		editor->hide();
+		layout->addWidget( editor );
 
 		const auto seat = student.seat;
 		connect( score, &QPushButton::clicked, this, [this, seat]() { chooseDelta( seat ); } );
+		connect( confirm, &QPushButton::clicked, this, [this, seat]() { commitScore( seat ); } );
+		connect( cancel, &QPushButton::clicked, this, [this, seat]() { cancelScore( seat ); } );
+		connect( reason, &QLineEdit::returnPressed, this, [this, seat]() { commitScore( seat ); } );
 
-		m_grid->addWidget( card, index / Columns, index % Columns );
-		m_cards.insert( seat, SeatCard{ card, thumbnail, score, caption, student.ip, student.name, seat } );
+		m_grid->addWidget( card, index / columns, index % columns );
+		m_cards.insert( seat, SeatCard{ card, thumbnail, score, confirm, cancel, delta, reason,
+										editor, caption, state, student.ip, student.name, seat } );
 		++index;
 	}
 
@@ -224,6 +281,7 @@ void ClassroomSeatGrid::rebuildList()
 		m_table->setItem( row, 6, new QTableWidgetItem( QString{} ) );
 		m_table->setItem( row, 7, new QTableWidgetItem( QString{} ) );
 		m_table->setItem( row, 8, new QTableWidgetItem( QString{} ) );
+		m_table->setItem( row, 9, new QTableWidgetItem( QString{} ) );
 		++row;
 	}
 	m_table->setRowCount( row );
@@ -231,11 +289,10 @@ void ClassroomSeatGrid::rebuildList()
 }
 
 
-QString ClassroomSeatGrid::protectionIcon( const QString& seat ) const
+QString ClassroomSeatGrid::protectionText( const QString& seat ) const
 {
-	// U+1F6E1 SHIELD = client-process protection enabled; hollow circle = off.
 	const auto enabled = m_protectionProvider ? m_protectionProvider( seat ) : false;
-	return enabled ? QString::fromUtf8( "\xF0\x9F\x9B\xA1" ) : QString::fromUtf8( "\xE2\x97\x8B" );
+	return enabled ? tr( "已保护" ) : tr( "未保护" );
 }
 
 
@@ -259,13 +316,19 @@ void ClassroomSeatGrid::refreshList()
 		const auto set = [this, row]( int column, const QString& text ) {
 			if( auto* item = m_table->item( row, column ) ) { item->setText( text ); }
 		};
-		set( 2, identity.isEmpty() ? tr( "not signed in" ) : identity );
-		set( 4, online ? tr( "online" ) : tr( "offline" ) );
-		set( 5, ( m_protectionProvider && m_protectionProvider( seat ) ) ?
-				 tr( "on (cannot quit)" ) : tr( "off" ) );
-		set( 6, uwf.isEmpty() ? tr( "unknown - use Query UWF" ) : uwf );
+		set( 2, identity.isEmpty() ? tr( "未签到" ) : identity );
+		set( 4, online ? tr( "在线" ) : tr( "离线" ) );
+		const auto protectedNow = m_protectionProvider && m_protectionProvider( seat );
+		set( 5, protectedNow ? tr( "已保护（不能退出）" ) : tr( "未保护" ) );
+		if( auto* protectionItem = m_table->item( row, 5 ) )
+		{
+			protectionItem->setIcon( QIcon( protectedNow ? QStringLiteral(":/classroom/icons/shield-on.png" ) :
+				QStringLiteral(":/classroom/icons/shield-off.png" ) ) );
+		}
+		set( 6, uwf.isEmpty() ? tr( "未知，请查询 UWF" ) : uwf );
 		set( 7, QString::number( total ) );
-		set( 8, online ? tr( "live" ) : tr( "-" ) );
+		set( 8, m_levelProvider ? m_levelProvider( seat ) : QString{} );
+		set( 9, online ? tr( "活跃" ) : tr( "-" ) );
 	}
 }
 
@@ -290,7 +353,7 @@ void ClassroomSeatGrid::refresh()
 				{
 					card.frameKey = image.cacheKey();
 					card.thumbnail->setPixmap( QPixmap::fromImage( image ).scaled(
-						ThumbWidth, ThumbHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation ) );
+						m_thumbWidth, m_thumbHeight, Qt::KeepAspectRatio, Qt::SmoothTransformation ) );
 				}
 			}
 		}
@@ -303,13 +366,15 @@ void ClassroomSeatGrid::refresh()
 
 		int total = 100;
 		if( m_scoreProvider ) { total = m_scoreProvider( card.seat ); }
-		card.score->setText( tr( "Score +/-" ) );
-		card.score->setEnabled( true );
+		card.score->setText( tr( "积分" ) );
+		card.score->setEnabled( m_scoreSink != nullptr );
 
-		// Caption contract: <protection icon> <name> [<score>], e.g. shield 学生1  [100].
-		const auto state = onlineNow ? tr( "online" ) : tr( "offline" );
-		card.caption->setText( QStringLiteral("%1 %2  [%3]")
-							   .arg( protectionIcon( card.seat ) ).arg( card.expectedName ).arg( total ) );
+		const auto state = onlineNow ? tr( "在线" ) : tr( "离线" );
+		const auto level = m_levelProvider ? m_levelProvider( card.seat ) : QString{};
+		card.caption->setText( level.isEmpty() ? QStringLiteral("%1 · %2").arg( card.expectedName ).arg( total ) :
+			QStringLiteral("%1 · %2 · %3").arg( card.expectedName ).arg( total ).arg( level ) );
+		card.state->setProperty( "online", onlineNow );
+		card.state->setText( QStringLiteral("%1 · %2").arg( state, protectionText( card.seat ) ) );
 		const auto uwf = m_uwfProvider ? m_uwfProvider( card.seat ) : QString{};
 		card.root->setToolTip( tr( "Drag this card onto another one to swap positions\n%1\nUWF: %2" )
 							   .arg( state, uwf.isEmpty() ? tr( "unknown" ) : uwf ) );
@@ -317,8 +382,7 @@ void ClassroomSeatGrid::refresh()
 	}
 	if( m_cards.isEmpty() == false )
 	{
-		m_summary->setText( tr( "%1: %2 of %3 students online. Shield = client protection on. "
-								"Click a score to add/deduct points." )
+		m_summary->setText( tr( "%1：%2/%3 名学生在线，可点击“积分”直接加减分。" )
 							.arg( m_className, QString::number( online ), QString::number( m_cards.size() ) ) );
 	}
 	refreshList();
@@ -328,29 +392,95 @@ void ClassroomSeatGrid::refresh()
 void ClassroomSeatGrid::chooseDelta( const QString& seat )
 {
 	if( m_scoreSink == nullptr ) { return; }
+	const auto it = m_cards.find( seat );
+	if( it == m_cards.end() ) { return; }
 
-	QMenu menu( this );
-	for( int delta = 5; delta >= -5; --delta )
+	if( m_activeScoreSeat == seat )
 	{
-		const auto text = delta > 0 ? QStringLiteral("+%1").arg( delta ) : QString::number( delta );
-		auto* action = menu.addAction( text );
-		action->setData( delta );
+		cancelScore( seat );
+		return;
 	}
-	auto* chosen = menu.exec( QCursor::pos() );
-	if( chosen == nullptr ) { return; }
+	if( m_activeScoreSeat.isEmpty() == false ) { cancelScore( m_activeScoreSeat ); }
 
-	const auto delta = chosen->data().toInt();
-	if( delta == 0 ) { return; }
+	auto& card = it.value();
+	card.scoreDelta->setValue( 1 );
+	card.scoreReason->clear();
+	card.scoreEditor->show();
+	card.scoreDelta->setFocus();
+	m_activeScoreSeat = seat;
+}
 
-	bool accepted = false;
-	const auto reason = QInputDialog::getText( this, tr( "Score reason" ),
-											   tr( "Reason for %1 points at seat %2:" )
-												   .arg( delta ).arg( seat ),
-											   QLineEdit::Normal, {}, &accepted );
-	if( accepted == false ) { return; }
 
-	m_scoreSink( seat, delta, reason.trimmed() );
+void ClassroomSeatGrid::commitScore( const QString& seat )
+{
+	const auto it = m_cards.find( seat );
+	if( it == m_cards.end() || m_scoreSink == nullptr ) { return; }
+	auto& card = it.value();
+	const auto delta = card.scoreDelta->value();
+	if( delta == 0 )
+	{
+		QMessageBox::information( this, windowTitle(), tr( "Choose a non-zero score change." ) );
+		return;
+	}
+	const auto reason = card.scoreReason->text().trimmed();
+	if( m_scoreSink( seat, delta, reason ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "Could not save the score change. Nothing was changed." ) );
+		return;
+	}
+	cancelScore( seat );
 	refresh();
+}
+
+
+void ClassroomSeatGrid::cancelScore( const QString& seat )
+{
+	const auto it = m_cards.find( seat );
+	if( it != m_cards.end() ) { it.value().scoreEditor->hide(); }
+	if( m_activeScoreSeat == seat ) { m_activeScoreSeat.clear(); }
+}
+
+
+int ClassroomSeatGrid::columnCount() const
+{
+	const auto available = qMax( MinimumCardWidth, m_gridPage->width() );
+	const auto cardWidth = m_thumbWidth + 16;
+	return qMax( 1, ( available + CardSpacing ) / ( cardWidth + CardSpacing ) );
+}
+
+
+void ClassroomSeatGrid::reflow()
+{
+	if( m_cards.isEmpty() ) { return; }
+	const auto columns = columnCount();
+	int index = 0;
+	for( auto it = m_cards.begin(); it != m_cards.end(); ++it )
+	{
+		auto* card = it.value().root;
+		m_grid->removeWidget( card );
+		m_grid->addWidget( card, index / columns, index % columns );
+		++index;
+	}
+}
+
+
+void ClassroomSeatGrid::updateZoom( int index )
+{
+	if( m_zoomCombo == nullptr ) { return; }
+	const auto zoom = m_zoomCombo->itemData( index ).toInt();
+	if( zoom <= 0 ) { return; }
+	m_thumbWidth = qRound( 168.0 * zoom / 100.0 );
+	m_thumbHeight = qRound( 105.0 * zoom / 100.0 );
+	QSettings settings( QStringLiteral("ikeback"), QStringLiteral("classroom") );
+	settings.setValue( QStringLiteral("seatZoom"), zoom );
+	rebuild();
+}
+
+
+void ClassroomSeatGrid::resizeEvent( QResizeEvent* event )
+{
+	QWidget::resizeEvent( event );
+	reflow();
 }
 
 

@@ -26,6 +26,7 @@
 #include <QDesktopServices>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QMessageBox>
 
 #include "BuiltinFeatures.h"
@@ -445,7 +446,7 @@ QString FileTransferPlugin::destinationDirectory() const
 
 FileTransferPlugin::LockedFileAction FileTransferPlugin::queryLockedFileAction(const QString& fileName)
 {
-	qApp->setQuitOnLastWindowClosed(false);
+	QGuiApplication::setQuitOnLastWindowClosed(false);
 
 	const auto processId = IkebackCore::platform().filesystemFunctions().findFileLockingProcess(fileName);
 	const auto applicationName = IkebackCore::platform().coreFunctions().getApplicationName(processId);

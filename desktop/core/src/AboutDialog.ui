@@ -183,80 +183,72 @@ Copyright © 2004-2026 Tobias Junghans / Veyon Solutions</string>
        </item>
       </layout>
      </widget>
-     <widget class="QWidget" name="tab_2">
+     <widget class="QWidget" name="sponsorTab">
       <attribute name="icon">
        <iconset resource="../resources/core.qrc">
-        <normaloff>:/core/user-group-new.png</normaloff>:/core/user-group-new.png</iconset>
+        <normaloff>:/core/help-about.png</normaloff>:/core/help-about.png</iconset>
       </attribute>
       <attribute name="title">
-       <string>Contributors</string>
+       <string>Sponsor</string>
       </attribute>
-      <layout class="QGridLayout">
+      <layout class="QVBoxLayout" name="sponsorLayout">
+       <property name="spacing">
+        <number>12</number>
+       </property>
        <property name="leftMargin">
-        <number>9</number>
+        <number>28</number>
        </property>
        <property name="topMargin">
-        <number>9</number>
+        <number>28</number>
        </property>
        <property name="rightMargin">
-        <number>9</number>
+        <number>28</number>
        </property>
        <property name="bottomMargin">
-        <number>9</number>
+        <number>28</number>
        </property>
-       <property name="spacing">
-        <number>6</number>
-       </property>
-       <item row="0" column="0">
-        <widget class="QPlainTextEdit" name="authors">
-         <property name="frameShape">
-          <enum>QFrame::NoFrame</enum>
+       <item>
+        <widget class="QLabel" name="sponsorHeading">
+         <property name="text">
+          <string>支持 ikeback课堂</string>
          </property>
-         <property name="readOnly">
-          <bool>true</bool>
+         <property name="alignment">
+          <set>Qt::AlignHCenter|Qt::AlignTop</set>
          </property>
         </widget>
        </item>
-      </layout>
-     </widget>
-     <widget class="QWidget" name="tab_3">
-      <attribute name="icon">
-       <iconset resource="../resources/core.qrc">
-        <normaloff>:/core/languages.png</normaloff>:/core/languages.png</iconset>
-      </attribute>
-      <attribute name="title">
-       <string>Translation</string>
-      </attribute>
-      <layout class="QVBoxLayout" name="verticalLayout">
-       <property name="spacing">
-        <number>6</number>
-       </property>
-       <property name="leftMargin">
-        <number>24</number>
-       </property>
-       <property name="topMargin">
-        <number>24</number>
-       </property>
-       <property name="rightMargin">
-        <number>24</number>
-       </property>
-       <property name="bottomMargin">
-        <number>24</number>
-       </property>
        <item>
-        <widget class="QLabel" name="label_5">
+        <widget class="QLabel" name="sponsorText">
          <property name="text">
-          <string>Current language not translated yet (or native English).
-
-If you're interested in translating ikeback into your local or another language or want to improve an existing translation, please contact a ikeback developer!</string>
+          <string>如果这个课堂工具对你有帮助，欢迎通过项目主页赞助、反馈或贡献代码。&#10;&#10;本程序不会在应用内收取任何费用，也不会跳转到第三方支付页面。</string>
          </property>
          <property name="alignment">
-          <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignTop</set>
+          <set>Qt::AlignHCenter|Qt::AlignTop</set>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
          </property>
         </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="sponsorButton">
+         <property name="text">
+          <string>访问项目主页</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="sponsorSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
        </item>
       </layout>
      </widget>

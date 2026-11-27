@@ -45,6 +45,8 @@ public:
 	virtual QWidget* mainWindow() = 0;
 	virtual Configuration::Object* userConfigurationObject() = 0;
 	virtual void reloadSubFeatures() = 0;
+	virtual void setClassroomPage( QWidget* page ) = 0;
+	virtual void setClassroomMode( bool active ) = 0;
 
 	virtual ComputerControlInterface& localSessionControlInterface() = 0;
 

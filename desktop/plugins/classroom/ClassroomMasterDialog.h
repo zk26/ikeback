@@ -19,6 +19,7 @@
 #include <QVector>
 
 #include "ClassroomData.h"
+#include "ComputerControlInterface.h"
 
 #include <functional>
 
@@ -32,13 +33,15 @@ class QProgressBar;
 class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
+class QListWidget;
 class QSpinBox;
-class QTabWidget;
+class QStackedWidget;
 class QTableWidget;
 class QTimer;
 class ClassroomAiClient;
 class ClassroomBridge;
 class ClassroomScorePanel;
+class ClassroomShopPanel;
 class ClassroomSeatGrid;
 class ComputerControlInterface;
 class ClassroomConfiguration;
@@ -80,8 +83,12 @@ public:
 	//! a QMenu so the same code is not duplicated as tool-bar buttons.
 	QVector<QuickToolGroup> quickToolGroups() const { return m_quickToolGroups; }
 	//! Runs one quick-tool action by its stable id (tool-bar button click).
-	bool runQuickTool( const QString& id );
-	void startCheckInFromToolBar() { startCheckIn(); }
+	bool runQuickTool( const QString& id, const ComputerControlInterfaceList& targets );
+	void startCheckInFromToolBar();
+	void beginLesson();
+	void endLesson();
+	bool lessonActive() const { return m_lessonActive; }
+	Q_INVOKABLE void showPage( const QString& pageName );
 
 	void showCall( const QString& ip, const QString& seat, const QString& student );
 	//! 名册文件被配置器更新后重新加载并同步到所有界面。
@@ -96,8 +103,11 @@ public:
 	void runConnectivityCheck();
 	//! Restarts the Windows service with the bundled CLI (needs elevation).
 	void restartService();
-	//! Asks for an installer and pushes it to the students (remote install).
+	//! Asks for a portable folder and deploys it to C:\IkebackApps.
 	void deployInstaller();
+	void recordPackageResult( const QString& ip, const QString& phase, bool success, const QString& detail );
+	void recordProtectionState( const QString& ip, bool enabled );
+	void restoreProtectionStates( const QMap<QString, bool>& states );
 	//! 学生机真实安装回执，用于替代定时器误报完成。
 	void recordInstallResult( const QString& ip, bool success, const QString& detail );
 	//! 5.2.2: compact dialog with teacher operations and their results
@@ -105,6 +115,13 @@ public:
 	void openOperationLog();
 	//! Switches to the Quick tools tab ("常用工具" button).
 	void showQuickToolsTab();
+	//! Sends the catalog of `className` (default: the selected class) to every
+	//! online student.
+	void broadcastShopState( const QString& className = QString{} );
+	//! Refreshes the shop tables after a student redeem/bid changed the book.
+	void refreshShopPanel();
+	//! A redemption moved a student's score: republish it to the seat grid.
+	void refreshScoresAfterShop() { refreshSeatGrid(); }
 
 	// Toggle state kept by the tool-bar buttons, so one click flips the
 	// behaviour instead of offering a separate "on" and "off" button.
@@ -124,6 +141,7 @@ Q_SIGNALS:
 
 private:
 	void setupClassTab();
+	void addPage( QWidget* page, const QString& label, int index = -1, const QString& key = QString{} );
 	void setupLogTab();
 	void setupAnalysisTab();
 	void setupAiTab();
@@ -137,6 +155,9 @@ private:
 	void setupTimetableTab();
 	void refreshLessonRecords();
 	QString timetableFilePath() const;
+
+	//! 5.3.0 class shop and auctions: management tab plus catalog broadcast.
+	void setupShopTab();
 
 	//! 5.2.0 quick tools. "Client protection" and "UWF" are separate switches.
 	void setupToolsTab();
@@ -169,10 +190,12 @@ private:
 		Transfer,
 		WaitInstall,
 		EnableUwf,
-		RebootAfterEnable
+		RebootAfterEnable,
+		WaitVerify
 	};
 	void advanceDeploy();
 	QString installSummaryText() const;
+	int deployOnlineCount() const;
 	void finishDeploy( const QString& result );
 
 	QString dataDirectory() const;
@@ -244,17 +267,24 @@ private:
 	ClassroomSettings& m_settings;
 	ClassroomAiClient* m_testAiClient = nullptr;
 	ClassroomScorePanel* m_scorePanel = nullptr;
+	ClassroomShopPanel* m_shopPanel = nullptr;
 	ClassroomBridge* m_bridge = nullptr;
 	QTimer* m_refreshTimer = nullptr;
 
 	QString m_sessionId;
+	QString m_currentLessonId;
+	bool m_lessonActive = false;
+	ComputerControlInterfaceList m_actionTargets;
+	bool m_actionTargetsActive = false;
 	int m_refreshTicks = 0;
 	QMap<QString, QString> m_status;
 	QMap<QString, QSharedPointer<ComputerControlInterface>> m_directInterfaces;
 	QVector<ClassroomEvent> m_logEvents;
 	QVector<ClassroomInterestProfile> m_profiles;
 
-	QTabWidget* m_tabs = nullptr;
+	QListWidget* m_navigation = nullptr;
+	QStackedWidget* m_tabs = nullptr;
+	QWidget* m_toolsPage = nullptr;
 
 	QComboBox* m_classCombo = nullptr;
 	QTableWidget* m_rosterTable = nullptr;
@@ -288,14 +318,12 @@ private:
 	QCheckBox* m_captureWindowTitle = nullptr;
 	QCheckBox* m_captureProcess = nullptr;
 	QCheckBox* m_exitProtection = nullptr;
-	QCheckBox* m_exitRequiresAdmin = nullptr;
 	QCheckBox* m_allowSelfLogin = nullptr;
 	QLineEdit* m_exitAdminUsername = nullptr;
 	//! Super-admin key (超级管理员密钥) gating protected exit on students.
 	QLineEdit* m_adminKey = nullptr;
 	QSpinBox* m_captureInterval = nullptr;
 	QSpinBox* m_retentionDays = nullptr;
-	QLineEdit* m_dataDirectory = nullptr;
 
 	QLabel* m_systemStatus = nullptr;
 	QLabel* m_connectivityLabel = nullptr;
@@ -320,6 +348,7 @@ private:
 	QLineEdit* m_toolSoftware = nullptr;
 	QLineEdit* m_toolWebsite = nullptr;
 	QMap<QString, QString> m_uwfStatus; //!< seat -> latest UWF report from that machine
+	QMap<QString, bool> m_protectionStatus;
 	QLineEdit* m_lessonTopic = nullptr;
 	QPlainTextEdit* m_lessonRecords = nullptr;
 	QLabel* m_timetableSummary = nullptr;
@@ -330,15 +359,28 @@ private:
 
 	//! Remote deployment state (see DeployPhase).
 	QTimer* m_deployTimer = nullptr;
-	QFile* m_deploySource = nullptr;
+	ComputerControlInterfaceList m_deployTargets;
+	QJsonObject m_deployManifest;
+	QJsonArray m_deployFiles;
+	QString m_deployFolder;
+	QString m_deploySourceFolder;
+	QString m_deployId;
 	QString m_deployArgs;
-	bool m_deployUwfFlow = false;
+	QFile* m_deploySource = nullptr;
+	int m_deployFileIndex = 0;
+	qint64 m_deployFileOffset = 0;
+	qint64 m_deployTotalBytes = 0;
+	qint64 m_deploySentBytes = 0;
+	bool m_deployUwfFlow = true;
 	DeployPhase m_deployPhase = DeployPhase::Idle;
 	int m_deployWaitTicks = 0;
 	int m_deployExpected = 0;
 	int m_deploySuccess = 0;
 	int m_deployFailure = 0;
 	QSet<QString> m_deployReported;
+	QSet<QString> m_deployVerified;
+	int m_deployVerifySuccess = 0;
+	int m_deployVerifyFailure = 0;
 	QString m_deployInstallSummary;
 	//! 安装期间显示的进度弹窗：窗口模态，禁止教师误操作其他设置。
 	QDialog* m_deployProgressDialog = nullptr;

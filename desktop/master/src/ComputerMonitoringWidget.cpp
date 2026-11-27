@@ -32,6 +32,7 @@
 #include "ComputerItemDelegate.h"
 #include "ComputerMonitoringModel.h"
 #include "ComputerMonitoringWidget.h"
+#include "MainWindow.h"
 #include "IkebackMaster.h"
 #include "FeatureManager.h"
 #include "IkebackConfiguration.h"
@@ -240,7 +241,9 @@ void ComputerMonitoringWidget::populateFeatureMenu( const ComputerControlInterfa
 
 	for( const auto& feature : master()->features() )
 	{
-		if( feature.testFlag( Feature::Flag::Meta ) )
+		if( MainWindow::isFeatureSuppressed( feature ) || MainWindow::isClassroomQuickAction( feature ) ||
+			feature.name().compare( QStringLiteral("ClassroomConsole"), Qt::CaseInsensitive ) == 0 ||
+			feature.name().compare( QStringLiteral("ClassroomCheckIn"), Qt::CaseInsensitive ) == 0 )
 		{
 			continue;
 		}

@@ -14,6 +14,7 @@
 #include <QVBoxLayout>
 
 #include "ClassroomSignInDialog.h"
+#include "ClassroomTheme.h"
 
 
 ClassroomSignInDialog::ClassroomSignInDialog( const QStringList& classNames,
@@ -29,6 +30,8 @@ ClassroomSignInDialog::ClassroomSignInDialog( const QStringList& classNames,
 	m_buttons( new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this ) )
 {
 	setWindowTitle( tr( "学生登录" ) );
+	setObjectName( QStringLiteral("classroomSignIn") );
+	Classroom::Theme::apply( this );
 	setMinimumWidth( 400 );
 
 	m_classCombo->addItems( classNames );

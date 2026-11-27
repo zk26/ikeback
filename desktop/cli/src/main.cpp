@@ -23,6 +23,9 @@
  */
 
 #include <QApplication>
+#include <QCryptographicHash>
+#include <QFile>
+#include <QSettings>
 
 #include <openssl/crypto.h>
 
@@ -56,6 +59,29 @@ int main( int argc, char **argv )
 #endif
 
 	const auto arguments = QCoreApplication::arguments();
+
+#ifdef Q_OS_WIN
+	if( arguments.count() == 3 && arguments.at( 1 ) == QLatin1String("--verify-exit-password") )
+	{
+		QFile passwordFile( arguments.at( 2 ) );
+		if( passwordFile.open( QIODevice::ReadOnly ) == false ) { return 2; }
+		const auto bytes = passwordFile.readAll();
+		if( bytes.size() % 2 != 0 ) { return 2; }
+		const auto password = QString::fromUtf16(
+			reinterpret_cast<const char16_t*>( bytes.constData() ), bytes.size() / 2 );
+		QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
+						   QSettings::Registry64Format );
+		const auto expected = machine.value( QStringLiteral("AdminKeyHash") ).toString().trimmed().toLatin1();
+		const auto actual = QCryptographicHash::hash( password.toUtf8(), QCryptographicHash::Sha256 ).toHex();
+		if( expected.isEmpty() || actual.size() != expected.size() ) { return 1; }
+		unsigned char difference = 0;
+		for( int index = 0; index < actual.size(); ++index )
+		{
+			difference = static_cast<unsigned char>( difference | ( actual.at( index ) ^ expected.at( index ) ) );
+		}
+		return difference == 0 ? 0 : 1;
+	}
+#endif
 
 	if( arguments.count() == 2 )
 	{
