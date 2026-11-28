@@ -297,7 +297,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           case "$VERSION" in
             [0-9]*) : ;;
-            *) VERSION=5.3.0 ;;
+            *) VERSION=5.3.1 ;;
           esac
           if ! makensis -DVERSION="$VERSION" -DROLE=teacher installer.nsi > nsis.log 2>&1; then
             cat nsis.log

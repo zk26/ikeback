@@ -24,7 +24,7 @@ Unicode true
 !include "nsDialogs.nsh"
 
 !ifndef VERSION
-  !define VERSION "5.2.1"
+  !define VERSION "5.3.1"
 !endif
 !ifndef ROLE
   !define ROLE "teacher"

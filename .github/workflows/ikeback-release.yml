@@ -2,8 +2,8 @@ name: ikeback Release
 
 # Publishes THREE real, compiled artifacts on tag push / manual dispatch:
 #   - Android APK                 (Ubuntu + JDK21 + Android SDK)
-#   - Windows teacher ZIP         (MSYS2 UCRT64 + Qt6/MinGW)
-#   - Windows student ZIP         (same binaries, different preset config)
+#   - Windows teacher setup EXE   (MSYS2 UCRT64 + Qt6/MinGW)
+#   - Windows student setup EXE   (same binaries, different role preset)
 # plus SHA256SUMS.txt and RELEASE-NOTES.md.
 #
 # Must live at the REPOSITORY ROOT .github/workflows/ to be triggered.
@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version without the v prefix (e.g. 5.3.0)'
+        description: 'Version without the v prefix (e.g. 5.3.1)'
         required: true
-        default: '5.3.0'
+        default: '5.3.1'
       purge_old_releases:
         description: 'After publishing, delete every GitHub release older than 5.2.0'
         required: false
@@ -146,7 +146,7 @@ jobs:
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           AAPT2="$BUILD_TOOLS/aapt2"
           APKSIGNER="$BUILD_TOOLS/apksigner"
-          # The published APK must be signed, non-debuggable and match 5.3.0.
+          # The published APK must be signed, non-debuggable and match the canonical release.
           "$APKSIGNER" verify --verbose --print-certs dist/ikeback-Mobile.apk
           BADGING=$("$AAPT2" dump badging dist/ikeback-Mobile.apk)
           grep -q "^package: name='top.ikee002.ikeback' versionCode='$VERSION_CODE' versionName='$VERSION_NAME'" <<< "$BADGING" || {
@@ -428,8 +428,9 @@ jobs:
         shell: pwsh
         run: |
           $v = '${{ needs.version.outputs.name }}'
+          $code = '${{ needs.version.outputs.code }}'
           $template = [IO.File]::ReadAllText('desktop/scripts/release-notes-template.md', [Text.Encoding]::UTF8)
-          $notes = $template.Replace('{VER}', $v)
+          $notes = $template.Replace('{VER}', $v).Replace('{CODE}', $code)
           [IO.File]::WriteAllText('dist/RELEASE-NOTES.md', $notes, (New-Object Text.UTF8Encoding($false)))
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
