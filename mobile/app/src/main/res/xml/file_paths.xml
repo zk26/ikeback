@@ -4,4 +4,8 @@
     <external-files-path
         name="documents"
         path="Documents/" />
+    <!-- Export fallback when external app-specific storage is unavailable. -->
+    <files-path
+        name="internal_documents"
+        path="documents/" />
 </paths>

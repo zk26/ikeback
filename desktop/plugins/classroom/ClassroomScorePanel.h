@@ -8,6 +8,7 @@
 
 #include <QByteArray>
 #include <QDate>
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QWidget>
 
@@ -55,7 +56,9 @@ private:
 	void setupRichTextTools( QTextEdit* editor, QBoxLayout* layout );
 
 	void refreshStudentTable();
+	void queueStudentTableRefresh();
 	void ensureLesson();
+	bool ensureLessonLocked();
 	void addEntry( int delta, const QString& label );
 	void saveRules();
 	void generateCloud();
@@ -70,9 +73,14 @@ private:
 	ClassroomLogStore& m_store;
 	QJsonObject m_settings;
 	mutable ClassroomScoreBook m_book;
+	mutable QElapsedTimer m_bookReloadTimer;
+	static constexpr int BookReloadIntervalMs = 500;
+
+	void ensureBookFresh() const;
 	QString m_className;
 	QString m_lessonId;
 	bool m_lessonPinned = false;
+	bool m_studentTableRefreshQueued = false;
 
 	QTabWidget* m_tabs = nullptr;
 	QDateEdit* m_lessonDate = nullptr;
@@ -81,6 +89,7 @@ private:
 	QSpinBox* m_delta = nullptr;
 	QTextEdit* m_detail = nullptr;
 	QLabel* m_callLabel = nullptr;
+	QLabel* m_emptyState = nullptr;
 
 	QSpinBox* m_baseScore = nullptr;
 	QCheckBox* m_publish = nullptr;

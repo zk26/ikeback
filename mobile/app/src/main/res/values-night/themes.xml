@@ -7,9 +7,8 @@
         <item name="android:colorBackground">@color/ikeback_background</item>
         <item name="android:textColorPrimary">@color/ikeback_title</item>
         <item name="android:textColorSecondary">@color/ikeback_body</item>
-        <!-- The palette is still light in night mode, so keep dark status icons. -->
         <item name="android:statusBarColor">@android:color/transparent</item>
-        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowBackground">@color/ikeback_background</item>
     </style>
 </resources>

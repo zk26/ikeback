@@ -56,6 +56,7 @@ public:
 	static constexpr int DefaultFileRotationCount = 10;
 	static constexpr int MaximumMessageSize = 16384;
 	static constexpr const char* DefaultLogFileDirectory = "%TEMP%";
+	static QString resolvedLogFileDirectory( const QString& configuredDirectory );
 
 	explicit Logger( const QString &appName );
 	~Logger();

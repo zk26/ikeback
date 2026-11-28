@@ -275,6 +275,14 @@ private:
 
 	// queue for RFB and custom events
 	QQueue<VncEvent *> m_eventQueue;
+	int m_eventQueueBytes = 0;
+	QAtomicInt m_droppedEvents;
+
+	static constexpr int MaxQueuedEvents = 10000;
+	static constexpr int MaxQueuedEventBytes = 4 * 1024 * 1024;
+
+	void clearEventQueue();
+	void clearEventQueueLocked();
 
 	// framebuffer data and thread synchronization objects
 	QImage m_framebuffer{}; // LibVNCClient's buffer, written by the connection thread only

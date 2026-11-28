@@ -11,7 +11,10 @@
 #include <QHash>
 #include <QHostAddress>
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <QObject>
+#include <QPointer>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 
@@ -46,6 +49,14 @@ public:
 	{
 		MaxHeaderBytes = 16 * 1024,
 		MaxBodyBytes = 1024 * 1024,
+		MaxConnections = 64,
+		MaxConnectionsPerIp = 4,
+		MaxPendingConnections = 16,
+		MaxAsyncRequests = 4,
+		MaxIssuedNonces = 4096,
+		MaxAuthFailurePeers = 1024,
+		NonceIssueIntervalMs = 1000,
+		RequestReadTimeoutMs = 10000,
 		NonceLifetimeSeconds = 300,
 		AuthLockSeconds = 60,
 		AuthFailureLimit = 10
@@ -81,6 +92,8 @@ Q_SIGNALS:
 private:
 	void acceptConnection();
 	void readRequest();
+	void expireRequests();
+	void releaseConnection( QTcpSocket* socket );
 	void writeResponse( QTcpSocket* socket, int statusCode, const QByteArray& reason,
 						const QByteArray& body, const QByteArray& contentType );
 	void respond( QTcpSocket* socket, const QByteArray& body,
@@ -96,13 +109,14 @@ private:
 	void readDiscovery();
 	QByteArray announcementPayload();
 	qint64 revision() const;
-	QJsonObject stateObject();
+	QJsonObject stateObject( const QString& peer );
 	QString timetableFilePath() const;
 	void handleCommand( const QJsonObject& command, bool* handled );
 	bool authorized( const QHostAddress& peer, const QStringList& headerLines, const QString& method,
 					 const QString& pathAndQuery, const QByteArray& body );
-	QString issueNonce();
+	QString issueNonce( const QString& peer );
 	void noteAuthFailure( const QString& peer );
+	void purgeAuthFailures();
 	void purgeStaleNonces();
 	void rotateNonce();
 
@@ -111,7 +125,6 @@ private:
 	ClassroomLogStore& m_store;
 	IkebackMasterInterface& m_master;
 	QJsonObject m_settings;
-	ClassroomScoreBook m_book;
 	QString m_className;
 	QString m_teacherId;
 	QString m_sessionKey;
@@ -119,17 +132,30 @@ private:
 	QDateTime m_nonceIssued;
 
 	//! One-time challenges issued by /state. A nonce is removed on first use,
-	//! so a captured request cannot be replayed even inside the old 120 s window.
+	//! so a captured request cannot be replayed inside its lifetime.
 	QHash<QString, QDateTime> m_issuedNonces;
+	QHash<QString, QElapsedTimer> m_nonceIssuedByPeer;
 	struct AuthFailure
 	{
 		int count = 0;
+		QDateTime lastFailure;
 		QDateTime lockUntil;
 	};
 	//! Failure counting is per source IP: one student machine cannot lock out
 	//! every phone on the LAN.
 	QHash<QString, AuthFailure> m_authFailures;
 	QHash<QTcpSocket*, QByteArray> m_buffers;
+	QHash<QTcpSocket*, QElapsedTimer> m_readStarted;
+	QHash<QTcpSocket*, QElapsedTimer> m_responseStarted;
+	struct ResponseContext
+	{
+		QString nonce;
+		QString key;
+	};
+	QHash<QTcpSocket*, ResponseContext> m_responseContexts;
+	QHash<QString, int> m_connectionsPerPeer;
+	QSet<QTcpSocket*> m_asyncSockets;
+	int m_asyncJobs = 0;
 
 	QTcpServer* m_server = nullptr;
 	QUdpSocket* m_udp = nullptr;

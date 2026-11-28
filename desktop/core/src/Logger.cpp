@@ -26,6 +26,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QStandardPaths>
 
 #include "IkebackConfiguration.h"
 #include "Filesystem.h"
@@ -137,9 +138,22 @@ Logger::LogLevel Logger::logLevelFromString(const QString& logLevelString)
 
 
 
+QString Logger::resolvedLogFileDirectory( const QString& configuredDirectory )
+{
+#ifdef Q_OS_WIN
+	if( configuredDirectory == QLatin1String( Logger::DefaultLogFileDirectory ) )
+	{
+		return QDir( QStandardPaths::writableLocation( QStandardPaths::AppLocalDataLocation ) ).
+			filePath( QStringLiteral("ikeback/logs") );
+	}
+#endif
+	return IkebackCore::filesystem().expandPath( configuredDirectory );
+}
+
+
 void Logger::initLogFile()
 {
-	QString logPath = IkebackCore::filesystem().expandPath( IkebackCore::config().logFileDirectory() );
+	QString logPath = resolvedLogFileDirectory( IkebackCore::config().logFileDirectory() );
 
 	QFileInfo logDirInfo(logPath);
 
@@ -164,21 +178,31 @@ void Logger::initLogFile()
 		return;
 	}
 
-	if (!QDir(logPath).exists())
+	const bool logDirectoryExisted = QDir(logPath).exists();
+	if (logDirectoryExisted == false)
 	{
-		if (QDir(QDir::rootPath()).mkdir(logPath))
-		{
-			QFile::setPermissions(logPath,
-								  QFile::ReadOwner  | QFile::WriteOwner | QFile::ExeOwner |
-								  QFile::ReadUser   | QFile::WriteUser  | QFile::ExeUser  |
-								  QFile::ReadGroup  | QFile::WriteGroup | QFile::ExeGroup |
-								  QFile::ReadOther  | QFile::WriteOther | QFile::ExeOther);
-		}
-		else
+		if (QDir().mkpath(logPath) == false)
 		{
 			vCritical() << "Could not create log directory" << logPath;
 			return;
 		}
+	}
+
+	// Never replace ACLs on an existing shared directory such as %TEMP%.
+	if (logDirectoryExisted == false)
+	{
+#ifdef Q_OS_WIN
+	const bool permissionsSet = IkebackCore::platform().filesystemFunctions().setFileOwnerGroupPermissions(
+				logPath, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner );
+#else
+	const bool permissionsSet = QFile::setPermissions(logPath,
+							  QFile::ReadOwner  | QFile::WriteOwner | QFile::ExeOwner);
+#endif
+	if( permissionsSet == false )
+	{
+		vCritical() << "Could not secure log directory" << logPath;
+		return;
+	}
 	}
 
 	logPath += QDir::separator();

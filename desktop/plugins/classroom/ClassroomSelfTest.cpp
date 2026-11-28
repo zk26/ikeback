@@ -9,12 +9,15 @@
 #include <QImage>
 #include <QDate>
 #include <QDir>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QJsonDocument>
+#include <QLockFile>
 #include <QTemporaryDir>
 #include <QTextStream>
 
 #include "ClassroomBridge.h"
+#include "ClassroomConfiguration.h"
 #include "ClassroomData.h"
 #include "ClassroomProtocol.h"
 #include "ClassroomScore.h"
@@ -23,6 +26,7 @@
 #include "ClassroomTermReport.h"
 #include "ClassroomWordCloud.h"
 
+#include <algorithm>
 #include <cstdio>
 
 
@@ -52,21 +56,34 @@ int main( int argc, char** argv )
 		   QStringLiteral("a&lt;b&gt;&amp;&quot;"), "xml escaping" );
 	check( ClassroomSecrets::reveal( QStringLiteral("plain-key") ) == QStringLiteral("plain-key"),
 		   "legacy plain secrets stay readable" );
-	check( ClassroomSecrets::defaultAdminKey() == QStringLiteral("Admin@123") &&
-		   ClassroomSecrets::verifyAdminKey( ClassroomSecrets::defaultAdminKey(),
-										 ClassroomSecrets::defaultAdminKeyHash() ),
-		   "default student administrator password is valid" );
+	check( ClassroomSecrets::defaultAdminKey().isEmpty() &&
+		   ClassroomSecrets::defaultAdminKeyHash().isEmpty() &&
+		   ClassroomSecrets::verifyAdminKey( QStringLiteral("Admin@123"), QString{} ) == false,
+		   "student administrator authentication fails closed without a configured password" );
+	const auto configuredAdminHash = ClassroomSecrets::adminKeyHash( QStringLiteral("teacher-only-secret") );
+	check( configuredAdminHash.isEmpty() == false &&
+		   ClassroomSecrets::verifyAdminKey( QStringLiteral("teacher-only-secret"), configuredAdminHash ) &&
+		   ClassroomSecrets::verifyAdminKey( QStringLiteral("wrong"), configuredAdminHash ) == false &&
+		   ClassroomSecrets::verifyAdminKey( QStringLiteral("Admin@123"),
+				QString::fromLatin1( QCryptographicHash::hash( QByteArrayLiteral("Admin@123"),
+					QCryptographicHash::Sha256 ).toHex() ) ) == false,
+		   "configured administrator passwords verify and the retired default is rejected" );
 	const auto defaultStudentSettings = ClassroomSettings::forStudents( QJsonObject{} );
-	check( defaultStudentSettings.value( Classroom::SettingKey::adminKeyHash() ).toString() ==
-			   ClassroomSecrets::defaultAdminKeyHash() &&
+	check( defaultStudentSettings.value( Classroom::SettingKey::adminKeyHash() ).toString().isEmpty() &&
 		   defaultStudentSettings.contains( Classroom::SettingKey::adminKey() ) == false,
-		   "student settings always carry a password digest and never the plain password" );
+		   "student settings never carry a default password or plain password" );
 	// Shared HMAC reference vector with mobile/IkebackCryptoTest.
 	const auto referenceToken = ClassroomSecrets::requestToken(
 		QStringLiteral("ABC123"), QStringLiteral("GET"), QStringLiteral("/api/classroom/state"),
 		QStringLiteral("nonce-0001"), QByteArray() );
 	check( referenceToken == QByteArrayLiteral("bd41d1e94c8c04a9ae857dce47c9f1d6907b65cfcd5c1bcbd8d08711a7c14e50"),
 		   "request-bound HMAC matches the Kotlin reference" );
+	const auto referenceResponse = ClassroomSecrets::responseToken(
+		QStringLiteral("ABC123"), QStringLiteral("nonce-0002"),
+		QStringLiteral("1700000000"), QByteArrayLiteral("{\"ok\":true}") );
+	check( referenceResponse ==
+		   QByteArrayLiteral("b35ec4ba272a86a16ecc54d358f4ff721e7e1e816aabfa55c0f6f631d45483cb"),
+		   "response HMAC matches the Kotlin reference over exact bytes" );
 	check( referenceToken.contains( QByteArrayLiteral("ABC123") ) == false,
 		   "auth token never contains the plain lesson key" );
 	check( ClassroomSecrets::requestToken( QStringLiteral("ABC123"), QStringLiteral("POST"),
@@ -414,6 +431,22 @@ int main( int argc, char** argv )
 	check( shopSpend == -10, "score book holds the net shop spend" );
 	check( hasShopLabel, "score entry carries the shop label" );
 
+	const auto idempotentBalance = shop.balance( QStringLiteral("1") );
+	const auto idempotentStock = shop.product( pen.id )->stock;
+	const auto idempotentRedemptions = shop.redemptions().size();
+	check( shop.redeem( pen.id, QStringLiteral("1"), QStringLiteral("Zhang"), idempotentBalance,
+					   QStringLiteral("stable-operation-1") ).isEmpty() &&
+		   shop.redeem( pen.id, QStringLiteral("1"), QStringLiteral("Zhang"), shop.balance( QStringLiteral("1") ),
+					   QStringLiteral("stable-operation-1") ).isEmpty() &&
+		   shop.product( pen.id )->stock == idempotentStock - 1 &&
+		   shop.redemptions().size() == idempotentRedemptions + 1 &&
+		   shop.balance( QStringLiteral("1") ) == idempotentBalance - pen.price,
+		   "a repeated stable operation id charges and restocks exactly once" );
+	check( shop.redeem( pen.id, QStringLiteral("2"), QStringLiteral("Li"), 100,
+					   QStringLiteral("stable-operation-1") ).isEmpty() == false &&
+		   shop.product( pen.id )->stock == idempotentStock - 1,
+		   "a stable operation id cannot be rebound to another student" );
+
 	// persistence across a reload
 	ClassroomShopBook reloaded( directory.path() );
 	check( reloaded.load( QStringLiteral("Class A") ), "shop book reload" );
@@ -440,8 +473,13 @@ int main( int argc, char** argv )
 		   value( QStringLiteral("image") ).toString().isEmpty() == false,
 		   "explicit catalog payload can carry the picture" );
 	check( catalogWithImages.value( QStringLiteral("products") ).toArray().first().toObject().
-		   value( QStringLiteral("stock") ).toInt() == 1,
+		   value( QStringLiteral("stock") ).toInt() == idempotentStock - 1,
 		   "catalog carries live stock" );
+	check( reloaded.redeem( pen.id, QStringLiteral("1"), QStringLiteral("Zhang"), reloaded.balance( QStringLiteral("1") ),
+							QStringLiteral("stable-operation-1") ).isEmpty() &&
+		   reloaded.product( pen.id )->stock == idempotentStock - 1 &&
+		   reloaded.redemptions().size() == idempotentRedemptions + 1,
+		   "completed operation ids remain idempotent after reload" );
 
 	QImage sourceImage( 320, 240, QImage::Format_RGB32 );
 	sourceImage.fill( Qt::red );
@@ -458,8 +496,9 @@ int main( int argc, char** argv )
 		   brokenFile.write( "{broken" ) == 7,
 		   "corrupt shop fixture written" );
 	brokenFile.close();
-	check( broken.load( QStringLiteral("Broken") ) == false && broken.isLoaded() == false,
-		   "corrupt shop data is rejected" );
+	check( broken.load( QStringLiteral("Broken") ) == false && broken.isLoaded() &&
+		   broken.products().isEmpty() && broken.auctions().isEmpty() && broken.redemptions().isEmpty(),
+		   "corrupt shop data is rejected without replacing the last valid state" );
 	check( brokenFile.open( QIODevice::ReadOnly ) && brokenFile.readAll() == QByteArrayLiteral("{broken"),
 		   "rejected load never overwrites corrupt data" );
 	brokenFile.close();
@@ -487,6 +526,421 @@ int main( int argc, char** argv )
 	check( recycledId.isEmpty() == false && history.auctions().size() == ClassroomShopBook::MaxStoredAuctions &&
 		   history.auction( recycledId )->open,
 		   "new auction recycles one closed history record" );
+
+	// ------------------------------------------------------- roster hardening
+	// Student-controlled text must not turn into a formula in Excel.
+	ClassroomEvent formulaEvent;
+	formulaEvent.timestamp = QDateTime( QDate( 2026, 11, 4 ), QTime( 9, 0 ) );
+	formulaEvent.student = QStringLiteral("=HYPERLINK(\"http://evil\")");
+	formulaEvent.detail = QStringLiteral("  +1|calc");
+	formulaEvent.className = QStringLiteral("Class A");
+	QString csvError;
+	check( ClassroomLogStore::exportCsv( QDir( directory.path() ).filePath( QStringLiteral("events.csv") ),
+										 { formulaEvent }, &csvError ) &&
+		   csvError.isEmpty(),
+		   "event log exports to csv" );
+	QFile exportedCsv( QDir( directory.path() ).filePath( QStringLiteral("events.csv") ) );
+	check( exportedCsv.open( QIODevice::ReadOnly ), "exported csv can be reopened" );
+	const auto exportedText = QString::fromUtf8( exportedCsv.readAll() );
+	exportedCsv.close();
+	check( exportedText.contains( QStringLiteral("\"'=HYPERLINK(\"\"http://evil\"\")\"") ) &&
+		   exportedText.contains( QStringLiteral("\"'  +1|calc\"") ),
+		   "csv export neutralises formula leads in student text" );
+
+	ClassroomRoster formulaRoster( directory.path() );
+	ClassroomClass formulaClass;
+	formulaClass.name = QStringLiteral("Class Z");
+	ClassroomStudent formulaStudent;
+	formulaStudent.seat = QStringLiteral("7");
+	formulaStudent.name = QStringLiteral("@SUM(1)");
+	formulaStudent.ip = QStringLiteral("192.168.1.70");
+	formulaClass.students.append( formulaStudent );
+	formulaRoster.classes().append( formulaClass );
+	ClassroomTermReport::Options formulaOptions;
+	formulaOptions.className = QStringLiteral("Class Z");
+	check( ClassroomTermReport::toCsv( formulaRoster, book, formulaOptions ).
+		   contains( QByteArrayLiteral("\"'@SUM(1)\"") ),
+		   "term report csv neutralises formula leads in names" );
+	ClassroomScoreEntry formulaEntry;
+	formulaEntry.lessonId = older;
+	formulaEntry.seat = QStringLiteral("3");
+	formulaEntry.student = QStringLiteral("Formula");
+	formulaEntry.delta = -1;
+	formulaEntry.label = QStringLiteral("=cmd");
+	book.addEntry( formulaEntry );
+	check( ClassroomTermReport::toDetailsCsv( book, options ).contains( QByteArrayLiteral("\"'=cmd\"") ),
+		   "term detail csv neutralises formula leads in reasons" );
+
+	// Imports are staged: a rejected row leaves the roster exactly as it was.
+	QTemporaryDir importDirectory;
+	check( importDirectory.isValid(), "import temporary directory" );
+	ClassroomRoster importRoster( importDirectory.path() );
+	ClassroomImportReport importReport;
+	check( importRoster.importTable( QStringLiteral("1;Bad;192.168.1\n"), {}, &importReport ) == false &&
+		   importRoster.classes().isEmpty() && importReport.problems.size() == 1,
+		   "invalid IP addresses are refused and leave no half-applied class" );
+	importReport = ClassroomImportReport{};
+	check( importRoster.importTable(
+			   QStringLiteral("班级;座位号;姓名;IP地址\n"
+							  "3年级1班;1;\"张\n三\";192.168.1.101\n"
+							  "3年级1班;2;李四;192.168.1.102\n"
+							  "3年级1班;1;张三;192.168.1.102\n"), {}, &importReport ) &&
+		   importRoster.classes().size() == 1 &&
+		   importRoster.findStudent( QStringLiteral("3年级1班"), QStringLiteral("1") )->name == QStringLiteral("张\n三") &&
+		   importRoster.findStudent( QStringLiteral("3年级1班"), QStringLiteral("1") )->ip == QStringLiteral("192.168.1.101") &&
+		   importReport.students == 2 && importReport.overwritten == 0 && importReport.ipConflicts == 1,
+		   "quoted line breaks are kept and a seat cannot take another seat's IP" );
+	const auto rosterJson = importRoster.toJson();
+	check( importRoster.importTable( QStringLiteral("姓名\n=只有人名\n"), {}, &importReport ) == false &&
+		   importRoster.toJson() == rosterJson,
+		   "an import that changes nothing does not rewrite the roster" );
+
+	QString manyRows = QStringLiteral("座位号;姓名\n");
+	for( int index = 0; index < 30; ++index ) { manyRows += QStringLiteral("%1;学生%2\n").arg( index ).arg( index ); }
+	importReport = ClassroomImportReport{};
+	check( importRoster.importTable( manyRows, QStringLiteral("大班"), &importReport ) &&
+		   importReport.problems.isEmpty(),
+		   "a regular class imports without warnings" );
+
+	// Storage keys must stay injective: two different class names never share
+	// one score or shop file, even when both sanitize to the same text.
+	check( ClassroomLogStore::storageKey( QStringLiteral("A:B") ) !=
+			   ClassroomLogStore::storageKey( QStringLiteral("A-B") ) &&
+			   ClassroomLogStore::storageKey( QStringLiteral("A:B") ) !=
+			   ClassroomLogStore::storageKey( QStringLiteral("A_B") ),
+		   "storage keys of different class names stay distinct" );
+	check( ClassroomLogStore::storageKey( QStringLiteral("3年级1班") ) ==
+			   QStringLiteral("3年级1班") &&
+		   ClassroomLogStore::sanitize( QStringLiteral("Class A") ) == QStringLiteral("Class_A"),
+		   "clean names keep their key and legacy log paths are unchanged" );
+	check( ClassroomLogStore::sanitize( QStringLiteral("") ) == QStringLiteral("unknown"),
+		   "empty names fall back to unknown" );
+
+	// A book stored under the old lossy key is migrated on first load.
+	const QString legacyName = ClassroomLogStore::sanitize( QStringLiteral("Class A") ) +
+							   QStringLiteral(".json");
+	const QString modernName = ClassroomLogStore::storageKey( QStringLiteral("Class A") ) +
+							   QStringLiteral(".json");
+	QTemporaryDir migrationDirectory;
+	check( migrationDirectory.isValid(), "migration temporary directory" );
+	const QString scoresDir = QDir( migrationDirectory.path() ).filePath( QStringLiteral("scores") );
+	check( QDir().mkpath( scoresDir ), "scores directory created" );
+	{
+		QFile legacyBook( QDir( scoresDir ).filePath( legacyName ) );
+		const QByteArray legacyBody( "{\"rules\":{},\"lessons\":[],\"entries\":[],\"attendance\":[]}" );
+		check( legacyBook.open( QIODevice::WriteOnly ) && legacyBook.write( legacyBody ) == legacyBody.size(),
+			   "legacy score book fixture written" );
+		legacyBook.close();
+	}
+	ClassroomScoreBook migratedBook( migrationDirectory.path() );
+	migratedBook.load( QStringLiteral("Class A") );
+	check( QFile( QDir( scoresDir ).filePath( modernName ) ).exists() &&
+		   QFile( QDir( scoresDir ).filePath( legacyName ) ).exists() == false,
+		   "legacy score book migrates to the injective key on load" );
+
+	// The staged roster is written in one step and reads back unchanged.
+	const auto stagedJson = importRoster.toJson();
+	check( importRoster.save(), "roster saves atomically" );
+	ClassroomRoster reloadedRoster( importDirectory.path() );
+	check( reloadedRoster.toJson() == stagedJson &&
+		   reloadedRoster.findStudent( QStringLiteral("大班"), QStringLiteral("29") ) != nullptr,
+		   "roster reload matches what was saved" );
+
+	// ------------------------------------------- transactional JSON persistence
+	// Rejected score books must preserve both the last good in-memory state and
+	// the exact bytes on disk, including truncated and wrong-shaped documents.
+	QTemporaryDir scoreDirectory;
+	check( scoreDirectory.isValid(), "score persistence temporary directory" );
+	ClassroomScoreBook stableBook( scoreDirectory.path() );
+	check( stableBook.load( QStringLiteral("Stable") ), "missing score book retains fresh-load semantics" );
+	check( stableBook.load( QStringLiteral("Stable") ), "an unsaved fresh score book can be reloaded before its first save" );
+	ClassroomScoreRules stableRules;
+	stableRules.baseScore = 87;
+	stableRules.html = QStringLiteral("<b>Stable rules</b>");
+	check( stableBook.setRules( stableRules ), "stable score rules saved" );
+	const auto stableLesson = stableBook.ensureLesson( QDate( 2026, 11, 5 ), QStringLiteral("Persistence") );
+	ClassroomScoreEntry stableEntry;
+	stableEntry.lessonId = stableLesson;
+	stableEntry.seat = QStringLiteral("1");
+	stableEntry.student = QStringLiteral("Stable student");
+	stableEntry.delta = 2;
+	stableEntry.label = QStringLiteral("stable entry");
+	check( stableBook.addEntry( stableEntry ), "stable score entry saved" );
+	ClassroomAttendance stableAttendance;
+	stableAttendance.lessonId = stableLesson;
+	stableAttendance.seat = QStringLiteral("1");
+	stableAttendance.student = QStringLiteral("Stable student");
+	stableAttendance.status = ClassroomAttendance::Present;
+	check( stableBook.setAttendance( stableAttendance ), "stable attendance saved" );
+	const auto stableSnapshot = QJsonDocument( stableBook.syncSnapshot() ).toJson( QJsonDocument::Compact );
+
+	const auto readFixture = []( const QString& path ) {
+		QFile file( path );
+		if( file.open( QIODevice::ReadOnly ) == false ) { return QByteArray{}; }
+		return file.readAll();
+	};
+	const auto writeFixture = []( const QString& path, const QByteArray& bytes ) {
+		QFile file( path );
+		if( file.open( QIODevice::WriteOnly | QIODevice::Truncate ) == false ) { return false; }
+		if( file.write( bytes ) != bytes.size() ) { return false; }
+		return file.flush();
+	};
+	const auto validScoreBytes = readFixture( stableBook.filePath( QStringLiteral("Stable") ) );
+	check( validScoreBytes.isEmpty() == false, "valid score fixture exists" );
+	const QVector<QByteArray> invalidScoreFixtures{
+		QByteArrayLiteral("{\"rules\":"),
+		QByteArrayLiteral("[]"),
+		QByteArrayLiteral("{}"),
+		QByteArrayLiteral("{\"rules\":{},\"lessons\":[],\"entries\":[]}"),
+		QByteArrayLiteral("{\"lessons\":[],\"entries\":[],\"attendance\":[{}]}"),
+		QByteArrayLiteral("{\"rules\":{},\"entries\":{}}"),
+		QByteArrayLiteral("{\"lessons\":[1]}"),
+		QByteArrayLiteral("{\"entries\":[{\"delta\":\"bad\"}]}"),
+		QByteArrayLiteral("{\"attendance\":[{\"status\":\"present\"}]}"),
+		QByteArrayLiteral("{\"rules\":{\"quickActions\":[[\"Good\",\"bad\"]]}}")
+	};
+	bool scoreCorruptionPreservedState = true;
+	bool scoreCorruptionPreservedBytes = true;
+	for( const auto& fixture : invalidScoreFixtures )
+	{
+		if( writeFixture( stableBook.filePath( QStringLiteral("Stable") ), fixture ) == false ||
+			stableBook.load( QStringLiteral("Stable") ) != false ||
+			stableBook.className() != QStringLiteral("Stable") ||
+			QJsonDocument( stableBook.syncSnapshot() ).toJson( QJsonDocument::Compact ) != stableSnapshot ||
+			readFixture( stableBook.filePath( QStringLiteral("Stable") ) ) != fixture )
+		{
+			scoreCorruptionPreservedState = false;
+			scoreCorruptionPreservedBytes = false;
+		}
+	}
+	check( scoreCorruptionPreservedState, "corrupt score JSON preserves prior lessons, entries, attendance and rules" );
+	check( scoreCorruptionPreservedBytes, "rejected score loads never rewrite corrupt bytes" );
+	check( writeFixture( stableBook.filePath( QStringLiteral("Stable") ), validScoreBytes ) &&
+		   stableBook.load( QStringLiteral("Stable") ) &&
+		   QJsonDocument( stableBook.syncSnapshot() ).toJson( QJsonDocument::Compact ) == stableSnapshot,
+		   "valid score bytes still load after corruption checks" );
+	check( QFile::remove( stableBook.filePath( QStringLiteral("Stable") ) ) &&
+		   stableBook.load( QStringLiteral("Stable") ) == false &&
+		   QJsonDocument( stableBook.syncSnapshot() ).toJson( QJsonDocument::Compact ) == stableSnapshot,
+		   "a disappeared score file never resets an already loaded book" );
+	check( writeFixture( stableBook.filePath( QStringLiteral("Stable") ), validScoreBytes ),
+		   "score fixture restored after disappearance check" );
+
+	// Roster parsing uses the same all-or-nothing contract for direct JSON and
+	// file loads. A valid empty classes array remains an explicit clear.
+	QTemporaryDir rosterDirectory;
+	check( rosterDirectory.isValid(), "roster persistence temporary directory" );
+	ClassroomRoster stableRoster( rosterDirectory.path() );
+	ClassroomClass stableClass;
+	stableClass.name = QStringLiteral("Stable");
+	stableClass.students.append( ClassroomStudent{ QStringLiteral("1"), QStringLiteral("Stable student"),
+												  QStringLiteral("192.168.1.101") } );
+	stableRoster.classes().append( stableClass );
+	check( stableRoster.save(), "stable roster saved" );
+	const auto stableRosterJson = stableRoster.toJson();
+	const auto validRosterBytes = readFixture( stableRoster.filePath() );
+	const QVector<QString> invalidRosterJson{
+		QStringLiteral("{broken"),
+		QStringLiteral("[]"),
+		QStringLiteral("{\"classes\":{}}"),
+		QStringLiteral("{\"classes\":[1]}"),
+		QStringLiteral("{\"classes\":[{\"name\":\"Bad\",\"students\":{}}]}")
+	};
+	bool rosterCorruptionPreservedState = true;
+	for( const auto& fixture : invalidRosterJson )
+	{
+		if( stableRoster.fromJson( fixture ) || stableRoster.toJson() != stableRosterJson )
+		{
+			rosterCorruptionPreservedState = false;
+		}
+	}
+	check( rosterCorruptionPreservedState, "invalid roster JSON and top-level shapes preserve existing classes" );
+	const QByteArray truncatedRoster = QByteArrayLiteral("{\"classes\":[");
+	check( writeFixture( stableRoster.filePath(), truncatedRoster ) &&
+		   stableRoster.load() == false && stableRoster.toJson() == stableRosterJson &&
+		   readFixture( stableRoster.filePath() ) == truncatedRoster,
+		   "truncated roster load preserves prior classes and original bytes" );
+	check( writeFixture( stableRoster.filePath(), validRosterBytes ) && stableRoster.load() &&
+		   stableRoster.toJson() == stableRosterJson,
+		   "valid roster bytes still load after corruption checks" );
+
+	// Report replacement is atomic on success and reports pre-write failures
+	// without modifying an existing filesystem object.
+	ClassroomTermReport::Options stableOptions;
+	stableOptions.className = QStringLiteral("Stable");
+	const auto reportPath = QDir( scoreDirectory.path() ).filePath( QStringLiteral("report.xls") );
+	const QByteArray previousReport = QByteArrayLiteral("previous report");
+	check( writeFixture( reportPath, previousReport ), "previous report fixture written" );
+	QString reportError;
+	const auto expectedReport = ClassroomTermReport::toSpreadsheetMl( stableRoster, stableBook, stableOptions );
+	check( ClassroomTermReport::exportXls( reportPath, stableRoster, stableBook, stableOptions, &reportError ) &&
+		   reportError.isEmpty() && readFixture( reportPath ) == expectedReport,
+		   "term report atomically replaces an existing export with the complete workbook" );
+	const auto blockerPath = QDir( scoreDirectory.path() ).filePath( QStringLiteral("not-a-directory") );
+	check( writeFixture( blockerPath, previousReport ), "report parent blocker fixture written" );
+	reportError.clear();
+	check( ClassroomTermReport::exportXls( QDir( blockerPath ).filePath( QStringLiteral("report.xls") ),
+										  stableRoster, stableBook, stableOptions, &reportError ) == false &&
+		   reportError.isEmpty() == false && readFixture( blockerPath ) == previousReport,
+		   "failed term report export preserves existing bytes and returns a visible error" );
+
+	// An interrupted purchase rolls its fixed-id charge back and clears the
+	// journal without creating a redemption or decrementing stock.
+	QTemporaryDir purchaseRecoveryDirectory;
+	ClassroomShopBook purchaseRecovery( purchaseRecoveryDirectory.path() );
+	check( purchaseRecovery.load( QStringLiteral("PurchaseRecovery") ), "purchase recovery shop loads" );
+	ClassroomShopProduct recoveryProduct;
+	recoveryProduct.name = QStringLiteral("Recovery item" );
+	recoveryProduct.price = 5;
+	recoveryProduct.stock = 2;
+	check( purchaseRecovery.addProduct( &recoveryProduct ), "purchase recovery product created" );
+	ClassroomScoreBook purchaseRecoveryScores( purchaseRecoveryDirectory.path() );
+	check( purchaseRecoveryScores.load( QStringLiteral("PurchaseRecovery") ), "purchase recovery score book loads" );
+	ClassroomScoreEntry interruptedCharge;
+	interruptedCharge.id = QStringLiteral("interrupted-purchase-charge" );
+	interruptedCharge.lessonId = purchaseRecoveryScores.ensureLesson( QDate::currentDate(),
+		ClassroomShopBook::lessonTopic() );
+	interruptedCharge.seat = QStringLiteral("1" );
+	interruptedCharge.student = QStringLiteral("Recovery student" );
+	interruptedCharge.delta = -5;
+	interruptedCharge.label = QStringLiteral("interrupted purchase" );
+	check( purchaseRecoveryScores.addEntry( interruptedCharge ), "interrupted purchase charge fixture written" );
+	QFile purchaseRecoveryFile( purchaseRecovery.filePath() );
+	check( purchaseRecoveryFile.open( QIODevice::ReadOnly ), "purchase recovery journal fixture opened" );
+	const auto purchaseRecoveryObject = QJsonDocument::fromJson( purchaseRecoveryFile.readAll() ).object();
+	purchaseRecoveryFile.close();
+	ClassroomShopRedemption interruptedRedemption;
+	interruptedRedemption.id = QStringLiteral("interrupted-purchase" );
+	interruptedRedemption.productId = recoveryProduct.id;
+	interruptedRedemption.productName = recoveryProduct.name;
+	interruptedRedemption.seat = QStringLiteral("1" );
+	interruptedRedemption.student = QStringLiteral("Recovery student" );
+	interruptedRedemption.price = 5;
+	interruptedRedemption.timestamp = QDateTime::currentDateTime();
+	auto purchaseJournal = purchaseRecoveryObject;
+	purchaseJournal.insert( QStringLiteral("pendingOperation"), QJsonObject{
+		{ QStringLiteral("version"), 1 },
+		{ QStringLiteral("id"), QStringLiteral("interrupted-operation") },
+		{ QStringLiteral("kind"), QStringLiteral("purchase") },
+		{ QStringLiteral("scoreEntryId"), interruptedCharge.id },
+		{ QStringLiteral("seat"), interruptedRedemption.seat },
+		{ QStringLiteral("student"), interruptedRedemption.student },
+		{ QStringLiteral("delta"), -5 },
+		{ QStringLiteral("redemption"), interruptedRedemption.toStorage() } } );
+	check( writeFixture( purchaseRecovery.filePath(), QJsonDocument( purchaseJournal ).toJson( QJsonDocument::Compact ) ),
+		   "interrupted purchase journal written" );
+	ClassroomShopBook recoveredPurchase( purchaseRecoveryDirectory.path() );
+	check( recoveredPurchase.load( QStringLiteral("PurchaseRecovery") ) &&
+		   recoveredPurchase.hasPendingOperation() &&
+		   recoveredPurchase.recoverPendingOperations() && recoveredPurchase.hasPendingOperation() == false &&
+		   recoveredPurchase.redemptions().isEmpty() &&
+		   recoveredPurchase.product( recoveryProduct.id )->stock == 2 &&
+		   recoveredPurchase.balance( QStringLiteral("1") ) == 100,
+		   "restart recovery rolls an uncommitted purchase charge back exactly once" );
+	purchaseRecoveryScores.load( QStringLiteral("PurchaseRecovery") );
+	check( std::none_of( purchaseRecoveryScores.entries().constBegin(), purchaseRecoveryScores.entries().constEnd(),
+		[&]( const ClassroomScoreEntry& entry ) { return entry.id == interruptedCharge.id; } ),
+		"rolled-back purchase charge is absent from the score book" );
+	check( recoveredPurchase.setOpen( false ), "stable shop state saved before corruption check" );
+	check( writeFixture( recoveredPurchase.filePath(), QByteArrayLiteral("{broken") ) &&
+		   recoveredPurchase.load( QStringLiteral("PurchaseRecovery") ) == false &&
+		   recoveredPurchase.isLoaded() && recoveredPurchase.isOpen() == false &&
+		   recoveredPurchase.products().size() == 1,
+		   "corrupt shop JSON preserves the last good in-memory catalog" );
+	const QByteArray malformedShop = QByteArrayLiteral(
+		"{\"open\":true,\"products\":{},\"auctions\":\"bad\",\"redemptions\":42,\"completedOperations\":[]}" );
+	check( writeFixture( recoveredPurchase.filePath(), malformedShop ) &&
+		   recoveredPurchase.load( QStringLiteral("PurchaseRecovery") ) == false &&
+		   recoveredPurchase.isOpen() == false && recoveredPurchase.products().size() == 1 &&
+		   readFixture( recoveredPurchase.filePath() ) == malformedShop,
+		   "malformed shop field shapes preserve memory and exact disk bytes" );
+
+	QTemporaryDir legacyShopDirectory;
+	check( legacyShopDirectory.isValid(), "legacy shop persistence temporary directory" );
+	const auto legacyShopPath = QDir( ClassroomShopBook::directoryPath( legacyShopDirectory.path() ) ).
+		filePath( ClassroomLogStore::sanitize( QStringLiteral("Legacy Shop") ) + QStringLiteral(".json") );
+	check( QDir().mkpath( QFileInfo( legacyShopPath ).absolutePath() ), "legacy shop directory created" );
+	const QByteArray legacyShopBytes( "{\"open\":true,\"products\":[],\"auctions\":[],\"redemptions\":[]}" );
+	ClassroomShopBook legacyShop( legacyShopDirectory.path() );
+	check( writeFixture( legacyShopPath, legacyShopBytes ) && legacyShop.load( QStringLiteral("Legacy Shop") ) &&
+		   legacyShop.load( QStringLiteral("Legacy Shop") ) && legacyShop.isLoaded() && legacyShop.isOpen(),
+		   "legacy shop JSON without completedOperations still loads" );
+	check( QFile::exists( QDir( ClassroomShopBook::directoryPath( legacyShopDirectory.path() ) ).
+			filePath( ClassroomLogStore::storageKey( QStringLiteral("Legacy Shop") ) + QStringLiteral(".json") ) ) &&
+		   QFile::exists( legacyShopPath ) == false,
+		   "legacy shop filename is migrated after successful validation" );
+	check( QFile::remove( legacyShop.filePath() ) && legacyShop.load( QStringLiteral("Legacy Shop") ) == false &&
+		   legacyShop.isLoaded() && legacyShop.isOpen(),
+		   "a disappeared shop file preserves the last good catalog" );
+	const auto corruptLegacyShopPath = QDir( ClassroomShopBook::directoryPath( legacyShopDirectory.path() ) ).
+		filePath( ClassroomLogStore::sanitize( QStringLiteral("Corrupt Legacy") ) + QStringLiteral(".json") );
+	const QByteArray corruptLegacyShopBytes( "{\"open\":true,\"products\":{}}" );
+	ClassroomShopBook corruptLegacyShop( legacyShopDirectory.path() );
+	check( writeFixture( corruptLegacyShopPath, corruptLegacyShopBytes ) &&
+		   corruptLegacyShop.load( QStringLiteral("Corrupt Legacy") ) == false &&
+		   readFixture( corruptLegacyShopPath ) == corruptLegacyShopBytes,
+		   "corrupt legacy shop JSON is neither accepted nor renamed" );
+
+	// An interrupted rejection rolls forward when its fixed-id refund already
+	// reached the score book, restoring stock without duplicating the refund.
+	QTemporaryDir rejectionRecoveryDirectory;
+	ClassroomShopBook rejectionRecovery( rejectionRecoveryDirectory.path() );
+	check( rejectionRecovery.load( QStringLiteral("RejectionRecovery") ), "rejection recovery shop loads" );
+	ClassroomShopProduct refundProduct;
+	refundProduct.name = QStringLiteral("Refund item" );
+	refundProduct.price = 5;
+	refundProduct.stock = 1;
+	check( rejectionRecovery.addProduct( &refundProduct ) &&
+		   rejectionRecovery.redeem( refundProduct.id, QStringLiteral("1"), QStringLiteral("Recovery student" ), 100 ).isEmpty(),
+		   "rejection recovery purchase created" );
+	const auto refundRedemption = rejectionRecovery.redemptions().constFirst();
+	QFile rejectionRecoveryFile( rejectionRecovery.filePath() );
+	check( rejectionRecoveryFile.open( QIODevice::ReadOnly ), "rejection recovery journal fixture opened" );
+	const auto rejectionRecoveryObject = QJsonDocument::fromJson( rejectionRecoveryFile.readAll() ).object();
+	rejectionRecoveryFile.close();
+	ClassroomScoreBook rejectionRecoveryScores( rejectionRecoveryDirectory.path() );
+	check( rejectionRecoveryScores.load( QStringLiteral("RejectionRecovery") ), "rejection recovery score book loads" );
+	ClassroomScoreEntry interruptedRefund;
+	interruptedRefund.id = QStringLiteral("interrupted-refund" );
+	interruptedRefund.lessonId = rejectionRecoveryScores.ensureLesson( QDate::currentDate(),
+		ClassroomShopBook::lessonTopic() );
+	interruptedRefund.seat = refundRedemption.seat;
+	interruptedRefund.student = refundRedemption.student;
+	interruptedRefund.delta = refundRedemption.price;
+	interruptedRefund.label = QStringLiteral("interrupted refund" );
+	check( rejectionRecoveryScores.addEntry( interruptedRefund ), "interrupted rejection refund fixture written" );
+	auto rejectionJournal = rejectionRecoveryObject;
+	rejectionJournal.insert( QStringLiteral("pendingOperation"), QJsonObject{
+		{ QStringLiteral("version"), 1 },
+		{ QStringLiteral("id"), QStringLiteral("interrupted-rejection") },
+		{ QStringLiteral("kind"), QStringLiteral("reject") },
+		{ QStringLiteral("redemptionId"), refundRedemption.id },
+		{ QStringLiteral("scoreEntryId"), interruptedRefund.id },
+		{ QStringLiteral("seat"), refundRedemption.seat },
+		{ QStringLiteral("student"), refundRedemption.student },
+		{ QStringLiteral("delta"), refundRedemption.price },
+		{ QStringLiteral("redemption"), refundRedemption.toStorage() } } );
+	check( writeFixture( rejectionRecovery.filePath(), QJsonDocument( rejectionJournal ).toJson( QJsonDocument::Compact ) ),
+		   "interrupted rejection journal written" );
+	ClassroomShopBook recoveredRejection( rejectionRecoveryDirectory.path() );
+	check( recoveredRejection.load( QStringLiteral("RejectionRecovery") ) &&
+		   recoveredRejection.hasPendingOperation() &&
+		   recoveredRejection.recoverPendingOperations() && recoveredRejection.hasPendingOperation() == false &&
+		   recoveredRejection.redemption( refundRedemption.id )->status == ClassroomShopRedemption::Rejected &&
+		   recoveredRejection.product( refundProduct.id )->stock == 1 &&
+		   recoveredRejection.balance( QStringLiteral("1") ) == 100,
+		   "restart recovery rolls a committed rejection forward without a duplicate refund" );
+	rejectionRecoveryScores.load( QStringLiteral("RejectionRecovery") );
+	const int refundCount = std::count_if( rejectionRecoveryScores.entries().constBegin(),
+		rejectionRecoveryScores.entries().constEnd(), [&]( const ClassroomScoreEntry& entry ) {
+			return entry.id == interruptedRefund.id;
+		} );
+	check( refundCount == 1, "roll-forward recovery preserves exactly one fixed-id refund" );
+	QLockFile shopMutationLock( recoveredRejection.filePath() + QStringLiteral( ".lock" ) );
+	check( shopMutationLock.tryLock( 0 ) && recoveredRejection.setOpen( false ) == false,
+		   "a competing shop writer cannot mutate a locked book" );
+	shopMutationLock.unlock();
+	check( recoveredRejection.setOpen( false ), "shop mutation succeeds after the competing lock is released" );
 
 	std::fprintf( stdout, "\n%d failure(s)\n", failures );
 	return failures == 0 ? 0 : 1;

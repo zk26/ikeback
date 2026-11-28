@@ -23,6 +23,10 @@
  */
 
 #include <QDir>
+#include <QFileInfo>
+
+#include <fcntl.h>
+#include <io.h>
 
 // ikeback: newer MinGW-w64 headers no longer pull in the basic Windows types
 // transitively. wtsapi32.h etc. require windows.h to be included FIRST.
@@ -192,20 +196,20 @@ bool WindowsFilesystemFunctions::setFileOwnerGroupPermissions( const QString& fi
 
 	// set read access for owner
 	ea[0].grfAccessPermissions = 0;
-	if( permissions & QFile::ReadGroup )
+	if( permissions & QFile::ReadOwner )
 	{
 		ea[0].grfAccessPermissions |= GENERIC_READ;
 	}
-	if( permissions & QFile::WriteGroup )
+	if( permissions & QFile::WriteOwner )
 	{
 		ea[0].grfAccessPermissions |= GENERIC_WRITE;
 	}
-	if( permissions & QFile::ExeGroup )
+	if( permissions & QFile::ExeOwner )
 	{
 		ea[0].grfAccessPermissions |= GENERIC_EXECUTE;
 	}
 	ea[0].grfAccessMode = SET_ACCESS;
-	ea[0].grfInheritance = NO_INHERITANCE;
+	ea[0].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 	ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
 	ea[0].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
 	ea[0].Trustee.ptstrName = LPTSTR(ownerSID);
@@ -213,7 +217,7 @@ bool WindowsFilesystemFunctions::setFileOwnerGroupPermissions( const QString& fi
 	// set full control for Administrators
 	ea[1].grfAccessPermissions = GENERIC_ALL;
 	ea[1].grfAccessMode = SET_ACCESS;
-	ea[1].grfInheritance = NO_INHERITANCE;
+	ea[1].grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
 	ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
 	ea[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
 	ea[1].Trustee.ptstrName = LPTSTR(adminSID.get());
@@ -246,16 +250,91 @@ bool WindowsFilesystemFunctions::openFileSafely( QFile* file, QIODevice::OpenMod
 		return false;
 	}
 
-	if( file->open( openMode ) &&
-		file->symLinkTarget().isEmpty() &&
-		file->setPermissions( permissions ) )
+	const auto absolutePath = QFileInfo( file->fileName() ).absoluteFilePath();
+	const auto parentPath = QFileInfo( absolutePath ).absoluteDir().canonicalPath();
+	if( parentPath.isEmpty() )
 	{
-		return true;
+		return false;
+	}
+	const auto expectedPath = QDir( parentPath ).filePath( QFileInfo( absolutePath ).fileName() );
+
+	DWORD access = 0;
+	if( openMode & QIODevice::ReadOnly ) { access |= GENERIC_READ; }
+	if( openMode & QIODevice::WriteOnly ) { access |= GENERIC_WRITE; }
+	if( access == 0 ) { access = GENERIC_READ; }
+
+	DWORD creation = OPEN_EXISTING;
+	if( openMode & QIODevice::NewOnly ) { creation = CREATE_NEW; }
+	else if( openMode & QIODevice::Truncate ) { creation = CREATE_ALWAYS; }
+	else if( openMode & QIODevice::WriteOnly ) { creation = OPEN_ALWAYS; }
+
+	const auto nativePath = QDir::toNativeSeparators( absolutePath );
+	SmartFileHandle handle( CreateFileW( WindowsCoreFunctions::toConstWCharArray( nativePath ), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr, creation, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr ) );
+	if( handle.isInvalid() )
+	{
+		return false;
 	}
 
-	file->close();
+	FILE_ATTRIBUTE_TAG_INFORMATION tagInfo{};
+	if( GetFileInformationByHandleEx( handle.get(), FileAttributeTagInfo, &tagInfo, sizeof( tagInfo ) ) == false ||
+		( ( tagInfo.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT ) &&
+		  ( tagInfo.ReparseTag == IO_REPARSE_TAG_SYMLINK || tagInfo.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT ) ) )
+	{
+		return false;
+	}
 
-	return false;
+	std::vector<wchar_t> finalPath( 32768 );
+	const auto finalPathLength = GetFinalPathNameByHandleW( handle.get(), finalPath.data(), finalPath.size(), FILE_NAME_NORMALIZED );
+	if( finalPathLength == 0 || finalPathLength >= finalPath.size() )
+	{
+		return false;
+	}
+
+	auto actualPath = QString::fromWCharArray( finalPath.data(), int( finalPathLength ) );
+	if( actualPath.startsWith( QStringLiteral("\\\\?\\UNC\\") ) )
+	{
+		actualPath = QStringLiteral("\\\\") + actualPath.mid( 8 );
+	}
+	else if( actualPath.startsWith( QStringLiteral("\\\\?\\") ) )
+	{
+		actualPath.remove( 0, 4 );
+	}
+	actualPath = QDir::fromNativeSeparators( actualPath );
+	if( actualPath.compare( expectedPath, Qt::CaseInsensitive ) != 0 )
+	{
+		return false;
+	}
+
+	int descriptorFlags = _O_BINARY;
+	descriptorFlags |= access & GENERIC_WRITE ? _O_WRONLY : _O_RDONLY;
+	if( openMode & QIODevice::Append ) { descriptorFlags |= _O_APPEND; }
+	const int descriptor = _open_osfhandle( reinterpret_cast<intptr_t>( handle.get() ), descriptorFlags );
+	if( descriptor < 0 )
+	{
+		return false;
+	}
+
+	handle.release();
+	if( file->open( descriptor, openMode, QFileDevice::AutoCloseHandle ) == false )
+	{
+		_close( descriptor );
+		return false;
+	}
+	if( file->setPermissions( permissions ) == false )
+	{
+		file->close();
+		return false;
+	}
+#ifdef Q_OS_WIN
+	if( ( openMode & QIODevice::WriteOnly ) &&
+		setFileOwnerGroupPermissions( file->fileName(), permissions ) == false )
+	{
+		file->close();
+		return false;
+	}
+#endif
+	return true;
 }
 
 

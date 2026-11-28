@@ -2,7 +2,9 @@
 
 本文件列明本仓库**构建期 / 运行期**涉及的第三方组件及其许可，用于分发合规核对。
 
-> **仓库源码**：不含任何第三方二进制（生成物与安装包由 `.gitignore` 排除）。
+> **仓库源码**：第三方组件主要以源码或构建依赖形式包含；但 `desktop/3rdparty/ddengine/`
+> 明确跟踪了上游 UltraVNC 的 `ddengine.dll` 与 `ddengine64.dll` 二进制，不能宣称仓库完全不含二进制。
+> 生成的安装包仍由 `.gitignore` 排除。
 > **Releases 安装程序**：为让 Windows 端可直接运行，`setup.exe` 内**确实捆绑了
 > Qt6 / QCA / OpenSSL / LibVNC / MinGW CRT 等动态链接库**（由 MSYS2 UCRT64 提供，
 > `ntldd` 递归收集）。这些都是以**动态链接**方式随附的 LGPL / GPL 兼容或宽松许可组件；
@@ -18,6 +20,7 @@
 |---|---|---|---|
 | Veyon 4.x | <https://github.com/veyon/veyon> | **GPL-2.0-or-later** | `desktop/`（除本分支新增/修改文件） |
 | Veyon 自带图标、翻译与文档 | 同上 | GPL-2.0-or-later | `desktop/core/resources/`、`desktop/translations/` |
+| DDEngine/UltraVNC 显示驱动 DLL | Veyon UltraVNC 上游 | GPL-2.0-or-later（以随附声明为准） | `desktop/3rdparty/ddengine/ddengine.dll`、`ddengine64.dll` |
 
 Veyon 的 GPL v2 全文见仓库根 [`LICENSE`](../../LICENSE) 与 [`desktop/COPYING`](../COPYING)。
 本仓库相对上游的修改声明见 [`NOTICE.md`](../../NOTICE.md) 第 4 节。

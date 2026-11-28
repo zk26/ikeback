@@ -82,7 +82,7 @@ CMake 构建目标、核心库 `ikeback-core.dll`、插件 DLL 与配置数据�
 
 ```powershell
 # 有完整 MinGW 工具链时（简写，详见 IKEBACK-BUILD.md）
-cmake -S ikeback -B build -G Ninja -DWITH_QT6=ON -DWITH_WEBAPI=OFF -DWITH_CORE_ONLY=OFF
+cmake -S desktop -B build -G Ninja -DWITH_QT6=ON -DWITH_WEBAPI=OFF -DWITH_CORE_ONLY=OFF
 cmake --build build
 ```
 

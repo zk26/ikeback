@@ -15,6 +15,7 @@
 #include <QMap>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStringList>
 
 #include "ClassroomData.h"
@@ -44,6 +45,26 @@ static QString trText( const char* text )
 		{ "Could not create the destination directory.", QStringLiteral("无法创建目标目录。") }
 	};
 	return chinese.value( QByteArray( text ), QString::fromUtf8( text ) );
+}
+
+
+//! CSV cell with an apostrophe in front of a formula lead (= + - @), so a
+//! student name or reason typed as "=HYPERLINK(...)" stays plain text in Excel.
+static QString csvQuote( const QString& value )
+{
+	QString escaped = value;
+	int lead = 0;
+	while( lead < escaped.size() && ( escaped.at( lead ).isSpace() ||
+									   escaped.at( lead ).category() == QChar::Other_Control ) )
+	{
+		++lead;
+	}
+	if( lead < escaped.size() && QStringLiteral("=+-@").contains( escaped.at( lead ) ) )
+	{
+		escaped.prepend( QLatin1Char('\'') );
+	}
+	escaped.replace( QStringLiteral("\""), QStringLiteral("\"\"") );
+	return QStringLiteral("\"%1\"").arg( escaped );
 }
 
 
@@ -429,11 +450,7 @@ QByteArray ClassroomTermReport::toCsv( const ClassroomRoster& roster,
 	const auto* classItem = roster.findClass( options.className );
 	const auto lessons = filteredLessons( book, options );
 
-	const auto quote = []( const QString& value ) {
-		QString escaped = value;
-		escaped.replace( QStringLiteral("\""), QStringLiteral("\"\"") );
-		return QStringLiteral("\"%1\"").arg( escaped );
-	};
+	const auto quote = []( const QString& value ) { return csvQuote( value ); };
 
 	QString csv;
 	csv += quote( trText("No.") ) + QLatin1Char(',') + quote( trText("Name") );
@@ -472,11 +489,7 @@ QByteArray ClassroomTermReport::toCsv( const ClassroomRoster& roster,
 
 QByteArray ClassroomTermReport::toDetailsCsv( const ClassroomScoreBook& book, const Options& options )
 {
-	const auto quote = []( const QString& value ) {
-		QString escaped = value;
-		escaped.replace( QStringLiteral("\""), QStringLiteral("\"\"") );
-		return QStringLiteral("\"%1\"").arg( escaped );
-	};
+	const auto quote = []( const QString& value ) { return csvQuote( value ); };
 
 	QString csv;
 	csv += quote( trText("Class") ) + QLatin1Char(',') + quote( options.className ) + QLatin1Char('\n');
@@ -518,17 +531,20 @@ bool ClassroomTermReport::exportXls( const QString& fileName, const ClassroomRos
 		if( error ) { *error = trText("Could not create the destination directory."); }
 		return false;
 	}
-	QFile file( fileName );
-	if( file.open( QFile::WriteOnly | QFile::Truncate ) == false )
+	const auto data = toSpreadsheetMl( roster, book, options );
+	QSaveFile file( fileName );
+	if( file.open( QIODevice::WriteOnly ) == false )
 	{
 		if( error ) { *error = file.errorString(); }
 		return false;
 	}
-	const auto data = toSpreadsheetMl( roster, book, options );
 	if( file.write( data ) != data.size() )
 	{
+		file.cancelWriting();
 		if( error ) { *error = file.errorString(); }
 		return false;
 	}
-	return true;
+	if( file.commit() ) { return true; }
+	if( error ) { *error = file.errorString(); }
+	return false;
 }

@@ -105,7 +105,9 @@ public:
 
 	QString toJson() const;
 	QJsonArray toJsonArray() const;
-	void fromJson( const QString& json );
+	//! Parse a complete roster document into temporary state. Invalid JSON or
+	//! an unexpected shape returns false and leaves the current classes intact.
+	bool fromJson( const QString& json );
 
 	bool importCsv( const QString& fileName, const QString& className, QString* error = nullptr );
 	bool exportCsv( const QString& fileName, const QString& className, QString* error = nullptr ) const;
@@ -167,6 +169,12 @@ public:
 								   const QVector<QStringList>& rows, QString* error = nullptr );
 
 	static QString sanitize( const QString& name );
+	//! Injective storage key: lossy rewrites of the name get a short hash appended.
+	static QString storageKey( const QString& name );
+
+	//! Moves a book file from its pre-5.3.1 lossy key to the injective one.
+	static bool migrateStorageKey( const QString& directory, const QString& legacyName,
+								   const QString& newName );
 
 	//! In-memory identity/last-activity index so the UI does not reparse every log file on each refresh.
 	QMap<QString, QString> identityStates() const;

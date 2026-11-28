@@ -64,6 +64,7 @@
 #include "NetworkObjectDirectory.h"
 #include "NetworkObjectDirectoryManager.h"
 #include "PlatformCoreFunctions.h"
+#include "PlatformFilesystemFunctions.h"
 #include "PlatformPluginInterface.h"
 #include "IkebackCore.h"
 #include "IkebackMasterInterface.h"
@@ -112,6 +113,63 @@ static bool safePackageFolder( const QString& value )
 	return value.isEmpty() == false && value != QStringLiteral("." ) && value != QStringLiteral(".." ) &&
 		value.contains( QRegularExpression( QStringLiteral("[<>:\"/\\\\|?*]") ) ) == false;
 }
+
+static QString deploymentStateDirectory()
+{
+	return QDir( QStandardPaths::writableLocation( QStandardPaths::AppLocalDataLocation ) ).
+		filePath( QStringLiteral("ikeback/portable-deployments") );
+}
+
+
+static bool pathWithoutLinks( const QString& path )
+{
+	QFileInfo info( path );
+#ifdef Q_OS_WIN
+	const auto sensitivity = Qt::CaseInsensitive;
+#else
+	const auto sensitivity = Qt::CaseSensitive;
+#endif
+	while( true )
+	{
+		if( info.isSymLink() )
+		{
+			return false;
+		}
+		if( info.exists() )
+		{
+			const auto canonical = info.canonicalFilePath();
+			if( canonical.isEmpty() || canonical.compare( info.absoluteFilePath(), sensitivity ) != 0 )
+			{
+				return false;
+			}
+		}
+		const auto parent = info.absoluteDir().absolutePath();
+		if( parent == info.absoluteFilePath() )
+		{
+			return true;
+		}
+		info.setFile( parent );
+	}
+}
+
+static bool ensureDeploymentStateDirectory()
+{
+	const auto path = deploymentStateDirectory();
+	if( pathWithoutLinks( path ) == false ) { return false; }
+	const bool existed = QDir( path ).exists();
+	if( QDir().mkpath( path ) == false ) { return false; }
+#ifdef Q_OS_WIN
+	if( existed == false && IkebackCore::platform().filesystemFunctions().setFileOwnerGroupPermissions(
+				path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner ) == false )
+	{
+		return false;
+	}
+#else
+	Q_UNUSED( existed );
+#endif
+	return true;
+}
+
 
 static QByteArray fileSha256( const QString& path )
 {
@@ -789,7 +847,14 @@ void ClassroomPlugin::startSessionFeature( IkebackServerInterface& server )
 			m_restartFailures = 0;
 			return;
 		}
-		if( m_restartPending ) { return; }
+		// A worker that was asked to start but never registered is a failed
+		// start, not one still in flight: give up waiting after three watchdog
+		// periods so the retry below actually happens.
+		if( m_restartPending )
+		{
+			if( m_restartPendingSince.isValid() && m_restartPendingSince.elapsed() < WorkerStartTimeoutMs ) { return; }
+			m_restartPending = false;
+		}
 
 		if( m_restartFailures >= MaxWorkerRestartFailures )
 		{
@@ -805,6 +870,7 @@ void ClassroomPlugin::startSessionFeature( IkebackServerInterface& server )
 		++m_restartFailures;
 		startClient( *m_server );
 		m_restartPending = true;
+		m_restartPendingSince.restart();
 	} );
 	m_watchdog->start();
 }
@@ -890,8 +956,13 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackServerInterface& server, cons
 	{
 		QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
 						   QSettings::Registry64Format );
-		machine.setValue( QStringLiteral("UninstallProtection"), message.argument( Argument::Enabled ).toBool() );
-		machine.sync();
+		const auto protect = message.argument( Argument::Enabled ).toBool();
+		if( protect == false ||
+			ClassroomSecrets::adminKeyHashConfigured( machine.value( QStringLiteral("AdminKeyHash") ).toString() ) )
+		{
+			machine.setValue( QStringLiteral("UninstallProtection"), protect );
+			machine.sync();
+		}
 	}
 #endif
 	if( command == Command::StopClient )
@@ -1061,7 +1132,11 @@ bool ClassroomPlugin::handleFeatureMessage( ComputerControlInterface::Pointer co
 		const auto phase = message.argument( Argument::DeployPhase ).toString();
 		const auto ip = message.argument( Argument::Ip ).toString();
 		const auto detail = message.argument( Argument::Detail ).toString();
-		if( m_dialog ) { m_dialog->recordPackageResult( ip, phase, ok, detail ); }
+		if( m_dialog )
+		{
+			m_dialog->recordPackageResult( ip, phase, ok, detail,
+										   message.argument( Argument::DeploymentId ).toString() );
+		}
 		ClassroomEvent event;
 		event.timestamp = QDateTime::currentDateTime();
 		event.ip = ip;
@@ -1324,7 +1399,8 @@ void ClassroomPlugin::handleShopRequest( const FeatureMessage& message,
 	{
 		const auto productId = message.argument( Argument::ProductId ).toString();
 		if( const auto* product = book.product( productId ) ) { item = product->name; }
-		errorText = book.redeem( productId, seat, student, book.balance( seat ) );
+		errorText = book.redeem( productId, seat, student, book.balance( seat ),
+			message.argument( Argument::OperationId ).toString() );
 	}
 	else if( command == Command::ShopBid )
 	{
@@ -1468,7 +1544,8 @@ void ClassroomPlugin::ensureClientUi( IkebackWorkerInterface& worker )
 					   .addArgument( Argument::Student, m_student )
 					   .addArgument( Argument::Host, m_hostName )
 					   .addArgument( Argument::Ip, m_ipAddress )
-					   .addArgument( Argument::ProductId, productId );
+					   .addArgument( Argument::ProductId, productId )
+					   .addArgument( Argument::OperationId, QUuid::createUuid().toString( QUuid::WithoutBraces ) );
 				 m_worker->sendFeatureMessageReply( redeem );
 			 } );
 	connect( m_clientWidget, &ClassroomClientWidget::shopBidRequested, this,
@@ -1581,7 +1658,7 @@ static QJsonObject withLocalStudentProtection( QJsonObject settingsObject )
 	QSettings machine( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
 					   QSettings::Registry64Format );
 	const auto storedHash = machine.value( QStringLiteral("AdminKeyHash") ).toString();
-	if( storedHash.isEmpty() == false )
+	if( ClassroomSecrets::adminKeyHashConfigured( storedHash ) )
 	{
 		settingsObject.insert( Classroom::SettingKey::adminKeyHash(), storedHash );
 	}
@@ -1605,8 +1682,15 @@ static void persistAdminKeyHash( const QJsonObject& settingsObject )
 	{
 		hash = machine.value( QStringLiteral("AdminKeyHash") ).toString();
 	}
-	if( hash.isEmpty() ) { hash = ClassroomSecrets::defaultAdminKeyHash(); }
-	machine.setValue( QStringLiteral("AdminKeyHash"), hash );
+	if( ClassroomSecrets::adminKeyHashConfigured( hash ) )
+	{
+		machine.setValue( QStringLiteral("AdminKeyHash"), hash );
+	}
+	else
+	{
+		machine.remove( QStringLiteral("AdminKeyHash") );
+		machine.setValue( QStringLiteral("UninstallProtection"), 0 );
+	}
 	machine.sync();
 #else
 	Q_UNUSED(settingsObject)
@@ -1724,12 +1808,12 @@ bool ClassroomPlugin::verifyDeployedPackage( const QJsonObject& state, QString* 
 
 void ClassroomPlugin::resumePackageDeployment()
 {
-	if( m_worker == nullptr ) { return; }
-	QDir apps( portableAppsRoot() );
-	const auto states = apps.entryList( { QStringLiteral(".ikeback-deploy-*.json") }, QDir::Files );
+	if( m_worker == nullptr || ensureDeploymentStateDirectory() == false ) { return; }
+	const auto stateDirectory = deploymentStateDirectory();
+	const auto states = QDir( stateDirectory ).entryList( { QStringLiteral(".ikeback-deploy-*.json") }, QDir::Files );
 	for( const auto& fileName : states )
 	{
-		QFile file( apps.filePath( fileName ) );
+		QFile file( QDir( stateDirectory ).filePath( fileName ) );
 		if( file.open( QIODevice::ReadOnly ) == false ) { continue; }
 		const auto state = QJsonDocument::fromJson( file.readAll() ).object();
 		if( state.value( QStringLiteral("phase") ).toString() != QStringLiteral("verify") ) { continue; }
@@ -1955,11 +2039,13 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 #ifdef Q_OS_WIN
 		QSettings settings( QStringLiteral("HKEY_LOCAL_MACHINE\\SOFTWARE\\ikeback\\Student"),
 							QSettings::Registry64Format );
-		settings.setValue( QStringLiteral("UninstallProtection"), protect ? 1 : 0 );
+		const auto canProtect = protect == false ||
+				ClassroomSecrets::adminKeyHashConfigured( settings.value( QStringLiteral("AdminKeyHash") ).toString() );
+		settings.setValue( QStringLiteral("UninstallProtection"), protect && canProtect ? 1 : 0 );
 		settings.sync();
 		const auto status = settings.status();
 		const auto readBack = settings.value( QStringLiteral("UninstallProtection"), -1 ).toInt();
-		confirmed = status == QSettings::NoError && readBack == ( protect ? 1 : 0 );
+		confirmed = canProtect && status == QSettings::NoError && readBack == ( protect ? 1 : 0 );
 		if( confirmed == false )
 		{
 			qWarning( "ikeback: SetUninstallProtection failed (status=%d, readback=%d, lastError=%s)",
@@ -2045,13 +2131,27 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 		m_packageId = id;
 		m_packageManifest = manifest;
 		const auto apps = QDir( portableAppsRoot() );
-		m_packageStagingRoot = apps.filePath( QStringLiteral(".ikeback-staging/%1" ).arg( id ) );
-		QDir( m_packageStagingRoot ).removeRecursively();
-		if( QDir().mkpath( m_packageStagingRoot ) == false )
+		const auto stagingDirectory = apps.filePath( QStringLiteral(".ikeback-staging-%1").arg( id ) );
+		m_packageStagingRoot = stagingDirectory;
+		if( pathWithoutLinks( apps.absolutePath() ) == false || pathWithoutLinks( stagingDirectory ) == false ||
+			QDir().mkdir( stagingDirectory ) == false )
 		{
-			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot create C:\\IkebackApps staging directory") );
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot create a fresh staging directory" ) );
 			m_packageId.clear();
+			break;
 		}
+#ifdef Q_OS_WIN
+		// The directory is created by the interactive user. Remove inherited
+		// read-only Users access before writing, so the protected DACL survives
+		// the same-volume rename that activates the package.
+		if( IkebackCore::platform().filesystemFunctions().setFileOwnerGroupPermissions(
+					stagingDirectory, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner ) == false )
+		{
+			sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot secure staging directory") );
+			m_packageId.clear();
+			break;
+		}
+#endif
 		break;
 	}
 
@@ -2082,6 +2182,11 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 			resetPackageReceive();
 			m_packageRelativePath = relative;
 			const auto path = QDir( m_packageStagingRoot ).filePath( relative );
+			if( pathWithoutLinks( path ) == false )
+			{
+				sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("unsafe package path" ) );
+				break;
+			}
 			if( QDir().mkpath( QFileInfo( path ).absolutePath() ) == false )
 			{
 				sendPackageResult( QStringLiteral("transfer"), false, QStringLiteral("cannot create package subdirectory") );
@@ -2114,8 +2219,11 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 		{
 			const auto entry = value.toObject();
 			const auto relative = entry.value( QStringLiteral("path") ).toString();
-			if( safeRelativePath( relative ) == false ) { error = QStringLiteral("invalid file path" ); break; }
+			if( safeRelativePath( relative ) == false || pathWithoutLinks( m_packageStagingRoot ) == false )
+			{ error = QStringLiteral("invalid file path" ); break; }
 			const auto stagedPath = QDir( m_packageStagingRoot ).filePath( relative );
+			if( pathWithoutLinks( stagedPath ) == false )
+			{ error = QStringLiteral("unsafe staged file path" ); break; }
 			const auto expectedSize = entry.value( QStringLiteral("size") ).toVariant().toLongLong();
 			if( expectedSize == 0 && QFileInfo::exists( stagedPath ) == false )
 			{
@@ -2138,9 +2246,41 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 		const auto shortcutName = shortcut.value( QStringLiteral("name") ).toString();
 		const auto shortcutTarget = QDir::fromNativeSeparators( shortcut.value( QStringLiteral("target") ).toString() );
 		QString backup;
+		QString shortcutBackup;
+		const bool shortcutExisted = QFileInfo::exists( desktopShortcutPath( shortcutName ) );
+		bool activated = false;
+		const auto rollback = [&]() {
+			bool restored = true;
+			if( activated )
+			{
+				restored = QDir( finalRoot ).removeRecursively();
+				activated = false;
+			}
+			if( backup.isEmpty() == false )
+			{
+				restored = QDir().rename( backup, finalRoot ) && restored;
+			}
+			if( shortcutBackup.isEmpty() == false )
+			{
+				QFile::remove( desktopShortcutPath( shortcutName ) );
+				restored = QFile::rename( shortcutBackup, desktopShortcutPath( shortcutName ) ) && restored;
+			}
+			else if( shortcutExisted == false && QFileInfo::exists( desktopShortcutPath( shortcutName ) ) )
+			{
+				restored = QFile::remove( desktopShortcutPath( shortcutName ) ) && restored;
+			}
+			if( restored == false )
+			{
+				error += QStringLiteral("; rollback incomplete - manual recovery required" );
+			}
+		};
 		if( error.isEmpty() )
 		{
-			if( QDir().mkpath( apps.absolutePath() ) == false ) { error = QStringLiteral("cannot create C:\\IkebackApps"); }
+			if( pathWithoutLinks( apps.absolutePath() ) == false || pathWithoutLinks( finalRoot ) == false )
+			{
+				error = QStringLiteral("unsafe deployment directory");
+			}
+			else if( QDir().mkpath( apps.absolutePath() ) == false ) { error = QStringLiteral("cannot create C:\\IkebackApps"); }
 			else if( QFileInfo::exists( finalRoot ) )
 			{
 				backup = apps.filePath( QStringLiteral(".ikeback-backup-%1-%2" ).arg( m_packageId ).arg( QDateTime::currentMSecsSinceEpoch() ) );
@@ -2148,32 +2288,64 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 			}
 			if( error.isEmpty() && QDir().rename( m_packageStagingRoot, finalRoot ) == false )
 			{
-				error = QStringLiteral("cannot activate the deployed folder" );
-				if( backup.isEmpty() == false ) { QDir().rename( backup, finalRoot ); }
+				error = QStringLiteral("cannot activate the deployed folder");
+				if( backup.isEmpty() == false && QDir().rename( backup, finalRoot ) == false )
+				{
+					error += QStringLiteral("; previous folder rollback failed");
+				}
+				else { backup.clear(); }
+			}
+			else if( error.isEmpty() )
+			{
+				activated = true;
 			}
 		}
 		if( error.isEmpty() )
 		{
 			const auto target = QDir( finalRoot ).filePath( shortcutTarget );
-			if( ClassroomSystem::createDesktopShortcut( shortcutName, target,
-				shortcut.value( QStringLiteral("arguments") ).toString(), QFileInfo( target ).absolutePath() ) == false )
+			if( pathWithoutLinks( target ) == false )
 			{
-				error = ClassroomSystem::lastError();
-				QDir( finalRoot ).removeRecursively();
-				if( backup.isEmpty() == false ) { QDir().rename( backup, finalRoot ); }
+				error = QStringLiteral("unsafe deployment target");
+			}
+			else
+			{
+				if( shortcutExisted )
+				{
+					shortcutBackup = QDir( QFileInfo( desktopShortcutPath( shortcutName ) ).absolutePath() ).
+						filePath( QStringLiteral(".ikeback-shortcut-%1.bak" ).arg( QUuid::createUuid().toString( QUuid::WithoutBraces ) ) );
+					if( QFile::copy( desktopShortcutPath( shortcutName ), shortcutBackup ) == false )
+					{
+						error = QStringLiteral("cannot preserve the previous desktop shortcut");
+					}
+				}
+				if( error.isEmpty() && ClassroomSystem::createDesktopShortcut( shortcutName, target,
+					shortcut.value( QStringLiteral("arguments") ).toString(), QFileInfo( target ).absolutePath() ) == false )
+				{
+					error = ClassroomSystem::lastError();
+				}
 			}
 		}
 		if( error.isEmpty() )
 		{
 			const QJsonObject state{ { QStringLiteral("id"), m_packageId }, { QStringLiteral("phase"), QStringLiteral("verify") },
 				{ QStringLiteral("manifest"), m_packageManifest }, { QStringLiteral("shortcutPath"), desktopShortcutPath( shortcutName ) } };
-			QSaveFile stateFile( apps.filePath( QStringLiteral(".ikeback-deploy-%1.json" ).arg( m_packageId ) ) );
-			if( stateFile.open( QIODevice::WriteOnly ) == false ||
-				stateFile.write( QJsonDocument( state ).toJson( QJsonDocument::Compact ) ) < 0 || stateFile.commit() == false )
+			const auto stateDirectory = deploymentStateDirectory();
+			if( ensureDeploymentStateDirectory() == false )
 			{
-				error = QStringLiteral("cannot save reboot verification state" );
+				error = QStringLiteral("cannot create private deployment state directory");
+			}
+			else
+			{
+				QSaveFile stateFile( QDir( stateDirectory ).filePath( QStringLiteral(".ikeback-deploy-%1.json" ).arg( m_packageId ) ) );
+				if( stateFile.open( QIODevice::WriteOnly ) == false ||
+					stateFile.write( QJsonDocument( state ).toJson( QJsonDocument::Compact ) ) < 0 || stateFile.commit() == false )
+				{
+					error = QStringLiteral("cannot save reboot verification state");
+				}
 			}
 		}
+		if( error.isEmpty() == false ) { rollback(); }
+		else if( shortcutBackup.isEmpty() == false ) { QFile::remove( shortcutBackup ); }
 		sendPackageResult( QStringLiteral("commit"), error.isEmpty(), error.isEmpty() ?
 			QStringLiteral("files verified and desktop shortcut created") : error );
 		if( error.isEmpty() == false ) { m_packageId.clear(); }
@@ -2195,7 +2367,10 @@ bool ClassroomPlugin::handleFeatureMessage( IkebackWorkerInterface& worker, cons
 								QStringLiteral("/ikeback-deploy");
 		QDir().mkpath( stagingDir );
 		m_deployFile = new QFile( stagingDir + QLatin1Char('/') + fileName, this );
-		if( m_deployFile->open( QFile::WriteOnly | QFile::Truncate ) == false )
+		if( pathWithoutLinks( m_deployFile->fileName() ) == false ||
+			IkebackCore::platform().filesystemFunctions().openFileSafely(
+				m_deployFile, QFile::WriteOnly | QFile::Truncate,
+				QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner ) == false )
 		{
 			qWarning( "ikeback: could not stage installer %s", qPrintable( fileName ) );
 			m_deployFile->deleteLater();

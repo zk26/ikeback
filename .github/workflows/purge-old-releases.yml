@@ -1,16 +1,24 @@
 name: Purge releases older than 5.2.0
 
-# 5.2.0 is the first official ikeback release. Everything published before it
-# carries the retired product name and the packages that could not connect, so
-# neither the release nor its tag should stay around.
+# 5.2.0 is the first official ikeback release. Older releases/tags carry the
+# retired product name and incompatible packages. Versions 5.2.0+ (including
+# every newer major) are retained; compare the full version, not only its major.
 #
 # Uses curl + jq instead of the gh CLI (which failed silently on this runner).
 
 on:
+  # Manual only: a push-triggered destructive job once deleted old releases
+  # and tags as a side effect of editing this very file.
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/purge-old-releases.yml'
+    inputs:
+      dry_run:
+        description: 'List what would be deleted without deleting anything'
+        type: boolean
+        default: true
+      confirm_delete:
+        description: 'Type DELETE to actually delete releases and tags'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -24,32 +32,76 @@ jobs:
       - name: Delete every release older than 5.2.0
         env:
           GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' }}
+          CONFIRM: ${{ github.event.inputs.confirm_delete }}
         run: |
           set -eu
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: nothing will be deleted. Re-run with dry_run=false and confirm_delete=DELETE."
+          fi
+          if [ "$DRY_RUN" != "true" ] && [ "$CONFIRM" != "DELETE" ]; then
+            echo "::error::Refusing to delete: set confirm_delete=DELETE to confirm."
+            exit 1
+          fi
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           auth="Authorization: Bearer ${GH_TOKEN}"
-          curl -sS -H "$auth" -H "Accept: application/vnd.github+json" \
-            "$api/releases?per_page=100" -o /tmp/releases.json
-          jq -r '.[] | "\(.id)\t\(.tag_name)"' /tmp/releases.json > /tmp/list.txt
-          while IFS="$(printf '\t')" read -r id tag; do
+          accept="Accept: application/vnd.github+json"
+
+          # GitHub caps each page at 100. Fetch every page and fail on transport,
+          # HTTP, rate-limit or malformed-JSON errors instead of purging a
+          # silently truncated release list.
+          fetch_releases() {
+            prefix=$1
+            page=1
+            : > "${prefix}.jsonl"
+            while :; do
+              body="/tmp/ikeback-releases-${prefix}-${page}.json"
+              curl -fsS --retry 3 --retry-delay 2 -H "$auth" -H "$accept" \
+                "$api/releases?per_page=100&page=$page" -o "$body"
+              jq -e 'type == "array" and length <= 100' "$body" >/dev/null
+              jq -c '.[]' "$body" >> "${prefix}.jsonl"
+              count=$(jq 'length' "$body")
+              [ "$count" -lt 100 ] && break
+              page=$((page + 1))
+            done
+          }
+
+          fetch_releases before
+          jq -r '[.id, .tag_name] | @tsv' /tmp/ikeback-releases-before.jsonl > /tmp/ikeback-purge-list.tsv
+          while IFS=$'\t' read -r id tag; do
             [ -n "$tag" ] || continue
             version="${tag#v}"
-            major="${version%%.*}"
-            case "$major" in
-              ''|*[!0-9]*)
-                echo "skip   $tag (not a numeric version)"
+            case "$version" in
+              ''|*[!0-9.]*|.*|*..*|*.)
+                echo "skip   $tag (not a numeric release version)"
                 continue
                 ;;
             esac
-            if [ "$major" -ge 5 ]; then
+            if dpkg --compare-versions "$version" ge 5.2.0; then
               echo "keep   $tag"
               continue
             fi
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete $tag (dry run)"
+              continue
+            fi
             echo "delete $tag"
-            curl -sS -o /dev/null -w '  release -> %{http_code}\n' -X DELETE \
-              -H "$auth" -H "Accept: application/vnd.github+json" "$api/releases/$id"
-            curl -sS -o /dev/null -w '  tag     -> %{http_code}\n' -X DELETE \
-              -H "$auth" -H "Accept: application/vnd.github+json" "$api/git/refs/tags/$tag" || true
-          done < /tmp/list.txt
+            if ! code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "$auth" -H "$accept" "$api/releases/$id"); then
+              echo "::error::Release deletion failed for $tag; its tag was not deleted."
+              exit 1
+            fi
+            echo "  release -> $code"
+            [ "$code" = "204" ] || { echo "::error::Unexpected release deletion status for $tag"; exit 1; }
+            if ! code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+              -H "$auth" -H "$accept" "$api/git/refs/tags/$tag"); then
+              echo "::error::Tag deletion failed for $tag after its release was deleted."
+              exit 1
+            fi
+            echo "  tag     -> $code"
+            [ "$code" = "204" ] || { echo "::error::Unexpected tag deletion status for $tag"; exit 1; }
+          done < /tmp/ikeback-purge-list.tsv
+
           echo "--- remaining ---"
-          curl -sS -H "$auth" "$api/releases?per_page=100" | jq -r '.[] | "\(.tag_name)\t\(.name)"'
+          fetch_releases after
+          jq -r '[.tag_name, .name] | @tsv' /tmp/ikeback-releases-after.jsonl

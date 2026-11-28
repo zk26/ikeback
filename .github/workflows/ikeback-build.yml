@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
       # Qt6 is MANDATORY: several upstream plugins (filetransfer) are Qt6-only
       # (QUuid completeness, QCoreApplication::setQuitOnLastWindowClosed).
@@ -46,7 +46,7 @@ jobs:
 
       # Reuse compiler outputs across runs; keyed on the build config.
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: ~/.cache/ccache
           key: ccache-linux-${{ hashFiles('desktop/CMakeLists.txt', 'desktop/cmake/**', 'desktop/plugins/classroom/**') }}
@@ -61,7 +61,7 @@ jobs:
       # desktop/ikeback v4.11.4. Cloning HEAD pulls a different kldap revision and
       # breaks the build. Qt6 builds use `kldap`, Qt5 builds `kldap-qt5`.
       - name: Cache Veyon 3rdparty sources
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: desktop/3rdparty
           key: veyon-3rdparty-v4.11.4-30860286-c1e3836-7ad8859-2002b2c
@@ -100,16 +100,14 @@ jobs:
             -DWITH_PCH=OFF \
             -DWITH_UNITY_BUILD=OFF \
             -DWITH_STACK_PROTECTION=OFF \
-            -DWITH_TESTS=OFF \
+            -DWITH_TESTS=ON \
             -DWITH_CORE_ONLY=OFF \
             -DCMAKE_SKIP_INSTALL_RULES=ON \
             -DCMAKE_CXX_FLAGS="-Wno-deprecated-enum-enum-conversion -include cmath" 2>&1 | tee configure.log
 
-      # Build only the ikeback plugin target (plus everything it depends on:
-      # ikeback-core, Qt, etc.). Upstream plugins/filetransfer is broken in this
-      # 4.11.4 snapshot under BOTH Qt5 and Qt6 (missing <QUuid> include,
-      # qApp->setQuitOnLastWindowClosed on QCoreApplication); it is unrelated to
-      # ikeback and would make every full-project build fail.
+      # Build the plugin and every test target registered on Linux. A full
+      # project build still hits the unrelated, broken upstream filetransfer
+      # plugin, so enumerate the platform-conditional targets explicitly.
       - name: Build the ikeback plugin
         run: |
           set -o pipefail
@@ -122,6 +120,23 @@ jobs:
             exit 1
           fi
 
+      # Build every project test and every conditionally registered bundled
+      # LibVNC test before invoking CTest; CTest does not build missing targets.
+      - name: Build and run unit tests
+        run: |
+          set -o pipefail
+          targets=(ClassroomSelfTest LinuxKeyboardMappingTest
+                   PipeWireVncServerTest VncProtocolRobustnessTest)
+          target_help=$(cmake --build build --target help)
+          for candidate in test_cargstest test_tjunittest test_wstest; do
+            if grep -Fq "$candidate:" <<< "$target_help"; then
+              targets+=("$candidate")
+            fi
+          done
+          cmake --build build --parallel "$(nproc)" --target "${targets[@]}" 2>&1 | tee tests-build.log
+          ctest --test-dir build -N
+          QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure
+
       - name: Verify the ikeback plugin was produced
         run: |
           set -e
@@ -130,12 +145,13 @@ jobs:
 
       - name: Upload compile logs
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ikeback-desktop-build-logs
           path: |
             configure.log
             build.log
+            tests-build.log
             plugin-paths.txt
           if-no-files-found: warn
 
@@ -145,9 +161,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
           distribution: temurin
           java-version: '21'
@@ -155,7 +171,7 @@ jobs:
       # Reuse the Gradle dependency cache and the Android SDK packages AGP
       # downloads between runs.
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.gradle/caches
@@ -183,7 +199,7 @@ jobs:
           test -n "$APK" || { echo 'No APK produced'; exit 1; }
           cp "$APK" ikeback-Mobile.apk
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ikeback-mobile
           path: ikeback-Mobile.apk

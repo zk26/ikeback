@@ -28,6 +28,7 @@ import android.widget.TextView
 class BottomBar(
     context: Context,
     tabs: List<Tab>,
+    initialSelected: Int = 0,
     private val onSelected: (Int) -> Unit,
 ) : FrameLayout(context) {
 
@@ -37,7 +38,7 @@ class BottomBar(
     private val items = mutableListOf<View>()
     private val icons = mutableListOf<ImageView>()
     private val labels = mutableListOf<TextView>()
-    private var selected = -1
+    private var selected = initialSelected
 
     private val barHeight = Ui.dp(context, 62)
     private val outer = Ui.dp(context, 6)
@@ -101,10 +102,10 @@ class BottomBar(
         viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 viewTreeObserver.removeOnGlobalLayoutListener(this)
-                select(if (selected < 0) 0 else selected, animated = false)
+                select(if (selected in items.indices) selected else 0, animated = false)
             }
         })
-        post { select(0, animated = false) }
+        post { select(if (selected in items.indices) selected else 0, animated = false) }
     }
 
     fun select(index: Int, animated: Boolean = true) {

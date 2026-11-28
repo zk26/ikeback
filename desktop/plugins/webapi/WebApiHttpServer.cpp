@@ -29,6 +29,7 @@
 #include <QJsonDocument>
 #include <QSslCertificate>
 #include <QSslKey>
+#include <QUrl>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
 #include <QSslServer>
 #endif
@@ -46,26 +47,6 @@ static inline QByteArray toJson(const QVariant& data)
 }
 
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-static inline QByteArray toJson(const QList<QPair<QByteArray, QByteArray>>& headers)
-{
-	QVariantList data;
-	for (auto it = headers.constBegin(), end = headers.constEnd(); it != end; ++it)
-	{
-		data.append(QVariantList({it->first, it->second}));
-	}
-	return toJson(data);
-}
-#endif
-
-#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
-static inline QByteArray toJson(const QHttpHeaders& headers)
-{
-	return toJson(headers.toListOfPairs());
-}
-#endif
-
-
 
 static QHttpServerResponse convertResponse(const WebApiController::Request& request,
 										   const WebApiController::Response& response)
@@ -76,8 +57,7 @@ static QHttpServerResponse convertResponse(const WebApiController::Request& requ
 		{
 			waDebug() << "[RESP]"
 					  << request.path.toUtf8().constData()
-					  << toJson(request.headers).constData()
-					  << "[binary data]";
+						  << "[binary data]";
 			return QHttpServerResponse{ response.binaryData };
 		}
 
@@ -85,14 +65,12 @@ static QHttpServerResponse convertResponse(const WebApiController::Request& requ
 		{
 			waDebug() << "[RESP]"
 					  << request.path.toUtf8().constData()
-					  << toJson(request.headers).constData()
-					  << toJson(response.arrayData).constData();
+						  << toJson(response.arrayData).constData();
 			return { QJsonArray::fromVariantList(response.arrayData) };
 		}
 
 		waDebug() << "[RESP]"
 				  << request.path.toUtf8().constData()
-				  << toJson(request.headers).constData()
 				  << toJson(response.mapData).constData();
 		return { QJsonObject::fromVariantMap(response.mapData) };
 	}
@@ -166,9 +144,8 @@ template<>
 QVariantMap WebApiHttpServer::dataFromRequest<WebApiHttpServer::Method::Post>( const QHttpServerRequest& request )
 {
 	waDebug() << "[REQ] [POST]"
-			  << request.url().toString().toUtf8().constData()
-			  << toJson(request.headers()).constData()
-			  << request.body().constData();
+			  << request.url().adjusted( QUrl::RemoveQuery ).toString().toUtf8().constData()
+			  << "body-size" << request.body().size();
 
 	QVariantMap data;
 
@@ -187,9 +164,8 @@ template<>
 QVariantMap WebApiHttpServer::dataFromRequest<WebApiHttpServer::Method::Put>( const QHttpServerRequest& request )
 {
 	waDebug() << "[REQ] [PUT]"
-			  << request.url().toString().toUtf8().constData()
-			  << toJson(request.headers()).constData()
-			  << request.body().constData();
+			  << request.url().adjusted( QUrl::RemoveQuery ).toString().toUtf8().constData()
+			  << "body-size" << request.body().size();
 
 	QVariantMap data;
 
@@ -208,8 +184,7 @@ template<>
 QVariantMap WebApiHttpServer::dataFromRequest<WebApiHttpServer::Method::Get>( const QHttpServerRequest& request )
 {
 	waDebug() << "[REQ] [GET]"
-			  << request.url().toString().toUtf8().constData()
-			  << toJson(request.headers()).constData();
+			  << request.url().adjusted( QUrl::RemoveQuery ).toString().toUtf8().constData();
 
 	QVariantMap data;
 
@@ -228,8 +203,7 @@ template<>
 QVariantMap WebApiHttpServer::dataFromRequest<WebApiHttpServer::Method::Delete>( const QHttpServerRequest& request )
 {
 	waDebug() << "[REQ] [DELETE]"
-			  << request.url().toString().toUtf8().constData()
-			  << toJson(request.headers()).constData();
+			  << request.url().adjusted( QUrl::RemoveQuery ).toString().toUtf8().constData();
 
 	QVariantMap data;
 

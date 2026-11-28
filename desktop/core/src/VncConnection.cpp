@@ -505,6 +505,12 @@ void VncConnection::run()
 		establishConnection();
 		handleConnection();
 		closeConnection();
+		clearEventQueue();
+		if( m_droppedEvents.loadAcquire() > 0 )
+		{
+			vWarning() << "Dropped" << m_droppedEvents.loadAcquire() << "input events of an overloaded connection";
+			m_droppedEvents.storeRelease( 0 );
+		}
 
 		const auto minimumConnectionTime = m_framebufferUpdateInterval > 0 ?
 											   int(m_framebufferUpdateInterval) :
@@ -961,6 +967,7 @@ void VncConnection::sendEvents()
 	while( m_eventQueue.isEmpty() == false )
 	{
 		auto event = m_eventQueue.dequeue();
+		m_eventQueueBytes -= event->memoryUsage();
 
 		// unlock the queue mutex during the runtime of ClientEvent::fire()
 		m_eventQueueMutex.unlock();
@@ -988,16 +995,47 @@ void VncConnection::deleteLaterInMainThread()
 
 
 
+void VncConnection::clearEventQueue()
+{
+	QMutexLocker lock( &m_eventQueueMutex );
+	clearEventQueueLocked();
+}
+
+
+void VncConnection::clearEventQueueLocked()
+{
+	while( m_eventQueue.isEmpty() == false )
+	{
+		delete m_eventQueue.dequeue();
+	}
+	m_eventQueueBytes = 0;
+}
+
+
 void VncConnection::enqueueEvent(VncEvent* event)
 {
 	if( state() != State::Connected )
 	{
+		// Nobody drains the queue any more, so the event would leak for good.
+		delete event;
 		return;
 	}
 
-	m_eventQueueMutex.lock();
+	QMutexLocker lock( &m_eventQueueMutex );
+
+	// A slow machine or a malicious peer can stop the connection thread from
+	// draining the queue. Drop the oldest events instead of growing without bound.
+	const auto bytes = event->memoryUsage();
+	while( m_eventQueue.isEmpty() == false &&
+		   ( m_eventQueue.size() >= MaxQueuedEvents || m_eventQueueBytes + bytes > MaxQueuedEventBytes ) )
+	{
+		m_eventQueueBytes -= m_eventQueue.head()->memoryUsage();
+		delete m_eventQueue.dequeue();
+		++m_droppedEvents;
+	}
+
 	m_eventQueue.enqueue( event );
-	m_eventQueueMutex.unlock();
+	m_eventQueueBytes += bytes;
 
 	m_updateIntervalSleeper.wakeAll();
 }

@@ -4,10 +4,13 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
+import androidx.core.view.ViewCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import java.util.Calendar
 
 /**
@@ -37,19 +40,29 @@ private object GridMetrics {
 
 private fun View.dp(value: Int): Float = value * resources.displayMetrics.density
 
-/** Parsed once: Color.parseColor per onDraw frame causes needless allocations. */
-private object GridColors {
-    val textPrimary = Color.parseColor("#1F2D3D")
-    val textSecondary = Color.parseColor("#5A6B7B")
-    val textMuted = Color.parseColor("#8A97A6")
-    val breakText = Color.parseColor("#7A7392")
-    val headerBg = Color.parseColor("#F7F9FC")
-    val breakBg = Color.parseColor("#EDEFF5")
-    val line = Color.parseColor("#E8ECF2")
-    val todayAxisBg = Color.parseColor("#F2EEFF")
-    val todayGridBg = Color.parseColor("#F4F0FF")
-    val todayChip = Color.parseColor("#7C5CFF")
-    val todayRowBg = Color.parseColor("#EDE8FF")
+private fun Context.themeColor(attribute: Int, fallback: Int): Int {
+    val values = obtainStyledAttributes(intArrayOf(attribute))
+    return try {
+        values.getColor(0, fallback)
+    } finally {
+        values.recycle()
+    }
+}
+
+/** Resolve theme-aware colors once per view, never hardcode a light canvas. */
+private class GridColors(context: Context) {
+    val textPrimary = context.themeColor(android.R.attr.textColorPrimary, context.getColor(R.color.ikeback_title))
+    val textSecondary = context.themeColor(android.R.attr.textColorSecondary, context.getColor(R.color.ikeback_secondary))
+    val textMuted = context.getColor(R.color.ikeback_hint)
+    val breakText = context.getColor(R.color.ikeback_grid_break_text)
+    val headerBg = context.getColor(R.color.ikeback_grid_header)
+    val breakBg = context.getColor(R.color.ikeback_grid_break)
+    val line = context.getColor(R.color.ikeback_grid_line)
+    val todayAxisBg = context.getColor(R.color.ikeback_grid_today_axis)
+    val todayGridBg = context.getColor(R.color.ikeback_grid_today)
+    val todayChip = context.getColor(R.color.ikeback_primary)
+    val todayRowBg = context.getColor(R.color.ikeback_grid_today_row)
+    val onPrimary = context.getColor(R.color.ikeback_on_primary)
 }
 
 private fun weekDates(): List<Pair<String, Int>> {
@@ -93,18 +106,31 @@ private fun View.textPaint(sizeSp: Float, color: Int, bold: Boolean): Paint = Pa
 /** Frozen left axis: period label + one or two parallel time ranges. */
 class TimetableAxisView(context: Context) : View(context) {
     var timetable: Timetable = Timetable()
-        set(value) { field = value; requestLayout(); invalidate() }
+        set(value) {
+            field = value
+            contentDescription = "作息时间。" + value.periods.joinToString("；") { period ->
+                "${period.label} ${period.times.joinToString("、")}"
+            }
+            requestLayout()
+            invalidate()
+        }
     var nowRow: Int? = null
         set(value) { field = value; invalidate() }
 
+    private val colors = GridColors(context)
     private val density get() = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     // Cached paints: a getter here would allocate a Paint on every access,
     // i.e. dozens of times per onDraw frame.
-    private val labelPaint by lazy { textPaint(12f, GridColors.textPrimary, true) }
-    private val timePaint by lazy { textPaint(9f, GridColors.textSecondary, false) }
-    private val breakPaint by lazy { textPaint(11f, GridColors.textSecondary, true) }
-    private val todayFill = GridColors.todayAxisBg
+    init {
+        contentDescription = "作息时间。" + timetable.periods.joinToString("；") { period ->
+            "${period.label} ${period.times.joinToString("、")}"
+        }
+    }
+    private val labelPaint by lazy { textPaint(12f, colors.textPrimary, true) }
+    private val timePaint by lazy { textPaint(9f, colors.textSecondary, false) }
+    private val breakPaint by lazy { textPaint(11f, colors.textSecondary, true) }
+    private val todayFill = colors.todayAxisBg
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         setMeasuredDimension(
@@ -120,7 +146,7 @@ class TimetableAxisView(context: Context) : View(context) {
         val colW = w / cols
         val headerH = GridMetrics.HEADER_H * d
 
-        fill.color = GridColors.headerBg
+        fill.color = colors.headerBg
         canvas.drawRect(0f, 0f, w, headerH, fill)
         if (cols == 2) {
             for (i in 0..1) {
@@ -140,7 +166,7 @@ class TimetableAxisView(context: Context) : View(context) {
                 canvas.drawRect(0f, top, w, bottom, fill)
             }
             if (period.isBreak) {
-                fill.color = GridColors.breakBg
+                fill.color = colors.breakBg
                 canvas.drawRect(0f, top, w, bottom, fill)
                 canvas.drawText(period.label, w / 2f, (top + bottom) / 2f + 4f * d, breakPaint)
             } else {
@@ -154,7 +180,7 @@ class TimetableAxisView(context: Context) : View(context) {
                     canvas.drawText(period.times.firstOrNull() ?: "", w / 2f, top + 48f * d, timePaint)
                 }
             }
-            fill.color = GridColors.line
+            fill.color = colors.line
             canvas.drawRect(0f, bottom - d, w, bottom, fill)
         }
     }
@@ -162,28 +188,78 @@ class TimetableAxisView(context: Context) : View(context) {
 
 /** Scrollable day grid: today column, break rows, coloured spanning course blocks. */
 class TimetableCourseGridView(context: Context) : View(context) {
-    init {
-        // Without this, ACTION_DOWN returns false and ACTION_UP is never
-        // delivered, so tapping a cell would silently do nothing.
-        isClickable = true
-        isFocusable = false
-    }
-
     var timetable: Timetable = Timetable()
-        set(value) { field = value; requestLayout(); invalidate() }
+        set(value) {
+            field = value
+            ensureSelectedCell()
+            contentDescription = accessibilitySummary()
+            requestLayout()
+            invalidate()
+        }
     var nowRow: Int? = null
         set(value) { field = value; invalidate() }
     var onCellClick: ((day: Int, row: Int) -> Unit)? = null
+        set(value) {
+            field = value
+            isClickable = value != null
+            contentDescription = accessibilitySummary()
+        }
 
+    private var selectedCell: Pair<Int, Int>? = null
+    private val colors = GridColors(context)
     private val density get() = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     // Cached paints (see TimetableAxisView): avoid per-frame allocations.
-    private val dayPaint by lazy { textPaint(11f, GridColors.textPrimary, true) }
-    private val datePaint by lazy { textPaint(9f, GridColors.textMuted, false) }
-    private val todayTextPaint by lazy { textPaint(11f, Color.WHITE, true) }
+    private val dayPaint by lazy { textPaint(11f, colors.textPrimary, true) }
+    private val datePaint by lazy { textPaint(9f, colors.textMuted, false) }
+    private val todayTextPaint by lazy { textPaint(11f, colors.onPrimary, true) }
     private val blockText by lazy { textPaint(11f, Color.WHITE, true) }
     private val blockSub by lazy { textPaint(9f, Color.WHITE, false) }
-    private val breakPaint by lazy { textPaint(11f, GridColors.breakText, true) }
+    private val breakPaint by lazy { textPaint(11f, colors.breakText, true) }
+
+    init {
+        // Custom canvases need explicit focus/click semantics for TalkBack and keyboards.
+        isClickable = true
+        isFocusable = true
+        ensureSelectedCell()
+        contentDescription = accessibilitySummary()
+        ViewCompat.replaceAccessibilityAction(
+            this,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat(ACTION_PREVIOUS_CELL, "上一个课格"),
+            "上一个课格",
+        ) { _, _ ->
+            moveSelectedCell(-1)
+            true
+        }
+        ViewCompat.replaceAccessibilityAction(
+            this,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat(ACTION_NEXT_CELL, "下一个课格"),
+            "下一个课格",
+        ) { _, _ ->
+            moveSelectedCell(1)
+            true
+        }
+        ViewCompat.replaceAccessibilityAction(
+            this,
+            AccessibilityNodeInfoCompat.AccessibilityActionCompat(
+                AccessibilityNodeInfoCompat.AccessibilityActionCompat.ACTION_CLICK.id,
+                "编辑当前课格",
+            ),
+            "编辑当前课格",
+        ) { _, _ ->
+            performClick()
+            true
+        }
+    }
+
+    private fun moveSelectedCell(offset: Int) {
+        val cells = timetable.periods.indices
+            .filter { !timetable.periods[it].isBreak }
+            .flatMap { row -> (1..7).map { day -> day to row } }
+        val current = selectedCell?.let { cells.indexOf(it) } ?: -1
+        val target = (current + offset).takeIf { it in cells.indices } ?: return
+        selectCell(cells[target].first, cells[target].second, announce = true)
+    }
 
     // weekDates() builds 8 Calendar instances; cache it and refresh once a day.
     private var cachedDates: List<Pair<String, Int>>? = null
@@ -214,14 +290,14 @@ class TimetableCourseGridView(context: Context) : View(context) {
         val dates = dates()
 
         // Today column background.
-        fill.color = GridColors.todayGridBg
+        fill.color = colors.todayGridBg
         canvas.drawRect(dayW * (today - 1), 0f, dayW * today, height.toFloat(), fill)
 
         // Header: weekday + date, today gets a filled rounded chip.
         for (i in 0..6) {
             val left = dayW * i
             if (i + 1 == today) {
-                fill.color = GridColors.todayChip
+                fill.color = colors.todayChip
                 val chip = RectF(left + 5f * d, 6f * d, left + dayW - 5f * d, headerH - 6f * d)
                 canvas.drawRoundRect(chip, 12f * d, 12f * d, fill)
                 canvas.drawText(WEEKDAYS[i], left + dayW / 2f, headerH * 0.42f, todayTextPaint)
@@ -237,20 +313,32 @@ class TimetableCourseGridView(context: Context) : View(context) {
             val top = tops[index]
             val bottom = tops[index + 1]
             if (index == nowRow && !period.isBreak) {
-                fill.color = GridColors.todayRowBg
+                fill.color = colors.todayRowBg
                 canvas.drawRect(0f, top, width.toFloat(), bottom, fill)
             }
             if (period.isBreak) {
-                fill.color = GridColors.breakBg
+                fill.color = colors.breakBg
                 canvas.drawRect(0f, top, width.toFloat(), bottom, fill)
                 canvas.drawText(period.label, width / 2f, (top + bottom) / 2f + 4f * d, breakPaint)
             }
-            fill.color = GridColors.line
+            fill.color = colors.line
             canvas.drawRect(0f, bottom - d, width.toFloat(), bottom, fill)
         }
         for (i in 1..6) {
-            fill.color = GridColors.line
+            fill.color = colors.line
             canvas.drawRect(dayW * i - d, 0f, dayW * i, height.toFloat(), fill)
+        }
+
+        // A restrained focus outline makes keyboard/TalkBack cell selection visible.
+        if (isFocused) selectedCell?.let { (day, row) ->
+            val left = dayW * (day - 1) + 2f * d
+            val right = dayW * day - 2f * d
+            val box = RectF(left, tops[row] + 2f * d, right, tops[row + 1] - 2f * d)
+            fill.color = colors.textPrimary
+            fill.style = Paint.Style.STROKE
+            fill.strokeWidth = 2f * d
+            canvas.drawRoundRect(box, 8f * d, 8f * d, fill)
+            fill.style = Paint.Style.FILL
         }
 
         // Course blocks, positioned by rowTops so a block can span several rows.
@@ -290,23 +378,124 @@ class TimetableCourseGridView(context: Context) : View(context) {
         }
     }
 
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.action == MotionEvent.ACTION_DOWN) return true
-        if (event.action == MotionEvent.ACTION_UP) {
-            val d = density
-            val dayW = GridMetrics.DAY_COL_W * d
-            val day = (event.x / dayW).toInt() + 1
-            val tops = rowTops(timetable, d)
-            if (day in 1..7 && event.y >= GridMetrics.HEADER_H * d) {
-                val row = (0 until timetable.periods.size).firstOrNull { i ->
-                    event.y >= tops[i] && event.y < tops[i + 1]
-                }
-                if (row != null && timetable.periods[row].isBreak.not()) {
-                    onCellClick?.invoke(day, row)
-                    return true
-                }
+    private fun ensureSelectedCell() {
+        if (selectedCell?.let { (day, row) ->
+                day in 1..7 && timetable.periods.getOrNull(row)?.isBreak == false
+            } == true
+        ) return
+        val row = nowRow?.takeIf { timetable.periods.getOrNull(it)?.isBreak == false }
+            ?: timetable.periods.indices.firstOrNull { !timetable.periods[it].isBreak }
+        selectedCell = row?.let { todayDay() to it }
+    }
+
+    private fun cellDescription(day: Int, row: Int): String {
+        val period = timetable.periods.getOrNull(row)
+        val course = courseAt(timetable, day, row)
+        val detail = course?.let {
+            listOf(it.name, it.className, it.room, it.teacher).filter { value -> value.isNotBlank() }
+                .joinToString("，")
+        } ?: "无课"
+        return "${WEEKDAYS.getOrElse(day - 1) { "" }} ${period?.label.orEmpty()}，$detail"
+    }
+
+    private fun accessibilitySummary(): String = buildString {
+        append("本周课表。方向键选择课格，双击或按确认键编辑。")
+        for (day in 1..7) {
+            val lessons = timetable.periods.indices
+                .filter { !timetable.periods[it].isBreak }
+                .mapNotNull { row -> courseAt(timetable, day, row)?.let { "${timetable.periods[row].label} ${it.name}" } }
+                .distinct()
+            append(WEEKDAYS.getOrElse(day - 1) { "" }).append("：")
+            append(lessons.ifEmpty { listOf("无课") }.joinToString("；"))
+            append("。")
+        }
+        selectedCell?.let { (day, row) -> append("当前课格：").append(cellDescription(day, row)).append("。") }
+    }
+
+    private fun selectCell(day: Int, row: Int, announce: Boolean = false) {
+        if (day !in 1..7 || timetable.periods.getOrNull(row)?.isBreak != false) return
+        selectedCell = day to row
+        contentDescription = accessibilitySummary()
+        invalidate()
+        val tops = rowTops(timetable, density)
+        val dayWidth = GridMetrics.DAY_COL_W * density
+        requestRectangleOnScreen(Rect(
+            (dayWidth * (day - 1)).toInt(),
+            tops[row].toInt(),
+            (dayWidth * day).toInt(),
+            tops[row + 1].toInt(),
+        ), false)
+        if (announce) announceForAccessibility(cellDescription(day, row))
+    }
+
+    override fun onFocusChanged(gainFocus: Boolean, direction: Int, previouslyFocusedRect: android.graphics.Rect?) {
+        super.onFocusChanged(gainFocus, direction, previouslyFocusedRect)
+        if (gainFocus) {
+            ensureSelectedCell()
+            selectedCell?.let { (day, row) -> selectCell(day, row, announce = true) }
+        }
+    }
+
+    override fun performClick(): Boolean {
+        val handled = super.performClick()
+        val (day, row) = selectedCell ?: return handled
+        onCellClick?.invoke(day, row)
+        sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED)
+        return true
+    }
+
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent?): Boolean {
+        ensureSelectedCell()
+        val (day, row) = selectedCell ?: return super.onKeyDown(keyCode, event)
+        var targetDay = day
+        var targetRow = row
+        when (keyCode) {
+            android.view.KeyEvent.KEYCODE_DPAD_LEFT -> targetDay--
+            android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> targetDay++
+            android.view.KeyEvent.KEYCODE_DPAD_UP -> targetRow--
+            android.view.KeyEvent.KEYCODE_DPAD_DOWN -> targetRow++
+            android.view.KeyEvent.KEYCODE_ENTER, android.view.KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                performClick()
+                return true
             }
+            else -> return super.onKeyDown(keyCode, event)
+        }
+        // Skip break rows when moving vertically, while keeping horizontal movement simple.
+        if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_UP || keyCode == android.view.KeyEvent.KEYCODE_DPAD_DOWN) {
+            val step = if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_UP) -1 else 1
+            targetRow = row + step
+            while (targetRow in timetable.periods.indices && timetable.periods[targetRow].isBreak) targetRow += step
+        }
+        if (targetDay !in 1..7 || timetable.periods.getOrNull(targetRow)?.isBreak != false) return true
+        selectCell(targetDay, targetRow, announce = true)
+        return true
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (event.action == MotionEvent.ACTION_DOWN) {
+            val d = density
+            val day = (event.x / (GridMetrics.DAY_COL_W * d)).toInt() + 1
+            val tops = rowTops(timetable, d)
+            val row = (0 until timetable.periods.size).firstOrNull {
+                event.y >= tops[it] && event.y < tops[it + 1]
+            }
+            if (day in 1..7 && row != null) selectCell(day, row)
+            else {
+                selectedCell = null
+                contentDescription = accessibilitySummary()
+                invalidate()
+            }
+            return true
+        }
+        if (event.action == MotionEvent.ACTION_UP) {
+            performClick()
+            return true
         }
         return super.onTouchEvent(event)
+    }
+
+    private companion object {
+        const val ACTION_PREVIOUS_CELL = 0x100001
+        const val ACTION_NEXT_CELL = 0x100002
     }
 }

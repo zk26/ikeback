@@ -43,6 +43,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QLockFile>
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QPair>
@@ -52,13 +53,16 @@
 #include <QRegularExpression>
 #include <QPushButton>
 #include <QTcpSocket>
+#include <QSaveFile>
 #include <QScrollArea>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QSizePolicy>
 #include <QScopedValueRollback>
 #include <QSpinBox>
 #include <QStackedWidget>
 #include <QStatusBar>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -493,23 +497,39 @@ void ClassroomMasterDialog::setupClassTab()
 	m_rosterTable->setSelectionMode( QAbstractItemView::ExtendedSelection );
 	layout->addWidget( m_rosterTable, 1 );
 
-	auto* actionRow = new QHBoxLayout;
-	auto* assignButton = new QPushButton( tr( "Sign in by IP" ), page );
-	auto* batchLoginButton = new QPushButton( tr( "Batch sign in" ), page );
-	auto* batchLogoutButton = new QPushButton( tr( "Batch sign out" ), page );
-	auto* forceLogoutButton = new QPushButton( tr( "Force sign out" ), page );
-	auto* switchButton = new QPushButton( tr( "Change student" ), page );
-	auto* lockButton = new QPushButton( tr( "Lock all" ), page );
-	auto* unlockButton = new QPushButton( tr( "Unlock all" ), page );
-	auto* aiOnButton = new QPushButton( tr( "Enable AI (all)" ), page );
-	auto* aiOffButton = new QPushButton( tr( "Disable AI (all)" ), page );
-	auto* refreshButton = new QPushButton( tr( "Refresh" ), page );
+	// Keep the original single-row action order, but make it reachable when
+	// translated button labels exceed the available width.
+	auto* actionScroll = new QScrollArea( page );
+	actionScroll->setWidgetResizable( true );
+	actionScroll->setFrameShape( QFrame::NoFrame );
+	actionScroll->setHorizontalScrollBarPolicy( Qt::ScrollBarAlwaysOn );
+	actionScroll->setVerticalScrollBarPolicy( Qt::ScrollBarAlwaysOff );
+	actionScroll->setSizePolicy( QSizePolicy::Expanding, QSizePolicy::Fixed );
+	auto* actionWidget = new QWidget( actionScroll );
+	auto* actionRow = new QHBoxLayout( actionWidget );
+	actionRow->setContentsMargins( 0, 0, 0, 0 );
+	auto* assignButton = new QPushButton( tr( "Sign in by IP" ), actionWidget );
+	auto* batchLoginButton = new QPushButton( tr( "Batch sign in" ), actionWidget );
+	auto* batchLogoutButton = new QPushButton( tr( "Batch sign out" ), actionWidget );
+	auto* forceLogoutButton = new QPushButton( tr( "Force sign out" ), actionWidget );
+	auto* switchButton = new QPushButton( tr( "Change student" ), actionWidget );
+	auto* lockButton = new QPushButton( tr( "Lock all" ), actionWidget );
+	auto* unlockButton = new QPushButton( tr( "Unlock all" ), actionWidget );
+	auto* aiOnButton = new QPushButton( tr( "Enable AI (all)" ), actionWidget );
+	auto* aiOffButton = new QPushButton( tr( "Disable AI (all)" ), actionWidget );
+	auto* refreshButton = new QPushButton( tr( "Refresh" ), actionWidget );
 	for( auto* button : { assignButton, batchLoginButton, batchLogoutButton, forceLogoutButton, switchButton,
 						  lockButton, unlockButton, aiOnButton, aiOffButton, refreshButton } )
 	{
 		actionRow->addWidget( button );
 	}
-	layout->addLayout( actionRow );
+	actionWidget->setMinimumWidth( actionRow->sizeHint().width() );
+	const int actionHeight = actionWidget->sizeHint().height() +
+							 actionScroll->style()->pixelMetric( QStyle::PM_ScrollBarExtent );
+	actionScroll->setMinimumHeight( actionHeight );
+	actionScroll->setMaximumHeight( actionHeight );
+	actionScroll->setWidget( actionWidget );
+	layout->addWidget( actionScroll );
 
 	connect( assignButton, &QPushButton::clicked, this, [this]() { assignByIp(); } );
 	connect( batchLoginButton, &QPushButton::clicked, this, [this]() { batchLogin(); } );
@@ -607,6 +627,22 @@ void ClassroomMasterDialog::refreshStatus()
 }
 
 
+bool ClassroomMasterDialog::persistSettings()
+{
+	if( m_settings.save() ) { return true; }
+	QMessageBox::warning( this, windowTitle(), tr( "Could not save %1" ).arg( m_settings.filePath() ) );
+	return false;
+}
+
+
+bool ClassroomMasterDialog::persistRoster()
+{
+	if( m_roster.save() ) { return true; }
+	QMessageBox::warning( this, windowTitle(), tr( "Could not save the roster to %1" ).arg( m_roster.filePath() ) );
+	return false;
+}
+
+
 void ClassroomMasterDialog::addClass()
 {
 	bool ok = false;
@@ -616,7 +652,7 @@ void ClassroomMasterDialog::addClass()
 	ClassroomClass newClass;
 	newClass.name = name.trimmed();
 	m_roster.classes().append( newClass );
-	m_roster.save();
+	persistRoster();
 	refreshRosterTable();
 }
 
@@ -775,7 +811,7 @@ void ClassroomMasterDialog::importRoster()
 							  error.isEmpty() ? tr( "Nothing could be imported from that file." ) : error );
 		return;
 	}
-	m_roster.save();
+	if( persistRoster() == false ) { return; }
 	refreshRosterTable();
 	pushRoster();
 	if( const auto* imported = m_roster.findClass( currentClassName() ) )
@@ -822,7 +858,7 @@ void ClassroomMasterDialog::importRosterPaste()
 		QMessageBox::warning( this, windowTitle(), tr( "Nothing could be imported from the pasted text." ) );
 		return;
 	}
-	m_roster.save();
+	if( persistRoster() == false ) { return; }
 	refreshRosterTable();
 	pushRoster();
 	if( const auto* imported = m_roster.findClass( currentClassName() ) )
@@ -988,8 +1024,22 @@ void ClassroomMasterDialog::beginLesson()
 	const auto topic = m_lessonTopic && m_lessonTopic->text().trimmed().isEmpty() == false ?
 						   m_lessonTopic->text().trimmed() : QStringLiteral("开始上课");
 	ClassroomScoreBook book( dataDirectory() );
-	book.load( currentClassName() );
+	QLockFile lock( book.filePath( currentClassName() ) + QStringLiteral( ".lock" ) );
+	if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+		lock.tryLock( 1000 ) == false || book.load( currentClassName() ) == false )
+	{
+		m_lessonActive = false;
+		QMessageBox::warning( this, windowTitle(), tr( "Could not load or lock the score book for %1." )
+							  .arg( currentClassName() ) );
+		return;
+	}
 	m_currentLessonId = book.ensureLesson( QDate::currentDate(), topic );
+	if( m_currentLessonId.isEmpty() )
+	{
+		m_lessonActive = false;
+		QMessageBox::warning( this, windowTitle(), tr( "Could not save the lesson to the score book." ) );
+		return;
+	}
 	if( m_scorePanel ) { m_scorePanel->setCurrentLessonId( m_currentLessonId ); }
 	pushSettings();
 	pushRoster();
@@ -1048,7 +1098,7 @@ void ClassroomMasterDialog::generateKey()
 	// bridge only; it is NEVER sent to a student machine.
 	object.insert( QStringLiteral("sessionKey"), ClassroomSecrets::generateBridgeKey() );
 	m_settings.setObject( object );
-	m_settings.save();
+	persistSettings();
 	if( m_bridge ) { m_bridge->setSettings( settingsJson() ); }
 	refreshStatus();
 	pushKey();
@@ -1137,7 +1187,7 @@ void ClassroomMasterDialog::assignByIp()
 	}
 
 	auto* writable = m_roster.findClass( currentClassName() );
-	if( writable ) { writable->students = updated; m_roster.save(); }
+	if( writable ) { writable->students = updated; persistRoster(); }
 	refreshRosterTable();
 	refreshStatus();
 }
@@ -1157,7 +1207,7 @@ void ClassroomMasterDialog::quickLoginByIp()
 	// The typed student must end up in the roster table, otherwise the teacher
 	// signs someone in and the class list still looks empty.
 	if( upsertStudent( currentClassName(), seat, name, ip ) == false ) { return; }
-	m_roster.save();
+	if( persistRoster() == false ) { return; }
 	refreshRosterTable();
 
 	ClassroomStudent student;
@@ -1555,7 +1605,7 @@ void ClassroomMasterDialog::editCategories()
 	auto object = m_settings.object();
 	object.insert( QStringLiteral("interestCategories"), text );
 	m_settings.setObject( object );
-	m_settings.save();
+	persistSettings();
 	refreshAnalysis();
 	refreshLogs();
 }
@@ -2369,9 +2419,18 @@ void ClassroomMasterDialog::recordInstallResult( const QString& ip, bool success
 
 
 void ClassroomMasterDialog::recordPackageResult( const QString& ip, const QString& phase,
-												  bool success, const QString& detail )
+												 bool success, const QString& detail,
+												 const QString& deploymentId )
 {
 	if( m_deployPhase == DeployPhase::Idle || ip.isEmpty() || toolTargets().contains( ip ) == false ) { return; }
+	// A late receipt from a previous deployment must not advance this one, so
+	// every worker reply is bound to the id sent with DeployPackageBegin.
+	if( deploymentId.isEmpty() || deploymentId != m_deployId )
+	{
+		appendTeacherEvent( EventType::install(),
+			tr( "忽略过期部署回执 %1（部署编号不匹配）" ).arg( ip ) );
+		return;
+	}
 	if( phase == QStringLiteral("transfer") )
 	{
 		appendTeacherEvent( EventType::install(), tr( "部署传输失败 %1：%2" ).arg( ip, detail ) );
@@ -2656,7 +2715,7 @@ void ClassroomMasterDialog::setClientProtection( bool enabled )
 	auto object = settingsJson();
 	object.insert( SettingKey::exitProtection(), enabled );
 	m_settings.setObject( object );
-	m_settings.save();
+	persistSettings();
 	if( m_exitProtection ) { m_exitProtection->setChecked( enabled ); }
 
 	setToolStatus( enabled ?
@@ -2704,7 +2763,7 @@ void ClassroomMasterDialog::applyFuzzyRules( const QString& key, const QString& 
 	auto object = settingsJson();
 	object.insert( key, array );
 	m_settings.setObject( object );
-	m_settings.save();
+	persistSettings();
 
 	auto message = Classroom::message( key == SettingKey::blockedApps() ?
 									   Command::SetAppBlockRules : Command::SetWebBlockRules );
@@ -2755,13 +2814,35 @@ void ClassroomMasterDialog::scoreWholeClass( int delta, const QString& reason )
 	const auto base = tr( "全班 %1" ).arg( deltaText );
 	const auto label = reason.trimmed().isEmpty() ? base
 												  : QStringLiteral("%1（%2）").arg( base, reason.trimmed() );
+	QStringList failedSeats;
+	int saved = 0;
 	for( const auto& student : item->students )
 	{
-		m_scorePanel->addEntryForSeat( student.seat, delta, label );
+		if( m_scorePanel->addEntryForSeat( student.seat, delta, label ) )
+		{
+			++saved;
+		}
+		else
+		{
+			failedSeats.append( student.seat.isEmpty() ? student.name :
+								QStringLiteral("%1 (%2)").arg( student.seat, student.name ) );
+		}
 	}
-	appendTeacherEvent( EventType::quickScore(), label );
-	setToolStatus( tr( "已给全班 %1 名学生%2：%3" ).arg( item->students.size() ).arg( base, label ) );
+
+	const auto result = failedSeats.isEmpty()
+		? tr( "已给全班 %1 名学生%2：%3" ).arg( item->students.size() ).arg( base, label )
+		: tr( "全班 %1：已保存 %2/%3 名学生，失败 %4 名（%5）。" )
+			  .arg( base ).arg( saved ).arg( item->students.size() )
+			  .arg( failedSeats.size() ).arg( failedSeats.join( QStringLiteral(", ") ) );
+	appendTeacherEvent( EventType::quickScore(), result );
+	setToolStatus( result );
 	refreshSeatGrid();
+	if( failedSeats.isEmpty() == false )
+	{
+		QMessageBox::warning( this, windowTitle(),
+							  tr( "Some class scores could not be saved. Successful seats were kept; "
+								  "failed seats were: %1" ).arg( failedSeats.join( QStringLiteral(", ") ) ) );
+	}
 }
 
 
@@ -3033,35 +3114,86 @@ void ClassroomMasterDialog::setupTimetableTab()
 	timetableLayout->addLayout( timetableRow );
 	layout->addWidget( timetableCard );
 
-	connect( importTimetable, &QPushButton::clicked, this, [this]() {
+	const auto writeAtomically = [this]( const QString& path, const QByteArray& bytes ) {
+		QSaveFile file( path );
+		if( file.open( QIODevice::WriteOnly ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not save %1: %2" )
+								  .arg( path, file.errorString() ) );
+			return false;
+		}
+		if( file.write( bytes ) != bytes.size() )
+		{
+			file.cancelWriting();
+			QMessageBox::warning( this, windowTitle(), tr( "Could not write %1: %2" )
+								  .arg( path, file.errorString() ) );
+			return false;
+		}
+		if( file.commit() ) { return true; }
+		QMessageBox::warning( this, windowTitle(), tr( "Could not save %1: %2" )
+							  .arg( path, file.errorString() ) );
+		return false;
+	};
+
+	connect( importTimetable, &QPushButton::clicked, this, [this, writeAtomically]() {
 		const auto path = QFileDialog::getOpenFileName( this, tr( "Import timetable JSON" ),
 													   QString{}, tr( "JSON (*.json);;All files (*)" ) );
 		if( path.isEmpty() ) { return; }
 		QFile source( path );
-		if( source.open( QFile::ReadOnly ) == false ) { return; }
-		const auto bytes = source.readAll();
-		source.close();
-		if( QJsonDocument::fromJson( bytes ).object().isEmpty() ) { return; }
-		QDir().mkpath( dataDirectory() );
-		QFile target( timetableFilePath() );
-		if( target.open( QFile::WriteOnly | QFile::Truncate ) )
+		if( source.open( QFile::ReadOnly ) == false )
 		{
-			target.write( QJsonDocument( QJsonDocument::fromJson( bytes ).object() ).toJson( QJsonDocument::Compact ) );
-			target.close();
+			QMessageBox::warning( this, windowTitle(), tr( "Could not open %1: %2" )
+								  .arg( path, source.errorString() ) );
+			return;
 		}
+		const auto bytes = source.readAll();
+		const auto readError = source.error();
+		const auto readErrorString = source.errorString();
+		source.close();
+		if( readError != QFile::NoError )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not read %1: %2" )
+								  .arg( path, readErrorString ) );
+			return;
+		}
+		const auto document = QJsonDocument::fromJson( bytes );
+		if( document.isObject() == false || document.object().isEmpty() )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "%1 is not a valid timetable JSON object." ).arg( path ) );
+			return;
+		}
+		if( QDir().mkpath( dataDirectory() ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not create the data directory: %1" )
+								  .arg( dataDirectory() ) );
+			return;
+		}
+		if( writeAtomically( timetableFilePath(), document.toJson( QJsonDocument::Compact ) ) == false ) { return; }
 		refreshLessonRecords();
 	} );
-	connect( exportTimetable, &QPushButton::clicked, this, [this]() {
+	connect( exportTimetable, &QPushButton::clicked, this, [this, writeAtomically]() {
 		const auto path = QFileDialog::getSaveFileName( this, tr( "Export timetable JSON" ),
 													   QStringLiteral("ikeback-timetable.json"),
 													   tr( "JSON (*.json);;All files (*)" ) );
 		if( path.isEmpty() ) { return; }
 		QFile source( timetableFilePath() );
-		if( source.open( QFile::ReadOnly ) == false ) { return; }
+		if( source.open( QFile::ReadOnly ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not open %1: %2" )
+								  .arg( source.fileName(), source.errorString() ) );
+			return;
+		}
 		const auto bytes = source.readAll();
+		const auto readError = source.error();
+		const auto readErrorString = source.errorString();
 		source.close();
-		QFile target( path );
-		if( target.open( QFile::WriteOnly | QFile::Truncate ) ) { target.write( bytes ); target.close(); }
+		if( readError != QFile::NoError )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not read %1: %2" )
+								  .arg( source.fileName(), readErrorString ) );
+			return;
+		}
+		writeAtomically( path, bytes );
 	} );
 
 	// Per-lesson scoring, bound to the lesson topic the teacher types here.
@@ -3090,9 +3222,15 @@ void ClassroomMasterDialog::setupTimetableTab()
 			{
 				const auto topic = m_lessonTopic->text().trimmed();
 				ClassroomScoreBook book( dataDirectory() );
-				book.load( currentClassName() );
-				book.ensureLesson( QDate::currentDate(), topic );
-				book.save();
+				QLockFile lock( book.filePath( currentClassName() ) + QStringLiteral( ".lock" ) );
+				if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+					lock.tryLock( 1000 ) == false || book.load( currentClassName() ) == false ||
+					book.ensureLesson( QDate::currentDate(), topic ).isEmpty() )
+				{
+					QMessageBox::warning( this, windowTitle(), tr( "Could not save the lesson topic." ) );
+					return;
+				}
+				lock.unlock();
 				scoreWholeClass( delta );
 				refreshLessonRecords();
 			}
@@ -3102,9 +3240,14 @@ void ClassroomMasterDialog::setupTimetableTab()
 	lessonLayout->addLayout( scoreRow );
 	connect( saveTopic, &QPushButton::clicked, this, [this]() {
 		ClassroomScoreBook book( dataDirectory() );
-		book.load( currentClassName() );
-		book.ensureLesson( QDate::currentDate(), m_lessonTopic->text().trimmed() );
-		book.save();
+		QLockFile lock( book.filePath( currentClassName() ) + QStringLiteral( ".lock" ) );
+		if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+			lock.tryLock( 1000 ) == false || book.load( currentClassName() ) == false ||
+			book.ensureLesson( QDate::currentDate(), m_lessonTopic->text().trimmed() ).isEmpty() )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not save the lesson topic." ) );
+			return;
+		}
 		appendTeacherEvent( EventType::score(), tr( "Lesson topic: %1" ).arg( m_lessonTopic->text().trimmed() ) );
 		refreshLessonRecords();
 	} );
@@ -3325,7 +3468,7 @@ void ClassroomMasterDialog::setupToolsTab()
 			auto object = settingsJson();
 			object.insert( SettingKey::silencePageText(), m_toolSilence->text() );
 			m_settings.setObject( object );
-			m_settings.save();
+			persistSettings();
 			if( m_silenceText ) { m_silenceText->setText( m_toolSilence->text() ); }
 			send( Command::ShowSilencePage, true, m_toolSilence->text() );
 			setToolStatus( tr( "Silence page shown and text saved." ) );
@@ -3339,7 +3482,7 @@ void ClassroomMasterDialog::setupToolsTab()
 				auto object = settingsJson();
 				object.insert( SettingKey::silencePageText(), m_toolSilence ? m_toolSilence->text() : QString{} );
 				m_settings.setObject( object );
-				m_settings.save();
+				persistSettings();
 				send( Command::ShowSilencePage, true, m_toolSilence ? m_toolSilence->text() : QString{} );
 			}
 			else
@@ -3607,12 +3750,18 @@ void ClassroomMasterDialog::recordCheckIn( const QString& className, const QStri
 										   const QString& typedName )
 {
 	if( seat.isEmpty() || className != currentClassName() ) { return; }
-	m_checkInNames.insert( seat, typedName );
-	m_checkInTimes.insert( seat, QDateTime::currentDateTime() );
+	const auto checkInTime = QDateTime::currentDateTime();
 	if( m_currentLessonId.isEmpty() == false )
 	{
 		ClassroomScoreBook book( dataDirectory() );
-		book.load( currentClassName() );
+		QLockFile lock( book.filePath( currentClassName() ) + QStringLiteral( ".lock" ) );
+		if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+			lock.tryLock( 1000 ) == false || book.load( currentClassName() ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not load or lock the score book for %1." )
+								  .arg( currentClassName() ) );
+			return;
+		}
 		const auto* student = m_roster.findStudent( currentClassName(), seat );
 		ClassroomAttendance attendance;
 		attendance.lessonId = m_currentLessonId;
@@ -3623,9 +3772,16 @@ void ClassroomMasterDialog::recordCheckIn( const QString& className, const QStri
 								ClassroomAttendance::Present : ClassroomAttendance::Custom;
 		attendance.reason = attendance.status == ClassroomAttendance::Custom ? tr( "姓名不符" ) : QString{};
 		attendance.author = tr( "Teacher" );
-		attendance.checkInTime = m_checkInTimes.value( seat );
-		book.setAttendance( attendance );
+		attendance.checkInTime = checkInTime;
+		if( book.setAttendance( attendance ) == false )
+		{
+			QMessageBox::warning( this, windowTitle(), tr( "Could not save check-in for %1 (seat %2)." )
+								  .arg( attendance.student.isEmpty() ? seat : attendance.student, seat ) );
+			return;
+		}
 	}
+	m_checkInNames.insert( seat, typedName );
+	m_checkInTimes.insert( seat, checkInTime );
 	refreshCheckIn();
 }
 
@@ -3636,15 +3792,21 @@ void ClassroomMasterDialog::refreshCheckIn()
 
 	const auto* classItem = m_roster.findClass( currentClassName() );
 	const int rows = classItem ? classItem->students.size() : 0;
-	m_checkInTable->setRowCount( rows );
-	m_checkInTable->setEnabled( m_lessonActive );
 	ClassroomScoreBook book( dataDirectory() );
-	if( m_currentLessonId.isEmpty() == false ) { book.load( currentClassName() ); }
+	QLockFile lock( book.filePath( currentClassName() ) + QStringLiteral( ".lock" ) );
+	if( m_currentLessonId.isEmpty() == false &&
+		( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+		  lock.tryLock( 1000 ) == false || book.load( currentClassName() ) == false ) )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "Could not load or lock the score book for %1." )
+							  .arg( currentClassName() ) );
+		return;
+	}
 	int counts[5] = {};
 
 	const auto persist = [&]( const QString& seat, const QString& student, int status,
 							  const QString& reason, const QDateTime& checkInTime ) {
-		if( m_currentLessonId.isEmpty() ) { return; }
+		if( m_currentLessonId.isEmpty() ) { return false; }
 		ClassroomAttendance attendance;
 		attendance.lessonId = m_currentLessonId;
 		attendance.className = currentClassName();
@@ -3654,17 +3816,16 @@ void ClassroomMasterDialog::refreshCheckIn()
 		attendance.reason = reason;
 		attendance.author = tr( "Teacher" );
 		attendance.checkInTime = checkInTime;
-		book.setAttendance( attendance );
+		return book.setAttendance( attendance );
 	};
 
-	for( int row = 0; row < rows; ++row )
-	{
-		const auto& student = classItem->students.at( row );
+	// Initialise missing attendance before replacing the table. A failed write
+	// leaves the previous table intact rather than presenting unsaved state.
+	const auto resolveStatus = [&]( const ClassroomStudent& student, int& status, QString& reason ) {
 		const auto typed = m_checkInNames.value( student.seat );
-		const auto time = m_checkInTimes.value( student.seat );
 		const auto saved = book.attendanceFor( m_currentLessonId, student.seat );
-		int status = ClassroomAttendance::Absent;
-		QString reason;
+		status = ClassroomAttendance::Absent;
+		reason.clear();
 		if( saved.lessonId.isEmpty() == false )
 		{
 			status = saved.status;
@@ -3675,10 +3836,36 @@ void ClassroomMasterDialog::refreshCheckIn()
 			status = typed == student.name ? ClassroomAttendance::Present : ClassroomAttendance::Custom;
 			reason = status == ClassroomAttendance::Custom ? tr( "姓名不符" ) : QString{};
 		}
-		if( saved.lessonId.isEmpty() && m_currentLessonId.isEmpty() == false )
+		return saved.lessonId.isEmpty() && m_currentLessonId.isEmpty() == false;
+	};
+
+	if( classItem )
+	{
+		for( const auto& student : classItem->students )
 		{
-			persist( student.seat, student.name, status, reason, time );
+			int status = ClassroomAttendance::Absent;
+			QString reason;
+			if( resolveStatus( student, status, reason ) &&
+				persist( student.seat, student.name, status, reason, m_checkInTimes.value( student.seat ) ) == false )
+			{
+				QMessageBox::warning( this, windowTitle(), tr( "Could not save attendance for %1 (seat %2)." )
+									  .arg( student.name.isEmpty() ? student.seat : student.name, student.seat ) );
+				return;
+			}
 		}
+	}
+
+	lock.unlock();
+	m_checkInTable->setRowCount( rows );
+	m_checkInTable->setEnabled( m_lessonActive );
+	for( int row = 0; row < rows; ++row )
+	{
+		const auto& student = classItem->students.at( row );
+		const auto typed = m_checkInNames.value( student.seat );
+		const auto time = m_checkInTimes.value( student.seat );
+		int status = ClassroomAttendance::Absent;
+		QString reason;
+		resolveStatus( student, status, reason );
 		counts[qBound( 0, status, 4 )]++;
 
 		m_checkInTable->setItem( row, 0, new QTableWidgetItem( student.seat ) );
@@ -3688,11 +3875,15 @@ void ClassroomMasterDialog::refreshCheckIn()
 			time.isValid() ? time.toString( QStringLiteral("HH:mm:ss") ) : QString{} ) );
 
 		auto* reasonEdit = new QLineEdit( m_checkInTable );
+		reasonEdit->setAccessibleName( tr( "%1 seat %2 attendance reason" )
+									   .arg( student.name.isEmpty() ? student.seat : student.name, student.seat ) );
 		reasonEdit->setPlaceholderText( tr( "缺勤、迟到或自定义原因" ) );
 		reasonEdit->setText( reason );
 		m_checkInTable->setCellWidget( row, 4, reasonEdit );
 
 		auto* statusCombo = new QComboBox( m_checkInTable );
+		statusCombo->setAccessibleName( tr( "%1 seat %2 attendance status" )
+										.arg( student.name.isEmpty() ? student.seat : student.name, student.seat ) );
 		statusCombo->addItem( tr( "出勤" ), ClassroomAttendance::Present );
 		statusCombo->addItem( tr( "缺勤" ), ClassroomAttendance::Absent );
 		statusCombo->addItem( tr( "迟到" ), ClassroomAttendance::Late );
@@ -3705,7 +3896,14 @@ void ClassroomMasterDialog::refreshCheckIn()
 							  statusCombo, reasonEdit, lessonId = m_currentLessonId,
 							  className = currentClassName()]() {
 			ClassroomScoreBook freshBook( dataDirectory() );
-			freshBook.load( className );
+			QLockFile lock( freshBook.filePath( className ) + QStringLiteral( ".lock" ) );
+			if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ||
+				lock.tryLock( 1000 ) == false || freshBook.load( className ) == false )
+			{
+				QMessageBox::warning( this, windowTitle(), tr( "Could not load or lock the score book for %1." )
+									  .arg( className ) );
+				return;
+			}
 			ClassroomAttendance attendance;
 			attendance.lessonId = lessonId;
 			attendance.className = className;
@@ -3715,7 +3913,11 @@ void ClassroomMasterDialog::refreshCheckIn()
 			attendance.reason = reasonEdit->text().trimmed();
 			attendance.author = tr( "Teacher" );
 			attendance.checkInTime = m_checkInTimes.value( seat );
-			freshBook.setAttendance( attendance );
+			if( freshBook.setAttendance( attendance ) == false )
+			{
+				QMessageBox::warning( this, windowTitle(), tr( "Could not save attendance for %1 (seat %2)." )
+									  .arg( studentName.isEmpty() ? seat : studentName, seat ) );
+			}
 		};
 		connect( statusCombo, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, saveRow );
 		connect( reasonEdit, &QLineEdit::editingFinished, this, saveRow );

@@ -105,7 +105,8 @@ public:
 	void restartService();
 	//! Asks for a portable folder and deploys it to C:\IkebackApps.
 	void deployInstaller();
-	void recordPackageResult( const QString& ip, const QString& phase, bool success, const QString& detail );
+	void recordPackageResult( const QString& ip, const QString& phase, bool success, const QString& detail,
+							  const QString& deploymentId );
 	void recordProtectionState( const QString& ip, bool enabled );
 	void restoreProtectionStates( const QMap<QString, bool>& states );
 	//! 学生机真实安装回执，用于替代定时器误报完成。
@@ -205,6 +206,11 @@ private:
 	//! Student-bound copy of settingsJson() with every teacher-side secret removed.
 	QJsonObject settingsForStudents() const;
 	QString sessionKey() const;
+
+	//! Write settings.json / classes.json and tell the teacher when that fails.
+	//! Callers stop pushing data to the class when the roster could not be saved.
+	bool persistSettings();
+	bool persistRoster();
 
 	void addClass();
 	void importRoster();

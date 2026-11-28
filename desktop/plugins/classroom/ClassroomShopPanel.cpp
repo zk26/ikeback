@@ -464,6 +464,10 @@ void ClassroomShopPanel::editProduct()
 		Q_EMIT shopChanged();
 		refresh();
 	}
+	else
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "保存失败，请检查教师机数据目录。" ) );
+	}
 }
 
 
@@ -487,6 +491,10 @@ void ClassroomShopPanel::removeProduct()
 		appendShopEvent( tr( "删除商品：%1" ).arg( productName ), {}, {} );
 		Q_EMIT shopChanged();
 		refresh();
+	}
+	else
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "保存失败，请检查教师机数据目录。" ) );
 	}
 }
 
@@ -675,6 +683,10 @@ void ClassroomShopPanel::removeSelectedAuction()
 		Q_EMIT shopChanged();
 		refresh();
 	}
+	else
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "保存失败，请检查教师机数据目录。" ) );
+	}
 }
 
 
@@ -698,6 +710,10 @@ void ClassroomShopPanel::deliverRedemption()
 		appendShopEvent( tr( "发货完成" ), {}, {} );
 		Q_EMIT shopChanged();
 		refresh();
+	}
+	else
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "保存失败，请检查教师机数据目录。" ) );
 	}
 }
 

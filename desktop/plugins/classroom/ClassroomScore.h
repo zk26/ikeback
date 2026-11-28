@@ -86,6 +86,7 @@ public:
 	explicit ClassroomScoreBook( const QString& dataDirectory );
 
 	QString filePath( const QString& className ) const;
+	void migrateLegacyFile( const QString& className ) const;
 	bool load( const QString& className );
 	bool save() const;
 
@@ -127,4 +128,5 @@ private:
 	QVector<ClassroomScoreEntry> m_entries;
 	QVector<ClassroomAttendance> m_attendance;
 	ClassroomScoreRules m_rules;
+	mutable bool m_persisted{false};
 };

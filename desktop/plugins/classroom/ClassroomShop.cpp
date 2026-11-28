@@ -1,10 +1,10 @@
 /*
  * ClassroomShop.cpp - per-class shop and auction book on the teacher machine
  *
- * Every mutation follows the same order: book the score entry first, then
- * save the shop file. If the save fails the score entry is reversed again,
- * so a student is never charged for something the book did not record. All
- * callers run on the teacher GUI thread, so there is no concurrent writer.
+ * Score-changing operations first persist a pending journal with a fixed
+ * score-entry id, then write that entry, then atomically commit the shop
+ * mutation and clear the journal. Recovery removes an uncommitted charge or
+ * completes a committed refund, so retries never apply the delta twice.
  *
  * This file is part of the Ikeback classroom modification.
  */
@@ -19,8 +19,10 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QLockFile>
 #include <QSaveFile>
 #include <QUuid>
+#include <QVariant>
 
 #include "ClassroomData.h"
 #include "ClassroomScore.h"
@@ -111,6 +113,62 @@ QDateTime shopTimeStamp( const QJsonObject& object, const QString& key )
 QString boundedName( const QString& name )
 {
 	return name.trimmed().left( ClassroomShopBook::MaxNameLength );
+}
+
+
+constexpr int ShopJournalVersion = 1;
+constexpr int MaxCompletedShopOperations = 128;
+
+
+bool validPendingOperation( const QJsonObject& operation )
+{
+	const auto kind = operation.value( QStringLiteral("kind") ).toString();
+	const auto redemption = operation.value( QStringLiteral("redemption") ).toObject();
+	const int delta = operation.value( QStringLiteral("delta") ).toInt();
+	if( operation.value( QStringLiteral("version") ).toInt() != ShopJournalVersion ||
+		operation.value( QStringLiteral("id") ).toString().isEmpty() ||
+		operation.value( QStringLiteral("scoreEntryId") ).toString().isEmpty() ||
+		operation.value( QStringLiteral("seat") ).toString().isEmpty() ||
+		operation.value( QStringLiteral("student") ).toString().isEmpty() ||
+		redemption.value( QStringLiteral("id") ).toString().isEmpty() ||
+		redemption.value( QStringLiteral("price") ).toInt() != qAbs( delta ) )
+	{
+		return false;
+	}
+	if( kind == QStringLiteral("purchase") || kind == QStringLiteral("auction") )
+	{
+		return delta <= 0 &&
+			( kind != QStringLiteral("auction") ||
+			  operation.value( QStringLiteral("auctionId") ).toString().isEmpty() == false );
+	}
+	if( kind == QStringLiteral("reject") )
+	{
+		return delta >= 0 &&
+			operation.value( QStringLiteral("redemptionId") ).toString() ==
+				redemption.value( QStringLiteral("id") ).toString();
+	}
+	return false;
+}
+
+
+QString redeemFingerprint( const QString& productId, const QString& seat, const QString& student )
+{
+	return QString::fromLatin1( QJsonDocument( QJsonArray{ productId, seat, student } ).
+		toJson( QJsonDocument::Compact ) );
+}
+
+
+bool tryLockShopFile( QLockFile& lock )
+{
+	if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ) { return false; }
+	return lock.tryLock( 1000 );
+}
+
+
+bool tryLockScoreFile( QLockFile& lock )
+{
+	if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) == false ) { return false; }
+	return lock.tryLock( 1000 );
 }
 
 
@@ -330,49 +388,138 @@ QString ClassroomShopBook::directoryPath( const QString& dataDirectory )
 QString ClassroomShopBook::filePath() const
 {
 	return QDir( directoryPath( m_basePath ) ).filePath(
-		ClassroomLogStore::sanitize( m_className ) + QStringLiteral(".json") );
+		ClassroomLogStore::storageKey( m_className ) + QStringLiteral(".json") );
+}
+
+
+//! Old installations stored the book under the lossy sanitize() name.
+void ClassroomShopBook::migrateLegacyFile() const
+{
+	if( m_className.isEmpty() ) { return; }
+	ClassroomLogStore::migrateStorageKey( directoryPath( m_basePath ),
+					   ClassroomLogStore::sanitize( m_className ) + QStringLiteral(".json"),
+					   ClassroomLogStore::storageKey( m_className ) + QStringLiteral(".json") );
 }
 
 
 bool ClassroomShopBook::load( const QString& className )
 {
+	const auto previousClassName = m_className;
+	const auto previousLoaded = m_loaded;
+	const auto previousPersisted = m_persisted;
+	const auto previousOpen = m_open;
+	const auto previousRevision = m_revision;
+	const auto previousProducts = m_products;
+	const auto previousAuctions = m_auctions;
+	const auto previousRedemptions = m_redemptions;
+	const auto previousPendingOperation = m_pendingOperation;
+	const auto previousCompletedOperations = m_completedOperations;
+	const auto previousError = m_lastError;
 	m_className = className;
 	m_loaded = false;
+	m_persisted = false;
 	m_open = true;
 	m_revision = 0;
 	m_products.clear();
 	m_auctions.clear();
 	m_redemptions.clear();
+	m_pendingOperation = QJsonObject{};
+	m_completedOperations = QJsonArray{};
+	m_lastError.clear();
+	const auto fail = [&]() {
+		m_className = previousClassName;
+		m_loaded = previousLoaded;
+		m_persisted = previousPersisted;
+		m_open = previousOpen;
+		m_revision = previousRevision;
+		m_products = previousProducts;
+		m_auctions = previousAuctions;
+		m_redemptions = previousRedemptions;
+		m_pendingOperation = previousPendingOperation;
+		m_completedOperations = previousCompletedOperations;
+		m_lastError = previousError;
+		return false;
+	};
 	if( m_className.isEmpty() ) { m_loaded = true; return true; }
 
+	const auto modernFileName = filePath();
+	const auto legacyFileName = QDir( directoryPath( m_basePath ) ).filePath(
+		ClassroomLogStore::sanitize( m_className ) + QStringLiteral(".json") );
+	const auto fileName = QFile::exists( modernFileName ) == false && QFile::exists( legacyFileName ) ?
+							  legacyFileName : modernFileName;
 	bool ok = true;
-	const auto data = readShopFile( filePath(), &ok );
-	if( ok == false ) { return false; }
-	if( data.isEmpty() && QFileInfo::exists( filePath() ) ) { return false; }
+	const auto data = readShopFile( fileName, &ok );
+	if( ok == false ) { return fail(); }
+	if( data.isEmpty() && QFileInfo::exists( fileName ) == false &&
+		className.isEmpty() == false && className == previousClassName && previousPersisted ) { return fail(); }
+	if( data.isEmpty() && QFileInfo::exists( fileName ) ) { return fail(); }
 	if( data.isEmpty() == false )
 	{
 		const auto document = QJsonDocument::fromJson( data );
-		if( document.isObject() == false ) { return false; }
+		if( document.isObject() == false ) { return fail(); }
 		const auto object = document.object();
-		m_open = object.value( QStringLiteral("open") ).toBool( true );
-		m_revision = qMax<qint64>( 0, object.value( QStringLiteral("revision") ).toInteger() );
-		for( const auto& value : object.value( QStringLiteral("products") ).toArray() )
+		const auto productsValue = object.value( QStringLiteral("products") );
+		const auto auctionsValue = object.value( QStringLiteral("auctions") );
+		const auto redemptionsValue = object.value( QStringLiteral("redemptions") );
+		const auto completedValue = object.value( QStringLiteral("completedOperations") );
+		if( productsValue.isArray() == false || auctionsValue.isArray() == false ||
+			redemptionsValue.isArray() == false ||
+			( completedValue.isUndefined() == false && completedValue.isArray() == false ) )
 		{
-			if( static_cast<int>( m_products.size() ) >= MaxProducts ) { return false; }
+			return fail();
+		}
+		m_open = object.value( QStringLiteral("open") ).toBool( true );
+		m_revision = qMax<qint64>( 0, object.value( QStringLiteral("revision") ).toVariant().toLongLong() );
+		for( const auto& value : productsValue.toArray() )
+		{
+			if( value.isObject() == false || static_cast<int>( m_products.size() ) >= MaxProducts ) { return fail(); }
 			m_products.append( ClassroomShopProduct::fromJson( value.toObject() ) );
 		}
-		for( const auto& value : object.value( QStringLiteral("auctions") ).toArray() )
+		for( const auto& value : auctionsValue.toArray() )
 		{
-			if( static_cast<int>( m_auctions.size() ) >= ClassroomShopBook::MaxStoredAuctions ) { return false; }
+			if( value.isObject() == false ||
+				static_cast<int>( m_auctions.size() ) >= ClassroomShopBook::MaxStoredAuctions ) { return fail(); }
 			m_auctions.append( ClassroomShopAuction::fromStorage( value.toObject() ) );
 		}
-		for( const auto& value : object.value( QStringLiteral("redemptions") ).toArray() )
+		for( const auto& value : redemptionsValue.toArray() )
 		{
-			if( static_cast<int>( m_redemptions.size() ) >= MaxRedemptions ) { return false; }
+			if( value.isObject() == false || static_cast<int>( m_redemptions.size() ) >= MaxRedemptions ) { return fail(); }
 			m_redemptions.append( ClassroomShopRedemption::fromStorage( value.toObject() ) );
 		}
+		const auto pendingValue = object.value( QStringLiteral("pendingOperation") );
+		if( pendingValue.isObject() )
+		{
+			if( pendingValue.toObject().isEmpty() == false )
+			{
+				m_pendingOperation = pendingValue.toObject();
+				if( validPendingOperation( m_pendingOperation ) == false ) { return fail(); }
+			}
+		}
+		else if( pendingValue.isNull() == false && pendingValue.isUndefined() == false )
+		{
+			return fail();
+		}
+		for( const auto& value : completedValue.toArray() )
+		{
+			if( value.isObject() == false ) { return fail(); }
+			const auto completed = value.toObject();
+			if( completed.value( QStringLiteral("id") ).toString().isEmpty() == false &&
+				completed.value( QStringLiteral("fingerprint") ).toString().isEmpty() == false )
+			{
+				m_completedOperations.append( completed );
+			}
+		}
+		while( m_completedOperations.size() > MaxCompletedShopOperations )
+		{
+			m_completedOperations.removeFirst();
+		}
+	}
+	if( fileName != filePath() )
+	{
+		migrateLegacyFile();
 	}
 	m_loaded = true;
+	m_persisted = data.isEmpty() == false;
 	return true;
 }
 
@@ -393,8 +540,217 @@ bool ClassroomShopBook::save()
 		{ QStringLiteral("open"), m_open },
 		{ QStringLiteral("products"), products },
 		{ QStringLiteral("auctions"), storageArray( m_auctions ) },
-		{ QStringLiteral("redemptions"), storageArray( m_redemptions ) } };
-	return writeShopFile( filePath(), QJsonDocument( object ).toJson( QJsonDocument::Indented ) );
+		{ QStringLiteral("redemptions"), storageArray( m_redemptions ) },
+		{ QStringLiteral("pendingOperation"), m_pendingOperation },
+		{ QStringLiteral("completedOperations"), m_completedOperations } };
+	if( writeShopFile( filePath(), QJsonDocument( object ).toJson( QJsonDocument::Indented ) ) == false ) { return false; }
+	m_persisted = true;
+	return true;
+}
+
+
+bool ClassroomShopBook::preparePendingOperation( const QJsonObject& operation )
+{
+	if( m_loaded == false || m_pendingOperation.isEmpty() == false ||
+		validPendingOperation( operation ) == false )
+	{
+		return false;
+	}
+	m_pendingOperation = operation;
+	++m_revision;
+	if( save() ) { return true; }
+
+	m_pendingOperation = QJsonObject{};
+	--m_revision;
+	const auto error = QStringLiteral( "无法保存商城操作日志。" );
+	// QSaveFile is atomic, but reloading also reconciles the unlikely case of
+	// an ambiguous commit result before another operation is allowed.
+	load( m_className );
+	m_lastError = error;
+	return false;
+}
+
+
+bool ClassroomShopBook::appendScoreEntry( const ClassroomScoreEntry& entry )
+{
+	if( entry.delta == 0 ) { return true; }
+	ClassroomScoreBook book( m_basePath );
+	QLockFile lock( book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+	if( tryLockScoreFile( lock ) == false || book.load( m_className ) == false ) { return false; }
+	if( entry.id.isEmpty() == false )
+	{
+		for( const auto& existing : book.entries() )
+		{
+			if( existing.id == entry.id ) { return true; }
+		}
+	}
+
+	auto copy = entry;
+	if( copy.lessonId.isEmpty() )
+	{
+		copy.lessonId = book.ensureLesson( QDate::currentDate(), lessonTopic() );
+		if( copy.lessonId.isEmpty() ) { return false; }
+	}
+	if( book.addEntry( copy ) ) { return true; }
+	// addEntry() keeps the unsaved item in memory when save() fails.
+	book.load( m_className );
+	return false;
+}
+
+
+bool ClassroomShopBook::scoreEntryExists( const QString& entryId, bool* exists )
+{
+	*exists = false;
+	ClassroomScoreBook book( m_basePath );
+	QLockFile lock( book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+	if( tryLockScoreFile( lock ) == false || book.load( m_className ) == false ) { return false; }
+	for( const auto& entry : book.entries() )
+	{
+		if( entry.id == entryId ) { *exists = true; return true; }
+	}
+	return true;
+}
+
+
+bool ClassroomShopBook::removeScoreEntryExactly( const QString& entryId )
+{
+	ClassroomScoreBook book( m_basePath );
+	QLockFile lock( book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+	if( tryLockScoreFile( lock ) == false || book.load( m_className ) == false ) { return false; }
+	bool found = false;
+	for( const auto& entry : book.entries() )
+	{
+		if( entry.id == entryId ) { found = true; break; }
+	}
+	if( found == false ) { return true; }
+	if( book.removeEntry( entryId ) ) { return true; }
+	book.load( m_className );
+	for( const auto& entry : book.entries() )
+	{
+		if( entry.id == entryId ) { return false; }
+	}
+	return true;
+}
+
+
+bool ClassroomShopBook::recoverPendingOperations()
+{
+	if( m_className.isEmpty() ) { return true; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
+	return recoverPendingOperationsLocked();
+}
+
+
+bool ClassroomShopBook::recoverPendingOperationsLocked()
+{
+	if( m_pendingOperation.isEmpty() ) { m_lastError.clear(); return true; }
+	if( m_recovering ) { return false; }
+
+	m_recovering = true;
+	const auto operation = m_pendingOperation;
+	const auto kind = operation.value( QStringLiteral("kind") ).toString();
+	const auto scoreEntryId = operation.value( QStringLiteral("scoreEntryId") ).toString();
+	bool recovered = false;
+
+	if( kind == QStringLiteral("purchase") || kind == QStringLiteral("auction") )
+	{
+		// The shop commit clears the journal atomically. If it is still here,
+		// the charge is not committed and its fixed id can be removed once.
+		if( removeScoreEntryExactly( scoreEntryId ) )
+		{
+			m_pendingOperation = QJsonObject{};
+			++m_revision;
+			if( save() ) { recovered = true; }
+			else
+			{
+				--m_revision;
+				m_pendingOperation = operation;
+				load( m_className );
+				recovered = m_pendingOperation.isEmpty();
+			}
+		}
+	}
+	else if( kind == QStringLiteral("reject") )
+	{
+		bool refundExists = false;
+		const int delta = operation.value( QStringLiteral("delta") ).toInt();
+		if( delta == 0 || scoreEntryExists( scoreEntryId, &refundExists ) )
+		{
+			refundExists = delta == 0 || refundExists;
+			if( refundExists )
+			{
+				const auto previousProducts = m_products;
+				const auto previousRedemptions = m_redemptions;
+				const auto previousRevision = m_revision;
+				const auto redemption = ClassroomShopRedemption::fromStorage(
+					operation.value( QStringLiteral("redemption") ).toObject() );
+				const int index = shopIndexById( m_redemptions, redemption.id );
+				bool canCommit = true;
+				if( index < 0 || m_redemptions.at( index ).status != ClassroomShopRedemption::Pending )
+				{
+					if( index < 0 || m_redemptions.at( index ).status != ClassroomShopRedemption::Rejected )
+					{
+						// The target changed outside this journal. Do not leave a
+						// refund attached to a missing/delivered redemption.
+						canCommit = removeScoreEntryExactly( scoreEntryId );
+					}
+				}
+				else
+				{
+					m_redemptions[index].status = ClassroomShopRedemption::Rejected;
+					if( redemption.kind == ClassroomShopRedemption::Purchase )
+					{
+						const int productIndex = shopIndexById( m_products, redemption.productId );
+						if( productIndex >= 0 )
+						{
+							m_products[productIndex].stock = qMin( m_products[productIndex].stock + 1,
+								static_cast<int>( MaxStock ) );
+						}
+					}
+				}
+				if( canCommit )
+				{
+					m_pendingOperation = QJsonObject{};
+					++m_revision;
+					if( save() ) { recovered = true; }
+					else
+					{
+						m_products = previousProducts;
+						m_redemptions = previousRedemptions;
+						m_revision = previousRevision;
+						m_pendingOperation = operation;
+						load( m_className );
+						recovered = m_pendingOperation.isEmpty();
+					}
+				}
+			}
+			else
+			{
+				// No refund reached the score book, so the rejection never
+				// crossed its point of no return and can simply be rolled back.
+				m_pendingOperation = QJsonObject{};
+				++m_revision;
+				if( save() ) { recovered = true; }
+				else
+				{
+					--m_revision;
+					m_pendingOperation = operation;
+					load( m_className );
+					recovered = m_pendingOperation.isEmpty();
+				}
+			}
+		}
+	}
+
+	m_recovering = false;
+	m_lastError = recovered ? QString{} :
+		QStringLiteral( "商城积分操作尚未恢复，已暂停新的积分操作，请稍后重试。" );
+	return recovered;
 }
 
 
@@ -425,7 +781,14 @@ const ClassroomShopRedemption* ClassroomShopBook::redemption( const QString& red
 
 bool ClassroomShopBook::setOpen( bool open )
 {
-	if( m_className.isEmpty() || open == m_open ) { return true; }
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
+	if( open == m_open ) { return true; }
 	const auto previous = m_open;
 	m_open = open;
 	++m_revision;
@@ -449,11 +812,25 @@ bool ClassroomShopBook::makeRedemptionCapacity()
 }
 
 
+bool ClassroomShopBook::canMakeRedemptionCapacity() const
+{
+	if( static_cast<int>( m_redemptions.size() ) < MaxRedemptions ) { return true; }
+	return std::any_of( m_redemptions.begin(), m_redemptions.end(),
+		[]( const ClassroomShopRedemption& item ) { return item.status != ClassroomShopRedemption::Pending; } );
+}
+
+
 // ------------------------------------------------------------------ catalog
 
 bool ClassroomShopBook::addProduct( ClassroomShopProduct* product )
 {
 	if( product == nullptr || m_className.isEmpty() || product->name.trimmed().isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	if( static_cast<int>( m_products.size() ) >= MaxProducts ) { return false; }
 
 	ClassroomShopProduct entry = *product;
@@ -480,6 +857,13 @@ bool ClassroomShopBook::addProduct( ClassroomShopProduct* product )
 
 bool ClassroomShopBook::updateProduct( const ClassroomShopProduct& product )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	const int index = shopIndexById( m_products, product.id );
 	if( index < 0 || product.name.trimmed().isEmpty() ) { return false; }
 
@@ -506,6 +890,13 @@ bool ClassroomShopBook::updateProduct( const ClassroomShopProduct& product )
 
 bool ClassroomShopBook::removeProduct( const QString& productId )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	const int index = shopIndexById( m_products, productId );
 	if( index < 0 ) { return false; }
 
@@ -523,6 +914,13 @@ bool ClassroomShopBook::removeProduct( const QString& productId )
 
 bool ClassroomShopBook::adjustStock( const QString& productId, int delta )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	const int index = shopIndexById( m_products, productId );
 	if( index < 0 ) { return false; }
 	const auto previous = m_products.at( index ).stock;
@@ -540,6 +938,13 @@ bool ClassroomShopBook::adjustStock( const QString& productId, int delta )
 
 bool ClassroomShopBook::setProductListed( const QString& productId, bool listed )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	const int index = shopIndexById( m_products, productId );
 	if( index < 0 || m_products.at( index ).listed == listed ) { return index >= 0; }
 	const auto previous = m_products.at( index ).listed;
@@ -555,6 +960,12 @@ bool ClassroomShopBook::setProductListed( const QString& productId, bool listed 
 QString ClassroomShopBook::startAuction( const QString& name, int startPrice, int minIncrement )
 {
 	if( m_className.isEmpty() || name.trimmed().isEmpty() ) { return {}; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return {};
+	}
 	int openCount = 0;
 	for( const auto& auction : m_auctions )
 	{
@@ -602,6 +1013,18 @@ QString ClassroomShopBook::startAuction( const QString& name, int startPrice, in
 ClassroomShopAuctionResult ClassroomShopBook::closeAuction( const QString& auctionId )
 {
 	ClassroomShopAuctionResult result;
+	if( m_className.isEmpty() ) { return result; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		result.error = QStringLiteral( "无法加载或锁定商城数据。" );
+		return result;
+	}
+	if( recoverPendingOperationsLocked() == false )
+	{
+		result.error = lastError();
+		return result;
+	}
 	const int index = shopIndexById( m_auctions, auctionId );
 	if( index < 0 || m_auctions.at( index ).open == false ) { return result; }
 
@@ -626,7 +1049,6 @@ ClassroomShopAuctionResult ClassroomShopBook::closeAuction( const QString& aucti
 
 	// 价高者得: bids are stored in ascending order, so the last one wins.
 	const auto winning = m_auctions.at( index ).bids.last();
-	result.sold = true;
 	result.price = winning.amount;
 	result.winnerSeat = winning.seat;
 	result.winnerStudent = winning.student;
@@ -648,12 +1070,10 @@ ClassroomShopAuctionResult ClassroomShopBook::closeAuction( const QString& aucti
 			arg( ClassroomShopBook::ProtectedScore );
 		return result;
 	}
-
-	if( bookScore( winning.seat, winning.student, -winning.amount,
-				   QStringLiteral( "竞拍拍得：%1" ).arg( result.name ) ) == false )
+	if( canMakeRedemptionCapacity() == false )
 	{
 		result = ClassroomShopAuctionResult{};
-		result.error = QStringLiteral( "无法写入积分记录，竞拍保持进行中，请稍后重试。" );
+		result.error = QStringLiteral( "待发货队列已满，请先处理发货记录，竞拍保持进行中。" );
 		return result;
 	}
 
@@ -666,37 +1086,103 @@ ClassroomShopAuctionResult ClassroomShopBook::closeAuction( const QString& aucti
 	redemption.kind = ClassroomShopRedemption::AuctionWin;
 	redemption.timestamp = QDateTime::currentDateTime();
 
+	const auto scoreEntryId = newShopId();
+	const auto label = QStringLiteral( "竞拍拍得：%1" ).arg( result.name );
+	const QJsonObject operation{
+		{ QStringLiteral("version"), ShopJournalVersion },
+		{ QStringLiteral("id"), newShopId() },
+		{ QStringLiteral("kind"), QStringLiteral("auction") },
+		{ QStringLiteral("auctionId"), auctionId },
+		{ QStringLiteral("scoreEntryId"), scoreEntryId },
+		{ QStringLiteral("seat"), winning.seat },
+		{ QStringLiteral("student"), winning.student },
+		{ QStringLiteral("delta"), -winning.amount },
+		{ QStringLiteral("label"), label },
+		{ QStringLiteral("redemption"), redemption.toStorage() },
+		{ QStringLiteral("created"), redemption.timestamp.toString( Qt::ISODateWithMs ) } };
+	if( preparePendingOperation( operation ) == false )
+	{
+		result = ClassroomShopAuctionResult{};
+		result.error = QStringLiteral( "无法保存竞拍操作日志，竞拍保持进行中。%1" ).arg( lastError() );
+		return result;
+	}
+
+	ClassroomScoreEntry charge;
+	charge.id = scoreEntryId;
+	charge.timestamp = redemption.timestamp;
+	charge.className = m_className;
+	charge.seat = winning.seat;
+	charge.student = winning.student;
+	charge.delta = -winning.amount;
+	charge.label = label;
+	charge.author = lessonTopic();
+	if( appendScoreEntry( charge ) == false )
+	{
+		recoverPendingOperationsLocked();
+		result = ClassroomShopAuctionResult{};
+		result.error = QStringLiteral( "无法写入积分记录，竞拍保持进行中，请稍后重试。%1" ).arg( lastError() );
+		return result;
+	}
+
 	const auto previousRedemptions = m_redemptions;
+	const auto previousRevision = m_revision;
 	m_auctions[index].open = false;
 	if( makeRedemptionCapacity() == false )
 	{
 		m_auctions[index].open = true;
 		m_redemptions = previousRedemptions;
-		bookScore( winning.seat, winning.student, winning.amount,
-				   QStringLiteral( "竞拍未成交，退回：%1" ).arg( result.name ) );
+		m_revision = previousRevision;
+		recoverPendingOperationsLocked();
 		result = ClassroomShopAuctionResult{};
-		result.error = QStringLiteral( "待发货队列已满，请先处理发货记录，竞拍保持进行中。" );
+		result.error = QStringLiteral( "待发货队列已满，竞拍保持进行中。%1" ).arg( lastError() );
 		return result;
 	}
 	m_redemptions.append( redemption );
 	++m_revision;
-	if( save() == false )
+	m_pendingOperation = QJsonObject{};
+	if( save() )
 	{
-		// Undo everything: the points go back and the auction stays open.
-		m_auctions[index].open = true;
-		m_redemptions = previousRedemptions;
-		--m_revision;
-		bookScore( winning.seat, winning.student, winning.amount,
-				   QStringLiteral( "竞拍未成交，退回：%1" ).arg( result.name ) );
-		result = ClassroomShopAuctionResult{};
-		result.error = QStringLiteral( "商城数据保存失败，竞拍保持进行中，请稍后重试。" );
+		result.sold = true;
+		return result;
 	}
+
+	// Reconcile an ambiguous commit before touching the score again. If the
+	// final atomic save won, the auction is closed and the journal is gone.
+	m_auctions[index].open = true;
+	m_redemptions = previousRedemptions;
+	m_revision = previousRevision;
+	m_pendingOperation = operation;
+	load( m_className );
+	const auto* committedAuction = auction( auctionId );
+	if( m_loaded && m_pendingOperation.isEmpty() && committedAuction != nullptr &&
+		committedAuction->open == false && shopItemById( m_redemptions, redemption.id ) != nullptr )
+	{
+		result.sold = true;
+		return result;
+	}
+	recoverPendingOperationsLocked();
+	const auto* recoveredAuction = auction( auctionId );
+	if( m_pendingOperation.isEmpty() && recoveredAuction != nullptr &&
+		recoveredAuction->open == false && shopItemById( m_redemptions, redemption.id ) != nullptr )
+	{
+		result.sold = true;
+		return result;
+	}
+	result = ClassroomShopAuctionResult{};
+	result.error = QStringLiteral( "商城数据保存失败，竞拍未成交；请稍后重试。%1" ).arg( lastError() );
 	return result;
 }
 
 
 bool ClassroomShopBook::removeAuction( const QString& auctionId )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
 	const int index = shopIndexById( m_auctions, auctionId );
 	if( index < 0 ) { return false; }
 
@@ -712,9 +1198,35 @@ bool ClassroomShopBook::removeAuction( const QString& auctionId )
 
 
 QString ClassroomShopBook::redeem( const QString& productId, const QString& seat,
-								   const QString& student, int balance )
+								   const QString& student, int balance,
+								   const QString& operationId )
 {
-	if( seat.trimmed().isEmpty() ) { return QStringLiteral( "请先签到后再兑换。" ); }
+	if( m_className.isEmpty() ) { return QStringLiteral( "班级不存在。" ); }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		return QStringLiteral( "无法加载或锁定商城数据。" );
+	}
+	if( recoverPendingOperationsLocked() == false ) { return lastError(); }
+	const auto normalizedSeat = seat.trimmed().left( 16 );
+	const auto normalizedStudent = student.trimmed().left( 32 );
+	const auto stableOperationId = operationId.trimmed().left( 128 );
+	const auto fingerprint = redeemFingerprint( productId, normalizedSeat, normalizedStudent );
+	if( stableOperationId.isEmpty() == false )
+	{
+		for( const auto& value : m_completedOperations )
+		{
+			const auto completed = value.toObject();
+			if( completed.value( QStringLiteral("id") ).toString() != stableOperationId ) { continue; }
+			if( completed.value( QStringLiteral("fingerprint") ).toString() != fingerprint )
+			{
+				return QStringLiteral( "该操作编号已用于其他兑换请求。" );
+			}
+			return {};
+		}
+	}
+
+	if( normalizedSeat.isEmpty() ) { return QStringLiteral( "请先签到后再兑换。" ); }
 	if( m_open == false ) { return QStringLiteral( "老师暂时关闭了商场，请稍后再来。" ); }
 
 	const int index = shopIndexById( m_products, productId );
@@ -728,43 +1240,103 @@ QString ClassroomShopBook::redeem( const QString& productId, const QString& seat
 		return QStringLiteral( "可用积分不足：需要 %1 分，你当前可用 %2 分（总积分 %3，保留 %4 分）。" ).
 			arg( product.price ).arg( available ).arg( balance ).arg( ProtectedScore );
 	}
-	const auto previousRedemptions = m_redemptions;
-	if( makeRedemptionCapacity() == false )
+	if( canMakeRedemptionCapacity() == false )
 	{
-		m_redemptions = previousRedemptions;
 		return QStringLiteral( "待发货队列已满，请先让老师处理发货记录。" );
-	}
-
-	// Score first, stock second: a failed save refunds the student again.
-	const auto label = QStringLiteral( "兑换：%1" ).arg( product.name );
-	if( bookScore( seat, student, -product.price, label ) == false )
-	{
-		m_redemptions = previousRedemptions;
-		return QStringLiteral( "无法写入积分记录，请稍后重试。" );
 	}
 
 	ClassroomShopRedemption redemption;
 	redemption.id = newShopId();
 	redemption.productId = product.id;
 	redemption.productName = product.name;
-	redemption.seat = seat.trimmed().left( 16 );
-	redemption.student = student.trimmed().left( 32 );
+	redemption.seat = normalizedSeat;
+	redemption.student = normalizedStudent;
 	redemption.price = product.price;
 	redemption.kind = ClassroomShopRedemption::Purchase;
 	redemption.timestamp = QDateTime::currentDateTime();
 
+	const auto scoreEntryId = newShopId();
+	const auto label = QStringLiteral( "兑换：%1" ).arg( product.name );
+	const QJsonObject operation{
+		{ QStringLiteral("version"), ShopJournalVersion },
+		{ QStringLiteral("id"), stableOperationId.isEmpty() ? newShopId() : stableOperationId },
+		{ QStringLiteral("kind"), QStringLiteral("purchase") },
+		{ QStringLiteral("fingerprint"), fingerprint },
+		{ QStringLiteral("scoreEntryId"), scoreEntryId },
+		{ QStringLiteral("seat"), normalizedSeat },
+		{ QStringLiteral("student"), normalizedStudent },
+		{ QStringLiteral("delta"), -product.price },
+		{ QStringLiteral("label"), label },
+		{ QStringLiteral("redemption"), redemption.toStorage() },
+		{ QStringLiteral("created"), redemption.timestamp.toString( Qt::ISODateWithMs ) } };
+	if( preparePendingOperation( operation ) == false )
+	{
+		return QStringLiteral( "无法保存兑换操作日志，请稍后重试。%1" ).arg( lastError() );
+	}
+
+	ClassroomScoreEntry charge;
+	charge.id = scoreEntryId;
+	charge.timestamp = redemption.timestamp;
+	charge.className = m_className;
+	charge.seat = normalizedSeat;
+	charge.student = normalizedStudent;
+	charge.delta = -product.price;
+	charge.label = label;
+	charge.author = lessonTopic();
+	if( appendScoreEntry( charge ) == false )
+	{
+		recoverPendingOperationsLocked();
+		return QStringLiteral( "无法写入积分记录，请稍后重试。%1" ).arg( lastError() );
+	}
+
+	const auto previousRedemptions = m_redemptions;
+	const auto previousCompletedOperations = m_completedOperations;
+	const auto previousRevision = m_revision;
 	--m_products[index].stock;
-	m_redemptions.append( redemption );
-	++m_revision;
-	if( save() == false )
+	if( makeRedemptionCapacity() == false )
 	{
 		++m_products[index].stock;
 		m_redemptions = previousRedemptions;
-		--m_revision;
-		bookScore( seat, student, product.price, QStringLiteral( "兑换未成功，退回：%1" ).arg( product.name ) );
-		return QStringLiteral( "商城数据保存失败，请稍后重试。" );
+		m_revision = previousRevision;
+		recoverPendingOperationsLocked();
+		return QStringLiteral( "待发货队列已满，请稍后重试。%1" ).arg( lastError() );
 	}
-	return {};
+	m_redemptions.append( redemption );
+	if( stableOperationId.isEmpty() == false )
+	{
+		m_completedOperations.append( QJsonObject{
+			{ QStringLiteral("id"), stableOperationId },
+			{ QStringLiteral("fingerprint"), fingerprint },
+			{ QStringLiteral("redemptionId"), redemption.id },
+			{ QStringLiteral("ts"), redemption.timestamp.toString( Qt::ISODateWithMs ) } } );
+		while( m_completedOperations.size() > MaxCompletedShopOperations )
+		{
+			m_completedOperations.removeFirst();
+		}
+	}
+	++m_revision;
+	m_pendingOperation = QJsonObject{};
+	if( save() ) { return {}; }
+
+	// The final save contains both the stock/redemption mutation and the
+	// idempotency record. Reconcile before reporting failure or rolling back.
+	++m_products[index].stock;
+	m_products[index].stock = qMin( m_products[index].stock, static_cast<int>( MaxStock ) );
+	m_redemptions = previousRedemptions;
+	m_completedOperations = previousCompletedOperations;
+	m_revision = previousRevision;
+	m_pendingOperation = operation;
+	load( m_className );
+	if( m_pendingOperation.isEmpty() && shopItemById( m_redemptions, redemption.id ) != nullptr )
+	{
+		return {};
+	}
+	recoverPendingOperationsLocked();
+	if( m_pendingOperation.isEmpty() && shopItemById( m_redemptions, redemption.id ) != nullptr )
+	{
+		return {};
+	}
+	return QStringLiteral( "商城数据保存失败，兑换未完成；请稍后重试。%1" ).arg( lastError() );
 }
 
 
@@ -772,6 +1344,12 @@ QString ClassroomShopBook::placeBid( const QString& auctionId, int amount, const
 									 const QString& student, int balance )
 {
 	if( seat.trimmed().isEmpty() ) { return QStringLiteral( "请先签到后再竞拍。" ); }
+	if( m_className.isEmpty() ) { return QStringLiteral( "班级不存在。" ); }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		return QStringLiteral( "无法加载或锁定商城数据。" );
+	}
 	if( m_open == false ) { return QStringLiteral( "老师暂时关闭了商场，请稍后再来。" ); }
 
 	const int index = shopIndexById( m_auctions, auctionId );
@@ -812,6 +1390,14 @@ QString ClassroomShopBook::placeBid( const QString& auctionId, int amount, const
 
 bool ClassroomShopBook::setRedemptionStatus( const QString& redemptionId, int status )
 {
+	if( m_className.isEmpty() ) { return false; }
+	QLockFile lock( filePath() + QStringLiteral( ".lock" ) );
+	if( tryLockShopFile( lock ) == false || load( m_className ) == false )
+	{
+		m_lastError = QStringLiteral( "无法加载或锁定商城数据。" );
+		return false;
+	}
+	if( recoverPendingOperationsLocked() == false ) { return false; }
 	const int index = shopIndexById( m_redemptions, redemptionId );
 	if( index < 0 ) { return false; }
 
@@ -824,51 +1410,104 @@ bool ClassroomShopBook::setRedemptionStatus( const QString& redemptionId, int st
 		return false;
 	}
 
-	// Only a pending rejection gives anything back: it always refunds the price and a
-	// shop purchase also returns the unit to the shelf. Auction wins are never
-	// restocked because the item was never taken from the catalog.
 	const bool rejecting = status == ClassroomShopRedemption::Rejected;
-	if( rejecting )
+	if( rejecting == false )
 	{
-		ClassroomRoster roster( m_basePath );
-		const auto* currentStudent = roster.findStudent( m_className, previous.seat );
-		if( currentStudent == nullptr || currentStudent->name != previous.student ) { return false; }
-	}
-	if( rejecting && bookScore( previous.seat, previous.student, previous.price,
-								QStringLiteral( "退回：%1" ).arg( previous.productName ) ) == false )
-	{
+		m_redemptions[index].status = status;
+		++m_revision;
+		if( save() ) { return true; }
+		m_redemptions[index] = previous;
+		--m_revision;
+		m_lastError = QStringLiteral( "发货状态保存失败。" );
 		return false;
 	}
 
-	int restocked = -1;
-	int previousStock = 0;
-	if( rejecting && previous.kind == ClassroomShopRedemption::Purchase )
+	ClassroomRoster roster( m_basePath );
+	const auto* currentStudent = roster.findStudent( m_className, previous.seat );
+	if( currentStudent == nullptr || currentStudent->name != previous.student )
 	{
-		for( int productIndex = 0; productIndex < m_products.size(); ++productIndex )
+		m_lastError = QStringLiteral( "座位学生身份已变化，无法退款。" );
+		return false;
+	}
+
+	const auto scoreEntryId = newShopId();
+	const auto label = QStringLiteral( "退回：%1" ).arg( previous.productName );
+	const QJsonObject operation{
+		{ QStringLiteral("version"), ShopJournalVersion },
+		{ QStringLiteral("id"), newShopId() },
+		{ QStringLiteral("kind"), QStringLiteral("reject") },
+		{ QStringLiteral("redemptionId"), redemptionId },
+		{ QStringLiteral("scoreEntryId"), scoreEntryId },
+		{ QStringLiteral("seat"), previous.seat },
+		{ QStringLiteral("student"), previous.student },
+		{ QStringLiteral("delta"), previous.price },
+		{ QStringLiteral("label"), label },
+		{ QStringLiteral("redemption"), previous.toStorage() },
+		{ QStringLiteral("created"), QDateTime::currentDateTime().toString( Qt::ISODateWithMs ) } };
+	if( preparePendingOperation( operation ) == false )
+	{
+		m_lastError = QStringLiteral( "无法保存退款操作日志。%1" ).arg( lastError() );
+		return false;
+	}
+
+	ClassroomScoreEntry refund;
+	refund.id = scoreEntryId;
+	refund.timestamp = QDateTime::currentDateTime();
+	refund.className = m_className;
+	refund.seat = previous.seat;
+	refund.student = previous.student;
+	refund.delta = previous.price;
+	refund.label = label;
+	refund.author = lessonTopic();
+	if( appendScoreEntry( refund ) == false )
+	{
+		recoverPendingOperationsLocked();
+		const auto* current = redemption( redemptionId );
+		if( m_pendingOperation.isEmpty() && current != nullptr &&
+			current->status == ClassroomShopRedemption::Rejected )
 		{
-			if( m_products.at( productIndex ).id == previous.productId )
-			{
-				restocked = productIndex;
-				previousStock = m_products.at( productIndex ).stock;
-				m_products[productIndex].stock = qMin( previousStock + 1, static_cast<int>( MaxStock ) );
-				break;
-			}
+			return true;
+		}
+		m_lastError = QStringLiteral( "退款写入失败，请勿重复操作，稍后重试。%1" ).arg( lastError() );
+		return false;
+	}
+
+	const auto previousProducts = m_products;
+	const auto previousRedemptions = m_redemptions;
+	const auto previousRevision = m_revision;
+	m_redemptions[index].status = ClassroomShopRedemption::Rejected;
+	if( previous.kind == ClassroomShopRedemption::Purchase )
+	{
+		const int productIndex = shopIndexById( m_products, previous.productId );
+		if( productIndex >= 0 )
+		{
+			m_products[productIndex].stock = qMin( m_products[productIndex].stock + 1,
+				static_cast<int>( MaxStock ) );
 		}
 	}
-
-	m_redemptions[index].status = status;
 	++m_revision;
+	m_pendingOperation = QJsonObject{};
 	if( save() ) { return true; }
 
-	// Save failed: put everything back, including the refund.
-	m_redemptions[index] = previous;
-	if( restocked >= 0 ) { m_products[restocked].stock = previousStock; }
-	--m_revision;
-	if( rejecting )
+	m_products = previousProducts;
+	m_redemptions = previousRedemptions;
+	m_revision = previousRevision;
+	m_pendingOperation = operation;
+	load( m_className );
+	const auto* current = redemption( redemptionId );
+	if( m_pendingOperation.isEmpty() && current != nullptr &&
+		current->status == ClassroomShopRedemption::Rejected )
 	{
-		bookScore( previous.seat, previous.student, -previous.price,
-				   QStringLiteral( "撤销退款：%1" ).arg( previous.productName ) );
+		return true;
 	}
+	recoverPendingOperationsLocked();
+	const auto* recoveredRedemption = redemption( redemptionId );
+	if( m_pendingOperation.isEmpty() && recoveredRedemption != nullptr &&
+		recoveredRedemption->status == ClassroomShopRedemption::Rejected )
+	{
+		return true;
+	}
+	m_lastError = QStringLiteral( "退款或商城状态保存失败，请勿重复操作，稍后重试。%1" ).arg( lastError() );
 	return false;
 }
 
@@ -890,20 +1529,14 @@ bool ClassroomShopBook::bookScore( const QString& seat, const QString& student,
 	if( delta == 0 ) { return true; }
 	if( m_className.isEmpty() || seat.trimmed().isEmpty() ) { return false; }
 
-	ClassroomScoreBook book( m_basePath );
-	if( book.load( m_className ) == false ) { return false; }
-
-	// One lesson per day keeps every shop entry of that day together and makes
-	// it visible in "我的成绩" as "MM.dd 班级商场".
 	ClassroomScoreEntry entry;
-	entry.lessonId = book.ensureLesson( QDate::currentDate(), lessonTopic() );
 	entry.className = m_className;
 	entry.seat = seat.trimmed();
 	entry.student = student.trimmed();
 	entry.delta = delta;
 	entry.label = label.left( 200 );
 	entry.author = lessonTopic();
-	return book.addEntry( entry );
+	return appendScoreEntry( entry );
 }
 
 

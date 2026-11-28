@@ -3,6 +3,7 @@ package top.ikee002.ikeback
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
 
 /** Offline-first snapshot. Best effort: storage failures never block the UI. */
 data class Cache(
@@ -25,6 +26,7 @@ data class Cache(
 class CacheStore(context: Context) {
     private val prefs = context.applicationContext
         .getSharedPreferences("ikeback", Context.MODE_PRIVATE)
+    private val writer = Executors.newSingleThreadExecutor()
 
     fun load(): Cache = try {
         val events = JSONArray(prefs.getString("events", "[]") ?: "[]")
@@ -58,8 +60,14 @@ class CacheStore(context: Context) {
         Cache()
     }
 
-    fun save(cache: Cache) {
-        try {
+    fun saveAsync(cache: Cache, onFailure: () -> Unit) {
+        writer.execute {
+            if (!save(cache)) onFailure()
+        }
+    }
+
+    fun save(cache: Cache): Boolean {
+        return try {
             val events = JSONArray()
             cache.events.takeLast(40).forEach { event ->
                 events.put(
@@ -86,9 +94,9 @@ class CacheStore(context: Context) {
                 .putString("seatsRaw", cache.seatsRaw)
                 .putString("events", events.toString())
                 .putLong("updatedAt", cache.updatedAt)
-                .apply()
+                .commit()
         } catch (_: Exception) {
-            // Offline cache is best effort.
+            false
         }
     }
 }

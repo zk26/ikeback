@@ -482,8 +482,18 @@ bool LinuxCoreFunctions::runProgramAsUser(const QString& program, const QStringL
 
 	QObject::connect( process, QOverload<int, QProcess::ExitStatus>::of( &QProcess::finished ), &QProcess::deleteLater );
 	process->start( program, parameters );
+	if( process->waitForStarted( 5000 ) )
+	{
+		return true;
+	}
 
-	return true;
+	if( process->state() != QProcess::NotRunning )
+	{
+		process->kill();
+		process->waitForFinished();
+	}
+	delete process;
+	return false;
 }
 
 

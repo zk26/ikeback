@@ -60,6 +60,12 @@
        </property>
       </widget>
       <widget class="QSlider" name="gridSizeSlider">
+       <property name="accessibleName">
+        <string>Computer icon size</string>
+       </property>
+       <property name="toolTip">
+        <string>Adjust computer icon size</string>
+       </property>
        <property name="geometry">
         <rect>
          <x>760</x>
@@ -157,6 +163,9 @@
        </property>
       </widget>
       <widget class="QToolButton" name="alignComputersButton">
+       <property name="accessibleName">
+        <string>Align computers to grid</string>
+       </property>
        <property name="enabled">
         <bool>false</bool>
        </property>
@@ -177,6 +186,9 @@
        </property>
       </widget>
       <widget class="QToolButton" name="useCustomComputerPositionsButton">
+       <property name="accessibleName">
+        <string>Use custom computer arrangement</string>
+       </property>
        <property name="geometry">
         <rect>
          <x>1010</x>
@@ -209,6 +221,9 @@ Press and hold to load arrangement from a file or save current arrangement to a 
        </property>
       </widget>
       <widget class="QToolButton" name="filterPoweredOnComputersButton">
+       <property name="accessibleName">
+        <string>Only show powered on computers</string>
+       </property>
        <property name="geometry">
         <rect>
          <x>590</x>
@@ -333,6 +348,9 @@ Press and hold to load arrangement from a file or save current arrangement to a 
        </layout>
       </widget>
       <widget class="QToolButton" name="filterComputersWithLoggedOnUsersButton">
+       <property name="accessibleName">
+        <string>Only show computers with logged on users</string>
+       </property>
        <property name="geometry">
         <rect>
          <x>670</x>

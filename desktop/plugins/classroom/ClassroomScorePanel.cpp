@@ -22,23 +22,62 @@
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLockFile>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSaveFile>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTextEdit>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include "ClassroomData.h"
 #include "ClassroomProtocol.h"
 #include "ClassroomScorePanel.h"
+
 #include "ClassroomTheme.h"
 #include "ClassroomTermReport.h"
 #include "ClassroomWordCloud.h"
+
+namespace
+{
+
+//! Whole file or nothing: the data is written to a temporary file first and
+//! then replaces the target in one step.
+bool writeFileCompletely( const QString& fileName, const QByteArray& data, QString* error )
+{
+	QSaveFile file( fileName );
+	if( file.open( QIODevice::WriteOnly ) == false )
+	{
+		*error = file.errorString();
+		return false;
+	}
+	if( file.write( data ) != data.size() )
+	{
+		file.cancelWriting();
+		*error = file.errorString();
+		return false;
+	}
+	if( file.commit() ) { return true; }
+	*error = file.errorString();
+	return false;
+}
+
+
+bool tryLockScoreBook( const QString& fileName, QLockFile& lock )
+{
+	if( QDir().mkpath( QFileInfo( fileName ).absolutePath() ) == false ) { return false; }
+	return lock.tryLock( 1000 );
+}
+
+
+}
 
 
 ClassroomScorePanel::ClassroomScorePanel( const QString& dataDirectory, ClassroomRoster& roster,
@@ -67,10 +106,14 @@ ClassroomScorePanel::ClassroomScorePanel( const QString& dataDirectory, Classroo
 void ClassroomScorePanel::setClassName( const QString& className )
 {
 	if( className.isEmpty() || className == m_className ) { return; }
+	if( m_book.load( className ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "Could not load scores for %1." ).arg( className ) );
+		return;
+	}
 	m_className = className;
 	m_lessonId.clear();
 	m_lessonPinned = false;
-	m_book.load( className );
 	refresh();
 }
 
@@ -78,7 +121,11 @@ void ClassroomScorePanel::setClassName( const QString& className )
 void ClassroomScorePanel::setCurrentLessonId( const QString& lessonId )
 {
 	if( lessonId.isEmpty() ) { return; }
-	m_book.load( m_className );
+	if( m_book.load( m_className ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "Could not load the score book." ) );
+		return;
+	}
 	m_lessonId = lessonId;
 	m_lessonPinned = true;
 	for( const auto& lesson : m_book.lessons() )
@@ -103,7 +150,13 @@ void ClassroomScorePanel::showRules()
 void ClassroomScorePanel::refresh()
 {
 	if( m_className.isEmpty() ) { return; }
-	m_book.load( m_className );
+	ClassroomScoreBook candidate( m_dataDirectory );
+	if( candidate.load( m_className ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(), tr( "Could not load the score book." ) );
+		return;
+	}
+	m_book = candidate;
 	refreshStudentTable();
 
 	const auto rules = m_book.rules();
@@ -179,6 +232,9 @@ void ClassroomScorePanel::setupDailyTab()
 	m_studentTable->setSelectionBehavior( QAbstractItemView::SelectRows );
 	m_studentTable->setEditTriggers( QAbstractItemView::NoEditTriggers );
 	layout->addWidget( m_studentTable, 1 );
+	m_emptyState = new QLabel( tr( "Select a class to load its student roster." ), page );
+	m_emptyState->setWordWrap( true );
+	layout->addWidget( m_emptyState );
 
 	auto* entryRow = new QHBoxLayout;
 	m_delta = new QSpinBox( page );
@@ -199,12 +255,21 @@ void ClassroomScorePanel::setupDailyTab()
 		addEntry( m_delta->value(), m_detail->toPlainText().trimmed() );
 	} );
 	connect( removeButton, &QPushButton::clicked, this, [this]() {
-		ensureLesson();
+		if( m_className.isEmpty() ) { return; }
+		QLockFile lock( m_book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+		if( tryLockScoreBook( lock.fileName(), lock ) == false || m_book.load( m_className ) == false ) { return; }
+		ensureLessonLocked();
 		const auto entries = m_book.entriesForCell( m_lessonId, currentSeat() );
 		if( entries.isEmpty() == false )
 		{
-			m_book.removeEntry( entries.last().id );
-			refreshStudentTable();
+			if( m_book.removeEntry( entries.last().id ) )
+			{
+				queueStudentTableRefresh();
+			}
+			else
+			{
+				m_book.load( m_className );
+			}
 		}
 	} );
 
@@ -346,7 +411,24 @@ void ClassroomScorePanel::saveRules()
 		return a.first < b.first;
 	} );
 	if( rules.levels.isEmpty() ) { rules.levels = ClassroomScoreBook::defaultLevels(); }
-	const bool saved = m_book.setRules( rules );
+	bool saved = false;
+	if( m_className.isEmpty() == false )
+	{
+		QLockFile lock( m_book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+		if( tryLockScoreBook( lock.fileName(), lock ) && m_book.load( m_className ) )
+		{
+			saved = m_book.setRules( rules );
+			if( saved == false )
+			{
+				// setRules() mutates first; discard its unsaved in-memory copy.
+				m_book.load( m_className );
+			}
+			else
+			{
+				m_bookReloadTimer.restart();
+			}
+		}
+	}
 	QMessageBox::information( this, windowTitle(), saved ? tr( "Scoring rules saved." ) : tr( "Could not save scoring rules." ) );
 }
 
@@ -364,10 +446,14 @@ void ClassroomScorePanel::setupCloudTab()
 	row->addWidget( exportSvg );
 	layout->addLayout( row );
 
-	m_cloudView = new QLabel( page );
+	m_cloudView = new QLabel;
 	m_cloudView->setAlignment( Qt::AlignCenter );
 	m_cloudView->setMinimumSize( 640, 380 );
-	layout->addWidget( m_cloudView, 1 );
+	auto* cloudScroll = new QScrollArea( page );
+	cloudScroll->setWidgetResizable( true );
+	cloudScroll->setAlignment( Qt::AlignCenter );
+	cloudScroll->setWidget( m_cloudView );
+	layout->addWidget( cloudScroll, 1 );
 
 	connect( generate, &QPushButton::clicked, this, [this]() { generateCloud(); } );
 	connect( exportSvg, &QPushButton::clicked, this, [this]() {
@@ -375,10 +461,10 @@ void ClassroomScorePanel::setupCloudTab()
 		const auto fileName = QFileDialog::getSaveFileName( this, tr( "Export word cloud" ), {},
 														   tr( "SVG files (*.svg)" ) );
 		if( fileName.isEmpty() ) { return; }
-		QFile file( fileName );
-		const auto ok = file.open( QFile::WriteOnly | QFile::Truncate ) &&
-						file.write( m_lastCloudSvg ) == m_lastCloudSvg.size();
-		file.close();
+		QSaveFile file( fileName );
+		const auto ok = file.open( QFile::WriteOnly ) &&
+						file.write( m_lastCloudSvg ) == m_lastCloudSvg.size() &&
+						file.commit();
 		QMessageBox::information( this, windowTitle(),
 								  ok ? tr( "Word cloud exported." ) : tr( "Could not write %1" ).arg( fileName ) );
 	} );
@@ -479,41 +565,50 @@ void ClassroomScorePanel::exportReport( bool xls )
 	}
 	else
 	{
-		QFile file( fileName );
-		ok = file.open( QFile::WriteOnly | QFile::Truncate );
-		if( ok ) { ok = file.write( ClassroomTermReport::toCsv( m_roster, m_book, options ) ) > 0; }
-		if( ok == false ) { error = file.errorString(); }
+		// Both files are written completely and atomically; a half-written or
+		// failed details file is reported instead of counted as a success.
+		ok = writeFileCompletely( fileName, ClassroomTermReport::toCsv( m_roster, m_book, options ), &error );
 
 		if( ok && options.includeDetails )
 		{
 			const QFileInfo info( fileName );
 			const QString detailsName = info.absolutePath() + QLatin1Char('/') +
 										 info.completeBaseName() + QStringLiteral("-details.csv");
-			QFile detailsFile( detailsName );
-			if( detailsFile.open( QFile::WriteOnly | QFile::Truncate ) )
-			{
-				const auto details = ClassroomTermReport::toDetailsCsv( m_book, options );
-				ok = detailsFile.write( details ) == details.size();
-				if( ok == false ) { error = detailsFile.errorString(); }
-			}
+			ok = writeFileCompletely( detailsName, ClassroomTermReport::toDetailsCsv( m_book, options ), &error );
 		}
 	}
-	QMessageBox::information( this, windowTitle(), ok ? tr( "Report exported." ) : error );
+	if( ok ) { QMessageBox::information( this, windowTitle(), tr( "Report exported." ) ); }
+	else { QMessageBox::warning( this, windowTitle(), tr( "Could not write %1: %2" ).arg( fileName, error ) ); }
 }
 
 
 void ClassroomScorePanel::ensureLesson()
 {
 	if( m_className.isEmpty() ) { return; }
-	m_book.load( m_className );
-	if( m_lessonPinned && m_lessonId.isEmpty() == false ) { return; }
+	QLockFile lock( m_book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+	if( tryLockScoreBook( lock.fileName(), lock ) == false || m_book.load( m_className ) == false ) { return; }
+	ensureLessonLocked();
+}
+
+
+bool ClassroomScorePanel::ensureLessonLocked()
+{
+	if( m_className.isEmpty() ) { return false; }
+	if( m_lessonPinned && m_lessonId.isEmpty() == false ) { return true; }
 	m_lessonId = m_book.ensureLesson( m_lessonDate->date(), m_lessonTopic->text().trimmed() );
+	return m_lessonId.isEmpty() == false;
 }
 
 
 void ClassroomScorePanel::refreshStudentTable()
 {
 	const auto* item = m_roster.findClass( m_className );
+	if( m_emptyState )
+	{
+		m_emptyState->setVisible( item == nullptr || item->students.isEmpty() );
+		m_emptyState->setText( item == nullptr ? tr( "Select a class to load its student roster." ) :
+			tr( "This class has no students yet. Add students on the class management page." ) );
+	}
 	if( item == nullptr ) { m_studentTable->setRowCount( 0 ); return; }
 
 	ensureLesson();
@@ -530,6 +625,20 @@ void ClassroomScorePanel::refreshStudentTable()
 		m_studentTable->setItem( row, 4, new QTableWidgetItem( m_book.levelName( m_book.total( student.seat ) ) ) );
 		++row;
 	}
+}
+
+
+void ClassroomScorePanel::queueStudentTableRefresh()
+{
+	if( m_studentTableRefreshQueued ) { return; }
+	m_studentTableRefreshQueued = true;
+	// A whole-class score is a synchronous run of addEntryForSeat() calls.
+	// Coalescing their refreshes leaves one rebuild; a single edit still
+	// refreshes as soon as control returns to the event loop.
+	QTimer::singleShot( 0, this, [this]() {
+		m_studentTableRefreshQueued = false;
+		refreshStudentTable();
+	} );
 }
 
 
@@ -567,10 +676,23 @@ void ClassroomScorePanel::addEntry( int delta, const QString& label )
 }
 
 
+//! Seat cards ask for every seat on each refresh. Reloading the book once per
+//! refresh instead of once per seat keeps a large class from re-reading the
+//! same JSON file dozens of times.
+void ClassroomScorePanel::ensureBookFresh() const
+{
+	if( m_bookReloadTimer.isValid() == false || m_bookReloadTimer.elapsed() > BookReloadIntervalMs )
+	{
+		m_book.load( m_className );
+		m_bookReloadTimer.restart();
+	}
+}
+
+
 int ClassroomScorePanel::scoreForSeat( const QString& seat ) const
 {
 	if( seat.isEmpty() || m_className.isEmpty() ) { return 0; }
-	m_book.load( m_className );
+	ensureBookFresh();
 	return m_book.total( seat );
 }
 
@@ -578,7 +700,7 @@ int ClassroomScorePanel::scoreForSeat( const QString& seat ) const
 QString ClassroomScorePanel::levelForSeat( const QString& seat ) const
 {
 	if( seat.isEmpty() || m_className.isEmpty() ) { return {}; }
-	m_book.load( m_className );
+	ensureBookFresh();
 	return m_book.levelName( m_book.total( seat ) );
 }
 
@@ -587,7 +709,9 @@ bool ClassroomScorePanel::addEntryForSeat( const QString& seat, int delta, const
 										   const QString& richText )
 {
 	if( seat.isEmpty() || m_className.isEmpty() ) { return false; }
-	ensureLesson();
+	QLockFile lock( m_book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+	if( tryLockScoreBook( lock.fileName(), lock ) == false || m_book.load( m_className ) == false ) { return false; }
+	if( ensureLessonLocked() == false ) { return false; }
 
 	ClassroomScoreEntry entry;
 	entry.lessonId = m_lessonId;
@@ -598,7 +722,12 @@ bool ClassroomScorePanel::addEntryForSeat( const QString& seat, int delta, const
 	entry.label = label;
 	entry.richText = richText;
 	entry.author = tr( "Teacher" );
-	if( m_book.addEntry( entry ) == false ) { return false; }
-	refreshStudentTable();
+	if( m_book.addEntry( entry ) == false )
+	{
+		m_book.load( m_className );
+		return false;
+	}
+	m_bookReloadTimer.restart();
+	queueStudentTableRefresh();
 	return true;
 }

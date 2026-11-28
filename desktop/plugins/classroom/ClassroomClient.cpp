@@ -57,11 +57,9 @@
 #include "ClassroomSecrets.h"
 #include "ClassroomShop.h"
 #include "ClassroomTheme.h"
-#include "CryptoCore.h"
 #include "PlatformCoreFunctions.h"
 #include "PlatformInputDeviceFunctions.h"
 #include "PlatformPluginInterface.h"
-#include "PlatformUserFunctions.h"
 #include "IkebackCore.h"
 
 
@@ -343,8 +341,12 @@ void ClassroomClientWidget::setSettings( const QJsonObject& settings )
 	m_aiEnabled = settings.value( Classroom::SettingKey::aiEnabled() ).toBool( true );
 	m_exitProtection = settings.value( Classroom::SettingKey::exitProtection() ).toBool( true );
 	m_exitAdminUsername = settings.value( Classroom::SettingKey::exitAdminUsername() ).toString();
-	m_adminKeyHash = settings.value( Classroom::SettingKey::adminKeyHash() ).toString();
-	if( m_adminKeyHash.isEmpty() ) { m_adminKeyHash = ClassroomSecrets::defaultAdminKeyHash(); }
+	const auto storedAdminKeyHash = settings.value( Classroom::SettingKey::adminKeyHash() ).toString().trimmed();
+	m_adminKeyHash = ClassroomSecrets::adminKeyHashConfigured( storedAdminKeyHash ) ?
+						 storedAdminKeyHash.toLower() : QString{};
+	// Never synthesize a credential or fall back to a student's Windows account.
+	// A missing/retired digest is discarded and leaves protected exit unavailable
+	// until the teacher configures and distributes a replacement key.
 
 	// The API key, endpoint, model and system prompt stay on the teacher
 	// machine. The student worker only submits a prompt through the bridge of
@@ -649,10 +651,14 @@ void ClassroomClientWidget::requestQuit()
 		return;
 	}
 
-	// 5.2.2: the super-admin key is the primary exit credential. The teacher
-	// configures it once; students only ever see its hash. Windows
-	// administrator credentials remain as a fallback for installs without a
-	// configured key.
+	// Protected exit requires the teacher-configured super-admin key. There is
+	// intentionally no default credential and no Windows-account fallback.
+	if( ClassroomSecrets::adminKeyHashConfigured( m_adminKeyHash ) == false )
+	{
+		QMessageBox::warning( this, windowTitle(),
+			tr( "尚未配置有效的管理员密码。请联系教师配置并下发新密码后再退出。" ) );
+		return;
+	}
 	m_quitDialogOpen = true;
 	struct QuitDialogGuard
 	{
@@ -664,27 +670,10 @@ void ClassroomClientWidget::requestQuit()
 	dialog.setWindowTitle( tr( "受保护退出" ) );
 	auto* form = new QFormLayout( &dialog );
 
-	QLineEdit* keyEdit = nullptr;
-	QLineEdit* username = nullptr;
-	QLineEdit* password = nullptr;
-	const auto useAdminKey = m_adminKeyHash.isEmpty() == false;
-	if( useAdminKey )
-	{
-		keyEdit = new QLineEdit( &dialog );
-		keyEdit->setEchoMode( QLineEdit::Password );
-		keyEdit->setPlaceholderText( tr( "管理员密码" ) );
-		form->addRow( tr( "管理员密码：" ), keyEdit );
-	}
-	else
-	{
-		username = new QLineEdit( &dialog );
-		password = new QLineEdit( &dialog );
-		username->setText( IkebackCore::platform().userFunctions().
-						   queryCurrentUserProperty( PlatformUserFunctions::UserProperty::LoginName ) );
-		password->setEchoMode( QLineEdit::Password );
-		form->addRow( tr( "管理员账户：" ), username );
-		form->addRow( tr( "管理员密码：" ), password );
-	}
+	auto* keyEdit = new QLineEdit( &dialog );
+	keyEdit->setEchoMode( QLineEdit::Password );
+	keyEdit->setPlaceholderText( tr( "管理员密码" ) );
+	form->addRow( tr( "管理员密码：" ), keyEdit );
 	auto* buttons = new QDialogButtonBox( QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog );
 	form->addRow( buttons );
 	connect( buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept );
@@ -694,27 +683,7 @@ void ClassroomClientWidget::requestQuit()
 
 	if( dialog.exec() != QDialog::Accepted ) { return; }
 
-	bool authorized = false;
-	if( useAdminKey )
-	{
-		authorized = ClassroomSecrets::verifyAdminKey( keyEdit->text(), m_adminKeyHash );
-	}
-	else
-	{
-		// Fallback: Windows administrator credentials. The configured admin
-		// account name is honoured when it is set; the password is always
-		// verified against Windows itself.
-		const auto expectedUser = m_exitAdminUsername.trimmed();
-		const auto userMatches = expectedUser.isEmpty() ||
-								 username->text().trimmed().compare( expectedUser, Qt::CaseInsensitive ) == 0;
-		if( userMatches && password->text().isEmpty() == false )
-		{
-			const CryptoCore::PlaintextPassword plainPassword = password->text().toUtf8();
-			authorized = IkebackCore::platform().userFunctions().authenticate( username->text().trimmed(), plainPassword );
-		}
-	}
-
-	if( authorized )
+	if( ClassroomSecrets::verifyAdminKey( keyEdit->text(), m_adminKeyHash ) )
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::quitAllowed(), tr( "authorized client exit" ), {} );
 		Q_EMIT quitAuthorized();
@@ -722,9 +691,7 @@ void ClassroomClientWidget::requestQuit()
 	else
 	{
 		Q_EMIT eventOccurred( Classroom::EventType::quitAttempt(), tr( "rejected client exit" ), {} );
-		QMessageBox::warning( this, windowTitle(),
-							  useAdminKey ? tr( "管理员密码不正确，本次尝试已记录。" )
-										  : tr( "管理员凭据无效，本次尝试已记录。" ) );
+		QMessageBox::warning( this, windowTitle(), tr( "管理员密码不正确，本次尝试已记录。" ) );
 	}
 }
 

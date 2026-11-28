@@ -12,6 +12,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QSaveFile>
 #include <QJsonDocument>
 #include <QPair>
 #include <QRegularExpression>
@@ -215,32 +216,185 @@ ClassroomScoreBook::ClassroomScoreBook( const QString& dataDirectory ) :
 QString ClassroomScoreBook::filePath( const QString& className ) const
 {
 	const QString directory = QDir( m_basePath ).filePath( QStringLiteral("scores") );
-	return QDir( directory ).filePath( ClassroomLogStore::sanitize( className ) + QStringLiteral(".json") );
+	return QDir( directory ).filePath( ClassroomLogStore::storageKey( className ) + QStringLiteral(".json") );
+}
+
+
+//! Old installations stored the book under the lossy sanitize() name.
+void ClassroomScoreBook::migrateLegacyFile( const QString& className ) const
+{
+	const QString directory = QDir( m_basePath ).filePath( QStringLiteral("scores") );
+	ClassroomLogStore::migrateStorageKey( directory,
+					   ClassroomLogStore::sanitize( className ) + QStringLiteral(".json"),
+					   ClassroomLogStore::storageKey( className ) + QStringLiteral(".json") );
 }
 
 
 bool ClassroomScoreBook::load( const QString& className )
 {
-	m_className = className;
-	m_lessons.clear();
-	m_entries.clear();
-	m_attendance.clear();
-	m_rules = ClassroomScoreRules{};
-
-	const auto fileName = filePath( className );
+	const auto modernFileName = filePath( className );
+	const auto legacyFileName = QDir( QDir( m_basePath ).filePath( QStringLiteral("scores") ) ).
+		filePath( ClassroomLogStore::sanitize( className ) + QStringLiteral(".json") );
+	// Read a legacy file in place first. Renaming it before validation would
+	// mutate disk even when the document turns out to be corrupt.
+	const auto fileName = QFile::exists( modernFileName ) == false && QFile::exists( legacyFileName ) ?
+							  legacyFileName : modernFileName;
 	QFile file( fileName );
-	if( file.exists() == false ) { return true; }
+	if( file.exists() == false )
+	{
+		if( className.isEmpty() == false && className == m_className && m_persisted ) { return false; }
+		m_className = className;
+		m_persisted = false;
+		m_lessons.clear();
+		m_entries.clear();
+		m_attendance.clear();
+		m_rules = ClassroomScoreRules{};
+		return true;
+	}
 	if( file.open( QFile::ReadOnly ) == false ) { return false; }
 
-	const auto document = QJsonDocument::fromJson( file.readAll() );
+	const auto bytes = file.readAll();
+	const auto readError = file.error();
+	file.close();
+	if( readError != QFile::NoError ) { return false; }
+
+	const auto document = QJsonDocument::fromJson( bytes );
+	if( document.isObject() == false ) { return false; }
 	const auto object = document.object();
-	m_rules = ClassroomScoreRules::fromJson( object.value( QStringLiteral("rules") ).toObject() );
-	const auto lessons = object.value( QStringLiteral("lessons") ).toArray();
-	for( const auto& value : lessons ) { m_lessons.append( ClassroomScoreLesson::fromJson( value.toObject() ) ); }
-	const auto entries = object.value( QStringLiteral("entries") ).toArray();
-	for( const auto& value : entries ) { m_entries.append( ClassroomScoreEntry::fromJson( value.toObject() ) ); }
-	const auto attendance = object.value( QStringLiteral("attendance") ).toArray();
-	for( const auto& value : attendance ) { m_attendance.append( ClassroomAttendance::fromJson( value.toObject() ) ); }
+
+	const auto stringFieldsValid = []( const QJsonObject& value, const QStringList& names ) {
+		for( const auto& name : names )
+		{
+			const auto field = value.value( name );
+			if( field.isUndefined() == false && field.isString() == false ) { return false; }
+		}
+		return true;
+	};
+	const auto numberFieldsValid = []( const QJsonObject& value, const QStringList& names ) {
+		for( const auto& name : names )
+		{
+			const auto field = value.value( name );
+			if( field.isUndefined() == false && field.isDouble() == false ) { return false; }
+		}
+		return true;
+	};
+
+	const auto requiredStringFieldsValid = []( const QJsonObject& value, const QStringList& names ) {
+		for( const auto& name : names )
+		{
+			const auto field = value.value( name );
+			if( field.isString() == false ) { return false; }
+		}
+		return true;
+	};
+
+	ClassroomScoreRules stagedRules;
+	if( object.contains( QStringLiteral("rules") ) )
+	{
+		const auto rules = object.value( QStringLiteral("rules") );
+		if( rules.isObject() == false ) { return false; }
+		const auto rulesObject = rules.toObject();
+		if( stringFieldsValid( rulesObject, { QStringLiteral("html"), QStringLiteral("updated"),
+											  QStringLiteral("levelSchemeName") } ) == false ||
+			numberFieldsValid( rulesObject, { QStringLiteral("baseScore") } ) == false )
+		{
+			return false;
+		}
+		const auto published = rulesObject.value( QStringLiteral("published") );
+		if( published.isUndefined() == false && published.isBool() == false ) { return false; }
+		const auto quickActions = rulesObject.value( QStringLiteral("quickActions") );
+		if( quickActions.isUndefined() == false && quickActions.isArray() == false ) { return false; }
+		for( const auto& action : quickActions.toArray() )
+		{
+			const auto pair = action.toArray();
+			if( action.isArray() == false || pair.size() < 2 || pair.at( 0 ).isString() == false ||
+				pair.at( 1 ).isDouble() == false )
+			{
+				return false;
+			}
+		}
+		const auto levels = rulesObject.value( QStringLiteral("levels") );
+		if( levels.isUndefined() == false && levels.isArray() == false ) { return false; }
+		for( const auto& level : levels.toArray() )
+		{
+			const auto pair = level.toArray();
+			if( level.isArray() == false || pair.size() < 2 || pair.at( 0 ).isDouble() == false ||
+				pair.at( 1 ).isString() == false )
+			{
+				return false;
+			}
+		}
+		stagedRules = ClassroomScoreRules::fromJson( rulesObject );
+	}
+
+	QVector<ClassroomScoreLesson> stagedLessons;
+	const auto lessons = object.value( QStringLiteral("lessons") );
+	if( lessons.isArray() == false ) { return false; }
+	for( const auto& value : lessons.toArray() )
+	{
+		if( value.isObject() == false ) { return false; }
+		const auto lessonObject = value.toObject();
+		if( requiredStringFieldsValid( lessonObject, { QStringLiteral("id"), QStringLiteral("date"),
+											   QStringLiteral("topic") } ) == false )
+		{
+			return false;
+		}
+		stagedLessons.append( ClassroomScoreLesson::fromJson( lessonObject ) );
+		if( stagedLessons.last().id.isEmpty() || stagedLessons.last().date.isValid() == false ) { return false; }
+	}
+
+	QVector<ClassroomScoreEntry> stagedEntries;
+	const auto entries = object.value( QStringLiteral("entries") );
+	if( entries.isArray() == false ) { return false; }
+	for( const auto& value : entries.toArray() )
+	{
+		if( value.isObject() == false ) { return false; }
+		const auto entryObject = value.toObject();
+		if( requiredStringFieldsValid( entryObject, { QStringLiteral("id"), QStringLiteral("timestamp"),
+											  QStringLiteral("lessonId"), QStringLiteral("className"),
+											  QStringLiteral("seat"), QStringLiteral("student"),
+											  QStringLiteral("label"), QStringLiteral("richText"),
+											  QStringLiteral("author") } ) == false ||
+			numberFieldsValid( entryObject, { QStringLiteral("delta") } ) == false )
+		{
+			return false;
+		}
+		stagedEntries.append( ClassroomScoreEntry::fromJson( entryObject ) );
+		if( stagedEntries.last().id.isEmpty() || stagedEntries.last().lessonId.isEmpty() ||
+			stagedEntries.last().seat.isEmpty() || stagedEntries.last().timestamp.isValid() == false ) { return false; }
+	}
+
+	QVector<ClassroomAttendance> stagedAttendance;
+	const auto attendance = object.value( QStringLiteral("attendance") );
+	if( attendance.isArray() == false ) { return false; }
+	for( const auto& value : attendance.toArray() )
+	{
+		if( value.isObject() == false ) { return false; }
+		const auto attendanceObject = value.toObject();
+		if( requiredStringFieldsValid( attendanceObject, { QStringLiteral("lessonId"), QStringLiteral("className"),
+													QStringLiteral("seat"), QStringLiteral("student"),
+													QStringLiteral("reason"), QStringLiteral("author"),
+													QStringLiteral("checkInTime"), QStringLiteral("updated") } ) == false ||
+			numberFieldsValid( attendanceObject, { QStringLiteral("status") } ) == false )
+		{
+			return false;
+		}
+		stagedAttendance.append( ClassroomAttendance::fromJson( attendanceObject ) );
+		if( stagedAttendance.last().lessonId.isEmpty() || stagedAttendance.last().seat.isEmpty() ) { return false; }
+	}
+
+	// Commit only after the whole document has parsed and passed shape checks.
+	// A corrupt file must never erase the teacher's last known good state.
+	if( fileName != modernFileName )
+	{
+		migrateLegacyFile( className );
+	}
+	m_className = className;
+	m_rules = stagedRules;
+	m_lessons = stagedLessons;
+	m_entries = stagedEntries;
+	m_attendance = stagedAttendance;
+	m_persisted = true;
 	return true;
 }
 
@@ -249,10 +403,14 @@ bool ClassroomScoreBook::save() const
 {
 	const auto fileName = filePath( m_className );
 	if( QDir().mkpath( QFileInfo( fileName ).absolutePath() ) == false ) { return false; }
-	QFile file( fileName );
-	if( file.open( QFile::WriteOnly | QFile::Truncate ) == false ) { return false; }
+	// Whole document or nothing: a full disk must not truncate the score book.
+	QSaveFile file( fileName );
+	if( file.open( QIODevice::WriteOnly ) == false ) { return false; }
 	const QByteArray data = QJsonDocument( syncSnapshot() ).toJson( QJsonDocument::Indented );
-	return file.write( data ) == data.size();
+	if( file.write( data ) != data.size() ) { file.cancelWriting(); return false; }
+	if( file.commit() == false ) { return false; }
+	m_persisted = true;
+	return true;
 }
 
 
@@ -276,7 +434,11 @@ QString ClassroomScoreBook::ensureLesson( const QDate& date, const QString& topi
 	lesson.date = date;
 	lesson.topic = topic;
 	m_lessons.append( lesson );
-	save();
+	if( save() == false )
+	{
+		m_lessons.removeLast();
+		return {};
+	}
 	return lesson.id;
 }
 

@@ -12,6 +12,7 @@
 #include <QString>
 #include <QStringList>
 #include <QWidget>
+#include <QPointer>
 #include <functional>
 
 class QComboBox;
@@ -67,8 +68,8 @@ public:
 	ViewMode viewMode() const { return m_viewMode; }
 
 protected:
-	//! Drag-and-drop reordering of seat cards (installed as an event filter on
-	//! each card and its thumbnail; the score button keeps its normal clicks).
+	//! Mouse drag-and-drop and keyboard seat swapping (installed on each card
+	//! and thumbnail; child controls keep their normal key handling).
 	bool eventFilter( QObject* watched, QEvent* event ) override;
 	void resizeEvent( QResizeEvent* event ) override;
 
@@ -104,6 +105,7 @@ private:
 	int columnCount() const;
 	void updateZoom( int index );
 	void swapSeats( const QString& from, const QString& to );
+	void cancelKeyboardSwap();
 	QString protectionText( const QString& seat ) const;
 
 	ClassroomRoster& m_roster;
@@ -127,6 +129,8 @@ private:
 	QTimer* m_timer = nullptr;
 	QMap<QString, SeatCard> m_cards;
 	QString m_activeScoreSeat;
+	QPointer<QPushButton> m_scoreFocusButton;
+	QString m_keyboardSwapSeat;
 	int m_thumbWidth = 126;
 	int m_thumbHeight = 79;
 

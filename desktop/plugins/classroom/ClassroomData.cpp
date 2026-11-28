@@ -15,7 +15,10 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QCryptographicHash>
+#include <QHostAddress>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QSet>
 #if QT_VERSION >= QT_VERSION_CHECK( 6, 0, 0 )
 #include <QStringDecoder>
@@ -34,9 +37,53 @@ static QStringList classroomSecretKeys()
 }
 
 
+namespace
+{
+
+//! Writes the whole document first and then replaces the target in one step, so
+//! a full disk or a failing encryption can never leave a truncated file behind.
+bool writeFileAtomically( const QString& fileName, const QByteArray& data, QString* error = nullptr )
+{
+	QDir().mkpath( QFileInfo( fileName ).absolutePath() );
+	QSaveFile file( fileName );
+#ifndef Q_OS_WIN
+	// DPAPI is Windows-only; on development/CI hosts at least keep the file
+	// readable by its owner alone.
+	file.setPermissions( QFile::ReadOwner | QFile::WriteOwner );
+#endif
+	if( file.open( QIODevice::WriteOnly ) == false )
+	{
+		if( error ) { *error = file.errorString(); }
+		return false;
+	}
+	if( file.write( data ) != data.size() )
+	{
+		file.cancelWriting();
+		if( error ) { *error = file.errorString(); }
+		return false;
+	}
+	if( file.commit() ) { return true; }
+	if( error ) { *error = file.errorString(); }
+	return false;
+}
+
+}
+
 static QString csvField( const QString& value )
 {
+	// Names and free-text reasons are student controlled. A leading =, +, - or @
+	// would be evaluated as a formula when the teacher opens the export in
+	// Excel, so prefix those cells with an apostrophe.
 	auto escaped = value;
+	int lead = 0;
+	while( lead < escaped.size() && ( escaped.at( lead ).isSpace() || escaped.at( lead ).category() == QChar::Other_Control ) )
+	{
+		++lead;
+	}
+	if( lead < escaped.size() && QStringLiteral("=+-@").contains( escaped.at( lead ) ) )
+	{
+		escaped.prepend( QLatin1Char('\'') );
+	}
 	escaped.replace( QStringLiteral("\""), QStringLiteral("\"\"") );
 	return QStringLiteral("\"%1\"").arg( escaped );
 }
@@ -45,13 +92,6 @@ static QString csvField( const QString& value )
 static bool writeCsv( const QString& fileName, const QStringList& header,
 					  const QVector<QStringList>& rows, QString* error )
 {
-	QFile file( fileName );
-	if( file.open( QFile::WriteOnly | QFile::Truncate ) == false )
-	{
-		if( error ) { *error = file.errorString(); }
-		return false;
-	}
-
 	QByteArray data( "\xEF\xBB\xBF", 3 );
 	QStringList quotedHeader;
 	for( const auto& field : header ) { quotedHeader += csvField( field ); }
@@ -64,7 +104,7 @@ static bool writeCsv( const QString& fileName, const QStringList& header,
 		data += quotedRow.join( QLatin1Char(';') ).toUtf8() + QByteArrayLiteral("\n");
 	}
 
-	return file.write( data ) == data.size();
+	return writeFileAtomically( fileName, data, error );
 }
 
 
@@ -118,11 +158,14 @@ QJsonObject ClassroomSettings::forStudents( const QJsonObject& object )
 	{
 		adminKeyHash = ClassroomSecrets::adminKeyHash( adminKey );
 	}
-	if( adminKeyHash.isEmpty() )
+	if( ClassroomSecrets::adminKeyHashConfigured( adminKeyHash ) )
 	{
-		adminKeyHash = ClassroomSecrets::defaultAdminKeyHash();
+		result.insert( SettingKey::adminKeyHash(), adminKeyHash );
 	}
-	result.insert( SettingKey::adminKeyHash(), adminKeyHash );
+	else
+	{
+		result.remove( SettingKey::adminKeyHash() );
+	}
 	// 下发给学生的肃静文案必须是中文；旧配置中的英文一律回退为「肃静」。
 	const auto silenceText = result.value( SettingKey::silencePageText() ).toString().trimmed();
 	bool hasChinese = false;
@@ -203,10 +246,8 @@ bool ClassroomSettings::load()
 
 bool ClassroomSettings::save() const
 {
-	QDir().mkpath( QFileInfo( m_filePath ).absolutePath() );
-	QFile file( m_filePath );
-	if( file.open( QFile::WriteOnly | QFile::Truncate ) == false ) { return false; }
-
+	// Protect every secret before touching the file: a failing encryption then
+	// leaves the previous settings.json completely intact.
 	QJsonObject onDisk = m_object;
 	for( const auto& key : classroomSecretKeys() )
 	{
@@ -222,13 +263,7 @@ bool ClassroomSettings::save() const
 			onDisk.insert( key, protectedValue );
 		}
 	}
-#ifndef Q_OS_WIN
-	// DPAPI is Windows-only; on development/CI hosts at least keep the file
-	// readable by its owner alone.
-	file.setPermissions( QFile::ReadOwner | QFile::WriteOwner );
-#endif
-	const auto data = QJsonDocument( onDisk ).toJson( QJsonDocument::Indented );
-	return file.write( data ) == data.size();
+	return writeFileAtomically( m_filePath, QJsonDocument( onDisk ).toJson( QJsonDocument::Indented ) );
 }
 
 
@@ -294,25 +329,18 @@ bool ClassroomRoster::load()
 	{
 		return false;
 	}
-	if( file.open( QFile::ReadOnly | QFile::Text ) == false )
+	if( file.open( QFile::ReadOnly ) == false )
 	{
 		return false;
 	}
-	fromJson( QString::fromUtf8( file.readAll() ) );
-	return true;
+	return fromJson( QString::fromUtf8( file.readAll() ) );
 }
 
 
 bool ClassroomRoster::save() const
 {
-	QDir().mkpath( QFileInfo( m_filePath ).absolutePath() );
-	QFile file( m_filePath );
-	if( file.open( QFile::WriteOnly | QFile::Truncate | QFile::Text ) == false )
-	{
-		return false;
-	}
-	file.write( QJsonDocument( QJsonObject{ { QStringLiteral("classes"), toJsonArray() } } ).toJson( QJsonDocument::Indented ) );
-	return true;
+	return writeFileAtomically( m_filePath,
+		QJsonDocument( QJsonObject{ { QStringLiteral("classes"), toJsonArray() } } ).toJson( QJsonDocument::Indented ) );
 }
 
 
@@ -388,15 +416,50 @@ QString ClassroomRoster::toJson() const
 }
 
 
-void ClassroomRoster::fromJson( const QString& json )
+bool ClassroomRoster::fromJson( const QString& json )
 {
-	m_classes.clear();
 	const auto document = QJsonDocument::fromJson( json.toUtf8() );
-	const auto classesArray = document.object().value( QStringLiteral("classes") ).toArray();
-	for( const auto& value : classesArray )
+	if( document.isObject() == false ) { return false; }
+
+	const auto root = document.object();
+	const auto classesValue = root.value( QStringLiteral("classes") );
+	if( classesValue.isArray() == false ) { return false; }
+
+	QVector<ClassroomClass> staged;
+	const auto stringField = []( const QJsonObject& object, const QString& name, QString& destination ) {
+		const auto value = object.value( name );
+		if( value.isUndefined() ) { return true; }
+		if( value.isString() == false ) { return false; }
+		destination = value.toString();
+		return true;
+	};
+
+	for( const auto& classValue : classesValue.toArray() )
 	{
-		m_classes.append( ClassroomClass::fromJson( value.toObject() ) );
+		if( classValue.isObject() == false ) { return false; }
+		const auto classObject = classValue.toObject();
+		ClassroomClass item;
+		if( stringField( classObject, QStringLiteral("name"), item.name ) == false ) { return false; }
+		const auto studentsValue = classObject.value( QStringLiteral("students") );
+		if( studentsValue.isArray() == false ) { return false; }
+		for( const auto& studentValue : studentsValue.toArray() )
+		{
+			if( studentValue.isObject() == false ) { return false; }
+			const auto studentObject = studentValue.toObject();
+			ClassroomStudent student;
+			if( stringField( studentObject, QStringLiteral("seat"), student.seat ) == false ||
+				stringField( studentObject, QStringLiteral("name"), student.name ) == false ||
+				stringField( studentObject, QStringLiteral("ip"), student.ip ) == false )
+			{
+				return false;
+			}
+			item.students.append( student );
+		}
+		staged.append( item );
 	}
+
+	m_classes = staged;
+	return true;
 }
 
 
@@ -424,54 +487,6 @@ QString decodeRosterText( const QByteArray& raw )
 	if( text.contains( QChar( 0xFFFD ) ) == false ) { return text; }
 	return QString::fromLocal8Bit( bytes );
 #endif
-}
-
-
-//! Quote-aware single line split, because writeCsv() wraps every field in
-//! quotes: a naive split used to import `"1"` as a seat number.
-QStringList splitTableLine( const QString& line, QChar separator )
-{
-	QStringList fields;
-	QString field;
-	bool quoted = false;
-	for( int index = 0; index < line.size(); ++index )
-	{
-		const auto character = line.at( index );
-		if( quoted )
-		{
-			if( character == QLatin1Char('"') )
-			{
-				if( index + 1 < line.size() && line.at( index + 1 ) == QLatin1Char('"') )
-				{
-					field += QLatin1Char('"');
-					++index;
-				}
-				else
-				{
-					quoted = false;
-				}
-			}
-			else
-			{
-				field += character;
-			}
-		}
-		else if( character == QLatin1Char('"') )
-		{
-			quoted = true;
-		}
-		else if( character == separator )
-		{
-			fields.append( field );
-			field.clear();
-		}
-		else
-		{
-			field += character;
-		}
-	}
-	fields.append( field );
-	return fields;
 }
 
 
@@ -518,6 +533,89 @@ int findColumn( const QStringList& header, const QStringList& keywords )
 	return -1;
 }
 
+//! Upper bounds for a teacher-selected import file. A roster of a whole school
+//! stays far below them; they keep a stray gigabyte export or a million-row
+//! paste from being decoded and split in memory in one go.
+constexpr int MaxImportBytes = 8 * 1024 * 1024;
+constexpr int MaxImportRows = 20000;
+constexpr int MaxImportColumns = 64;
+constexpr int MaxImportFieldLength = 256;
+
+
+//! Parses the record starting at `position` into `fields` and advances
+//! `position` and the 1-based `line` counter past it. A line break inside a
+//! quoted cell belongs to that cell instead of ending the row. Returns false
+//! once the text is exhausted.
+bool nextTableRecord( const QString& text, int& position, QChar separator,
+					  QStringList& fields, int& line, int& recordLine )
+{
+	recordLine = line;
+	fields.clear();
+	QString field;
+	bool quoted = false;
+	int index = position;
+	const int size = text.size();
+	while( index < size )
+	{
+		const auto character = text.at( index );
+		if( quoted )
+		{
+			if( character == QLatin1Char('"') )
+			{
+				if( index + 1 < size && text.at( index + 1 ) == QLatin1Char('"') )
+				{
+					field += QLatin1Char('"');
+					index += 2;
+					continue;
+				}
+				quoted = false;
+			}
+			else
+			{
+				if( character == QLatin1Char('\n') ) { ++line; }
+				if( character != QLatin1Char('\r') ) { field += character; }
+			}
+			++index;
+			continue;
+		}
+		if( character == QLatin1Char('"') ) { quoted = true; ++index; continue; }
+		if( character == separator ) { fields.append( field ); field.clear(); ++index; continue; }
+		if( character == QLatin1Char('\r') || character == QLatin1Char('\n') ) { break; }
+		field += character;
+		++index;
+	}
+	fields.append( field );
+
+	while( index < size && ( text.at( index ) == QLatin1Char('\r') || text.at( index ) == QLatin1Char('\n') ) )
+	{
+		if( text.at( index ) == QLatin1Char('\n') ) { ++line; }
+		++index;
+	}
+	const bool progressed = index != position;
+	position = index;
+	return progressed;
+}
+
+
+bool isBlankRecord( const QStringList& fields )
+{
+	return fields.size() == 1 && fields.first().trimmed().isEmpty();
+}
+
+
+//! An IPv4/IPv6 address, or at least something shaped like a host name. Bare
+//! "192.168.1" or "computer 05" would later be pushed to every machine as a
+//! broken identity, so they are refused here.
+bool isValidRosterAddress( const QString& address )
+{
+	if( QHostAddress( address ).isNull() == false ) { return true; }
+	static const QRegularExpression numeric( QStringLiteral("^[0-9.]+$") );
+	if( numeric.match( address ).hasMatch() ) { return false; }
+	static const QRegularExpression hostName(
+		QStringLiteral("^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$") );
+	return hostName.match( address ).hasMatch();
+}
+
 } // namespace
 
 
@@ -530,49 +628,55 @@ bool ClassroomRoster::importTable( const QString& text, const QString& defaultCl
 			{ "No seat/name column found in the imported table.", QStringLiteral("导入表格中没有找到座位号或姓名列。") },
 			{ "Line %1: no class name", QStringLiteral("第 %1 行：缺少班级名称") },
 			{ "Line %1: no student name", QStringLiteral("第 %1 行：缺少学生姓名") },
-			{ "Line %1: %2 already uses IP %3 in class %4", QStringLiteral("第 %1 行：%2 已在班级 %4 中使用 IP %3") }
+			{ "Line %1: %2 already uses IP %3 in class %4", QStringLiteral("第 %1 行：%2 已在班级 %4 中使用 IP %3") },
+			{ "Line %1: %2 is not a valid IP address", QStringLiteral("第 %1 行：%2 不是有效的 IP 地址") },
+			{ "Line %1: row skipped (too many columns or an over-long cell)",
+			  QStringLiteral("第 %1 行已跳过（列数过多或单元格过长）") },
+			{ "The table has more than %1 rows; the remaining rows were not imported.",
+			  QStringLiteral("表格超过 %1 行，其余行未导入。") }
 		};
 		return chinese.value( QByteArray( text ), QString::fromUtf8( text ) );
 	};
 	ClassroomImportReport localReport;
 	auto& result = report ? *report : localReport;
 
-	auto lines = text.split( QRegularExpression( QStringLiteral("[\\r\\n]") ) );
+	QStringList record;
+	int position = 0;
+	int line = 1;
 	const auto separator = detectSeparator( text );
 
 	int classColumn = -1;
 	int seatColumn = -1;
 	int nameColumn = -1;
 	int ipColumn = -1;
-	int firstDataLine = 0;
 
-	// Header detection: only the first non-empty line can be a header.
-	for( int index = 0; index < lines.size(); ++index )
+	int recordLine = 1;
+	const auto nextRecord = [&record, &position, &line, &recordLine, &text, separator]() {
+		return nextTableRecord( text, position, separator, record, line, recordLine );
+	};
+
+	// Header detection: only the first non-empty record can be a header.
+	bool have = nextRecord();
+	while( have && isBlankRecord( record ) ) { have = nextRecord(); }
+	if( have )
 	{
-		if( lines.at( index ).trimmed().isEmpty() ) { continue; }
-		const auto header = splitTableLine( lines.at( index ), separator );
-		classColumn = findColumn( header, { QStringLiteral("班级"), QStringLiteral("班別"),
-										   QStringLiteral("class") } );
-		seatColumn = findColumn( header, { QStringLiteral("座位"), QStringLiteral("座号"),
-										  QStringLiteral("座號"), QStringLiteral("seat"),
-										  QStringLiteral("序号") } );
-		nameColumn = findColumn( header, { QStringLiteral("姓名"), QStringLiteral("学生"),
-										  QStringLiteral("student"), QStringLiteral("name") } );
-		ipColumn = findColumn( header, { QStringLiteral("ip") } );
+		classColumn = findColumn( record, { QStringLiteral("班级"), QStringLiteral("班別"),
+											QStringLiteral("class") } );
+		seatColumn = findColumn( record, { QStringLiteral("座位"), QStringLiteral("座号"),
+										   QStringLiteral("座號"), QStringLiteral("seat"),
+										   QStringLiteral("序号") } );
+		nameColumn = findColumn( record, { QStringLiteral("姓名"), QStringLiteral("学生"),
+										   QStringLiteral("student"), QStringLiteral("name") } );
+		ipColumn = findColumn( record, { QStringLiteral("ip") } );
 		if( seatColumn >= 0 || nameColumn >= 0 )
 		{
-			firstDataLine = index + 1;
+			have = nextRecord();
+			while( have && isBlankRecord( record ) ) { have = nextRecord(); }
 		}
-		break;
-	}
-
-	if( seatColumn < 0 && nameColumn < 0 )
-	{
-		// No header: infer the layout from the column count of the first line.
-		for( int index = 0; index < lines.size(); ++index )
+		else
 		{
-			if( lines.at( index ).trimmed().isEmpty() ) { continue; }
-			const auto width = splitTableLine( lines.at( index ), separator ).size();
+			// No header: infer the layout from the column count of the first record.
+			const auto width = record.size();
 			if( width >= 4 )
 			{
 				classColumn = 0;
@@ -591,8 +695,6 @@ bool ClassroomRoster::importTable( const QString& text, const QString& defaultCl
 				seatColumn = 0;
 				nameColumn = 1;
 			}
-			firstDataLine = index;
-			break;
 		}
 	}
 
@@ -602,68 +704,105 @@ bool ClassroomRoster::importTable( const QString& text, const QString& defaultCl
 		return false;
 	}
 
-	for( int index = firstDataLine; index < lines.size(); ++index )
-	{
-		if( lines.at( index ).trimmed().isEmpty() ) { continue; }
-		const auto fields = splitTableLine( lines.at( index ), separator );
+	// Rows go into a copy first: a file with nothing usable in it must leave
+	// the roster exactly as it was, instead of keeping half-applied classes.
+	QVector<ClassroomClass> staged = m_classes;
+	const auto findStagedClass = [&staged]( const QString& name ) -> ClassroomClass* {
+		for( auto& item : staged )
+		{
+			if( item.name == name ) { return &item; }
+		}
+		return nullptr;
+	};
 
-		auto className = classColumn >= 0 ? fields.value( classColumn ).trimmed() : QString{};
+	int rows = 0;
+	for( ; have; have = nextRecord() )
+	{
+		if( isBlankRecord( record ) ) { continue; }
+		if( ++rows > MaxImportRows )
+		{
+			result.note( tr( "The table has more than %1 rows; the remaining rows were not imported." )
+						 .arg( MaxImportRows ) );
+			break;
+		}
+		if( record.size() > MaxImportColumns )
+		{
+			result.note( tr( "Line %1: row skipped (too many columns or an over-long cell)" ).arg( recordLine ) );
+			continue;
+		}
+		bool overLongCell = false;
+		for( const auto& field : record )
+		{
+			overLongCell = overLongCell || field.size() > MaxImportFieldLength;
+		}
+		if( overLongCell )
+		{
+			result.note( tr( "Line %1: row skipped (too many columns or an over-long cell)" ).arg( recordLine ) );
+			continue;
+		}
+		const auto trimmed = [&record]( int column ) {
+			return column >= 0 && column < record.size() ? record.at( column ).trimmed() : QString{};
+		};
+
+		auto className = trimmed( classColumn );
 		if( className.isEmpty() ) { className = defaultClassName; }
 		if( className.isEmpty() )
 		{
-			result.note( tr( "Line %1: no class name" ).arg( index + 1 ) );
+			result.note( tr( "Line %1: no class name" ).arg( recordLine ) );
 			continue;
 		}
 
 		ClassroomStudent student;
-		student.seat = fields.value( seatColumn ).trimmed();
-		student.name = fields.value( nameColumn ).trimmed();
-		student.ip = ipColumn >= 0 ? fields.value( ipColumn ).trimmed() : QString{};
+		student.seat = trimmed( seatColumn );
+		student.name = trimmed( nameColumn );
+		student.ip = trimmed( ipColumn );
 		if( student.seat.isEmpty() && student.name.isEmpty() ) { continue; }
 		if( student.name.isEmpty() )
 		{
-			result.note( tr( "Line %1: no student name" ).arg( index + 1 ) );
+			result.note( tr( "Line %1: no student name" ).arg( recordLine ) );
+			continue;
+		}
+		if( student.ip.isEmpty() == false && isValidRosterAddress( student.ip ) == false )
+		{
+			result.note( tr( "Line %1: %2 is not a valid IP address" ).arg( recordLine ).arg( student.ip ) );
 			continue;
 		}
 
-		auto* item = findClass( className );
+		auto* item = findStagedClass( className );
 		if( item == nullptr )
 		{
 			ClassroomClass newClass;
 			newClass.name = className;
-			m_classes.append( newClass );
-			item = &m_classes.last();
+			staged.append( newClass );
+			item = &staged.last();
 			++result.classes;
 		}
 
 		// Same class, same seat: replace. Same class, same IP on ANOTHER seat:
 		// that machine cannot host two students, so keep the first one and tell
 		// the teacher instead of silently sending the wrong identity later.
-		bool replaced = false;
+		ClassroomStudent* sameSeat = nullptr;
 		bool ipConflict = false;
 		for( auto& existing : item->students )
 		{
-			if( existing.seat == student.seat && student.seat.isEmpty() == false )
+			if( student.seat.isEmpty() == false && existing.seat == student.seat ) { sameSeat = &existing; }
+			else if( student.ip.isEmpty() == false && existing.ip == student.ip )
 			{
-				existing = student;
-				replaced = true;
-				break;
-			}
-			if( student.ip.isEmpty() == false && existing.ip == student.ip )
-			{
+				// Also raised when the row replaces its own seat: the IP may not
+				// silently migrate from the seat that already owns it.
 				ipConflict = true;
-				break;
 			}
 		}
 		if( ipConflict )
 		{
 			++result.ipConflicts;
 			result.note( tr( "Line %1: %2 already uses IP %3 in class %4" )
-							 .arg( index + 1 ).arg( student.name, student.ip, className ) );
+							 .arg( recordLine ).arg( student.name, student.ip, className ) );
 			continue;
 		}
-		if( replaced )
+		if( sameSeat )
 		{
+			*sameSeat = student;
 			++result.overwritten;
 		}
 		else
@@ -673,6 +812,10 @@ bool ClassroomRoster::importTable( const QString& text, const QString& defaultCl
 		}
 	}
 
+	if( result.students > 0 || result.overwritten > 0 )
+	{
+		m_classes = staged;
+	}
 	return result.students > 0 || result.overwritten > 0;
 }
 
@@ -686,7 +829,15 @@ bool ClassroomRoster::importTableFile( const QString& fileName, const QString& d
 		if( error ) { *error = file.errorString(); }
 		return false;
 	}
-	const auto bytes = file.readAll();
+	if( file.size() > MaxImportBytes )
+	{
+		if( error )
+		{
+			*error = QStringLiteral( "文件超过 %1 MB，无法作为名单表格导入。" ).arg( MaxImportBytes / ( 1024 * 1024 ) );
+		}
+		return false;
+	}
+	const auto bytes = file.read( MaxImportBytes + 1 );
 	file.close();
 	return importTable( decodeRosterText( bytes ), defaultClassName, report, error );
 }
@@ -773,6 +924,41 @@ QString ClassroomLogStore::sanitize( const QString& name )
 	}
 	while( result.contains( QStringLiteral("__") ) ) { result.replace( QStringLiteral("__"), QStringLiteral("_") ); }
 	return result.left( 96 );
+}
+
+
+//! Injective variant of sanitize() for storage keys. Score and shop books are
+//! keyed on the class name: two different names must never map onto one file.
+//! Event log paths keep the legacy sanitize() so existing installations do not
+//! lose their log history.
+QString ClassroomLogStore::storageKey( const QString& name )
+{
+	const auto legacy = sanitize( name );
+	const auto trimmed = name.trimmed();
+	if( legacy == trimmed && trimmed == name ) { return legacy; }
+	const auto digest = QCryptographicHash::hash( name.toUtf8(), QCryptographicHash::Sha256 ).
+						toHex().left( 8 );
+	return legacy.left( 96 ) + QLatin1Char('-') + QString::fromLatin1( digest );
+}
+
+
+//! Moves a pre-5.3.1 book file from its lossy key to the injective one, so an
+//! updated teacher machine keeps the existing score and shop data. Returns
+//! false when nothing had to be migrated.
+bool ClassroomLogStore::migrateStorageKey( const QString& directory, const QString& legacyName,
+										   const QString& newName )
+{
+	if( newName == legacyName ) { return false; }
+	QFile legacy( QDir( directory ).filePath( legacyName ) );
+	QFile modern( QDir( directory ).filePath( newName ) );
+	if( legacy.exists() == false || modern.exists() ) { return false; }
+	if( legacy.rename( QFileInfo( modern ).absoluteFilePath() ) == false )
+	{
+		qWarning( "ikeback: could not migrate %s to %s", qPrintable( legacy.fileName() ),
+				  qPrintable( modern.fileName() ) );
+		return false;
+	}
+	return true;
 }
 
 

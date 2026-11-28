@@ -83,10 +83,31 @@ ClassroomConfigurationPage::ClassroomConfigurationPage( ClassroomConfiguration& 
 								  error.isEmpty() ? tr( "未能从该文件导入任何学生。" ) : error );
 			return;
 		}
-		roster.save();
-		QMessageBox::information( this, windowTitle(),
-								  tr( "导入完成：%1 个班级，%2 名学生。" )
-									.arg( report.classes ).arg( report.students ) );
+		if( roster.save() == false )
+		{
+			QMessageBox::warning( this, windowTitle(),
+								  tr( "名单未能写入 %1，本次导入未生效。" ).arg( roster.filePath() ) );
+			return;
+		}
+		QString summary = tr( "导入完成：%1 个班级，%2 名学生。" )
+							  .arg( report.classes ).arg( report.students );
+		if( report.overwritten > 0 )
+		{
+			summary += QLatin1Char('\n') + tr( "更新了 %1 个已有座位。" ).arg( report.overwritten );
+		}
+		if( report.ipConflicts > 0 )
+		{
+			summary += QLatin1Char('\n') + tr( "跳过 %1 行：同一班级中该 IP 已被其他座位使用。" ).arg( report.ipConflicts );
+		}
+		if( report.problems.isEmpty() )
+		{
+			QMessageBox::information( this, windowTitle(), summary );
+		}
+		else
+		{
+			QMessageBox::warning( this, windowTitle(),
+								  summary + QLatin1Char('\n') + QLatin1Char('\n') + report.problems.join( QLatin1Char('\n') ) );
+		}
 	} );
 
 	form->addRow( new QLabel( tr( "AI 助手" ), this ) );

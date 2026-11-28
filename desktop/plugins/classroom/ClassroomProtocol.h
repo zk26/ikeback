@@ -367,7 +367,10 @@ enum class Argument
 	FileOffset,
 	ShortcutName,
 	ShortcutTarget,
-	DeployPhase
+	DeployPhase,
+
+	// Stable identifier for retried shop mutations (append only).
+	OperationId
 };
 
 inline FeatureMessage message( Command command )

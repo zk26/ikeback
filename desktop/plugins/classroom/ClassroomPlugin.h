@@ -11,6 +11,7 @@
 
 #include <QDockWidget>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QMap>
@@ -153,6 +154,9 @@ private:
 	QVector<FeatureMessage> m_pendingEvents;
 	QTimer* m_watchdog = nullptr;
 	bool m_restartPending = false;
+	//! When the pending worker start was issued; guards against a start that never registers.
+	QElapsedTimer m_restartPendingSince;
+	static constexpr int WorkerStartTimeoutMs = 90000;
 	bool m_stopAllowed = false;
 	//! Consecutive restarts that never produced a working worker. A worker that
 	//! cannot start (missing runtime DLL, blocked by security software) used to

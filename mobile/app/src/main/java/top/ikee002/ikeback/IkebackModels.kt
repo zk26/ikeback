@@ -47,6 +47,33 @@ data class ActivityEvent(
     fun time(): String = if (timestamp.length >= 19) timestamp.substring(11, 19) else ""
 }
 
+data class SeatSnapshot(val raw: String, val count: Int)
+
+/**
+ * Merges a successful sync without confusing an empty roster with a failed
+ * roster request. A null [seats] retains the last known seats and count; a
+ * valid empty snapshot deliberately replaces them.
+ */
+fun Cache.mergeSync(
+    state: TeacherState,
+    scores: ScoreSnapshot,
+    events: List<ActivityEvent>,
+    seats: SeatSnapshot?,
+    updatedAt: Long,
+): Cache = copy(
+    revision = state.revision,
+    className = state.className.ifEmpty { scores.className }.ifEmpty { this.className },
+    baseScore = scores.rules.baseScore,
+    rulesPublished = scores.rules.published,
+    lessons = scores.lessons.size,
+    entries = scores.entries.size,
+    students = seats?.count ?: this.students,
+    scoresRaw = scores.raw,
+    seatsRaw = seats?.raw ?: this.seatsRaw,
+    events = events,
+    updatedAt = updatedAt,
+)
+
 fun parseTeacherState(json: JSONObject): TeacherState = TeacherState(
     teacherId = json.optString("teacherId"),
     revision = json.optLong("revision"),

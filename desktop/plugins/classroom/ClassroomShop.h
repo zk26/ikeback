@@ -9,7 +9,10 @@
  *
  * Data lives in <dataDirectory>/shop/<class>.json and is atomically replaced
  * after every change. Product pictures are stored in the same file so the
- * catalog metadata and pictures cannot diverge after a failed save.
+ * catalog metadata and pictures cannot diverge after a failed save. Score
+ * mutations use a durable pending-operation journal with fixed score entry
+ * ids, so an interrupted operation can be retried without double charging or
+ * refunding.
  *
  * This file is part of the Ikeback classroom modification.
  */
@@ -18,11 +21,13 @@
 
 #include <QByteArray>
 #include <QDateTime>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
 #include <QVector>
 
 class QImage;
+struct ClassroomScoreEntry;
 
 //! One product of the class shop.
 struct ClassroomShopProduct
@@ -154,10 +159,16 @@ public:
 
 	static QString directoryPath( const QString& dataDirectory );
 	QString filePath() const;
+	void migrateLegacyFile() const;
 
 	//! Reads the book of `className`. An empty class name or a missing file
 	//! gives an empty book; false is returned for unreadable or invalid data.
 	bool load( const QString& className );
+	//! Completes or rolls back the journal left by an interrupted score/shop
+	//! transaction. Safe to call repeatedly; false leaves the journal intact.
+	bool recoverPendingOperations();
+	bool hasPendingOperation() const { return m_pendingOperation.isEmpty() == false; }
+	QString lastError() const { return m_lastError; }
 
 	const QString& className() const { return m_className; }
 	bool isOpen() const { return m_open; }
@@ -198,8 +209,11 @@ public:
 	//! Redeems one unit of a product for (seat, student). `balance` is the
 	//! student's current score, which the caller reads from the score book.
 	//! Returns an empty string on success, otherwise a Chinese reason that is
-	//! shown to the student as is. Books the score entry itself.
-	QString redeem( const QString& productId, const QString& seat, const QString& student, int balance );
+	//! shown to the student as is. Books the score entry itself. A non-empty
+	//! `operationId` makes retries idempotent; callers retrying a request must
+	//! reuse the same id.
+	QString redeem( const QString& productId, const QString& seat, const QString& student,
+					int balance, const QString& operationId = QString{} );
 	//! Places a bid. No points change until the auction is closed.
 	QString placeBid( const QString& auctionId, int amount, const QString& seat,
 					  const QString& student, int balance );
@@ -229,13 +243,24 @@ public:
 private:
 	bool save();
 	bool makeRedemptionCapacity();
+	bool canMakeRedemptionCapacity() const;
+	bool preparePendingOperation( const QJsonObject& operation );
+	bool recoverPendingOperationsLocked();
+	bool appendScoreEntry( const ClassroomScoreEntry& entry );
+	bool scoreEntryExists( const QString& entryId, bool* exists );
+	bool removeScoreEntryExactly( const QString& entryId );
 
 	QString m_basePath;
 	QString m_className;
 	bool m_loaded = false;
+	bool m_persisted = false;
 	bool m_open = true;
+	bool m_recovering = false;
 	qint64 m_revision = 0;
 	QVector<ClassroomShopProduct> m_products;
 	QVector<ClassroomShopAuction> m_auctions;
 	QVector<ClassroomShopRedemption> m_redemptions;
+	QJsonObject m_pendingOperation;
+	QJsonArray m_completedOperations;
+	QString m_lastError;
 };

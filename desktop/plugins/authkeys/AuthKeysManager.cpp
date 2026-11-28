@@ -25,6 +25,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QUuid>
 
 #include "AuthKeysManager.h"
 #include "CommandLineIO.h"
@@ -311,15 +312,25 @@ bool AuthKeysManager::writePrivateKeyFile( const CryptoCore::PrivateKey& private
 		return false;
 	}
 
-	if( privateKey.toPEMFile( privateKeyFileName ) == false )
+	const auto temporaryFileName = privateKeyFileName + QStringLiteral(".tmp-") +
+			QUuid::createUuid().toString( QUuid::WithoutBraces );
+	QFile temporaryFile( temporaryFileName );
+	if( IkebackCore::platform().filesystemFunctions().openFileSafely(
+			&temporaryFile, QIODevice::WriteOnly | QIODevice::NewOnly,
+			QFile::ReadOwner | QFile::WriteOwner ) == false )
 	{
-		m_resultMessage = tr( "Failed to save private key in file \"%1\"!" ).arg( privateKeyFileName ) + QLatin1Char(' ') + m_checkPermissions;
+		m_resultMessage = tr( "Failed to create protected private key file \"%1\"!" ).arg( privateKeyFileName ) +
+				QLatin1Char(' ') + m_checkPermissions;
 		return false;
 	}
-
-	if( setPrivateKeyFilePermissions( privateKeyFileName ) == false )
+	const auto pem = privateKey.toPEM().toUtf8();
+	const bool written = temporaryFile.write( pem ) == pem.size() && temporaryFile.flush();
+	temporaryFile.close();
+	if( written == false || QFile::rename( temporaryFileName, privateKeyFileName ) == false )
 	{
-		m_resultMessage = tr( "Failed to set permissions for private key file \"%1\"!" ).arg( privateKeyFileName ) + QLatin1Char(' ') + m_checkPermissions;
+		QFile::remove( temporaryFileName );
+		m_resultMessage = tr( "Failed to save private key in file \"%1\"!" ).arg( privateKeyFileName ) +
+				QLatin1Char(' ') + m_checkPermissions;
 		return false;
 	}
 
@@ -545,7 +556,11 @@ bool AuthKeysManager::setKeyFilePermissions( const QString& name, const QString&
 
 bool AuthKeysManager::setPrivateKeyFilePermissions( const QString& fileName ) const
 {
+#ifdef Q_OS_WIN
+	return IkebackCore::platform().filesystemFunctions().setFileOwnerGroupPermissions( fileName, QFile::ReadOwner );
+#else
 	return QFile::setPermissions( fileName, QFile::ReadOwner | QFile::ReadUser | QFile::ReadGroup );
+#endif
 }
 
 

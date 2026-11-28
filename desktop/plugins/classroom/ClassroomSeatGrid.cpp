@@ -16,6 +16,7 @@
 #include <QFrame>
 #include <QGridLayout>
 #include <QHeaderView>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
@@ -49,6 +50,7 @@ ClassroomSeatGrid::ClassroomSeatGrid( ClassroomRoster& roster, QWidget* parent )
 	m_roster( roster )
 {
 	setObjectName( QStringLiteral("classroomSeatGrid") );
+	installEventFilter( this );
 	Classroom::Theme::apply( this );
 	auto* root = new QVBoxLayout( this );
 
@@ -150,6 +152,8 @@ void ClassroomSeatGrid::rebuild()
 	}
 	m_cards.clear();
 	m_activeScoreSeat.clear();
+	m_scoreFocusButton.clear();
+	m_keyboardSwapSeat.clear();
 
 	const auto* classItem = m_className.isEmpty() ? nullptr : m_roster.findClass( m_className );
 	if( classItem == nullptr )
@@ -189,8 +193,11 @@ void ClassroomSeatGrid::rebuild()
 		card->setFrameShape( QFrame::StyledPanel );
 		card->setProperty( "seatCard", true );
 		card->setFixedWidth( m_thumbWidth + 16 );
-		card->setToolTip( tr( "Drag this card onto another one to swap positions" ) );
+		card->setFocusPolicy( Qt::StrongFocus );
+		card->setToolTip( tr( "Drag onto another card, or focus a card and press Enter/Space, then choose the destination and press Enter/Space. Esc cancels." ) );
 		card->setProperty( "ikebackSeat", student.seat );
+		card->setAccessibleName( tr( "Seat %1, %2" ).arg( student.seat, student.name ) );
+		card->setAccessibleDescription( card->toolTip() );
 		card->setAcceptDrops( true );
 		card->installEventFilter( this );
 
@@ -256,7 +263,7 @@ void ClassroomSeatGrid::rebuild()
 		++index;
 	}
 
-	m_summary->setText( tr( "%1 students in %2. Drag cards to reorder (persisted); click a score for -5..+5." )
+	m_summary->setText( tr( "%1 students in %2. Drag cards or focus a card and press Enter/Space, then choose a destination and press Enter/Space; Esc cancels. Click a score for -5..+5." )
 						.arg( classItem->students.size() ).arg( m_className ) );
 	rebuildList();
 	refresh();
@@ -380,9 +387,14 @@ void ClassroomSeatGrid::refresh()
 							   .arg( state, uwf.isEmpty() ? tr( "unknown" ) : uwf ) );
 		if( onlineNow ) { ++online; }
 	}
-	if( m_cards.isEmpty() == false )
+	if( m_keyboardSwapSeat.isEmpty() == false )
 	{
-		m_summary->setText( tr( "%1：%2/%3 名学生在线，可点击“积分”直接加减分。" )
+		m_summary->setText( tr( "已选择座位 %1。请焦点移到目标座位后按 Enter/空格交换，Esc 取消。" )
+							.arg( m_keyboardSwapSeat ) );
+	}
+	else if( m_cards.isEmpty() == false )
+	{
+		m_summary->setText( tr( "%1：%2/%3 名学生在线。拖动卡片或按 Enter/空格交换座位，Esc 取消；可点击“积分”直接加减分。" )
 							.arg( m_className, QString::number( online ), QString::number( m_cards.size() ) ) );
 	}
 	refreshList();
@@ -405,6 +417,7 @@ void ClassroomSeatGrid::chooseDelta( const QString& seat )
 	auto& card = it.value();
 	card.scoreDelta->setValue( 1 );
 	card.scoreReason->clear();
+	m_scoreFocusButton = card.score;
 	card.scoreEditor->show();
 	card.scoreDelta->setFocus();
 	m_activeScoreSeat = seat;
@@ -437,7 +450,12 @@ void ClassroomSeatGrid::cancelScore( const QString& seat )
 {
 	const auto it = m_cards.find( seat );
 	if( it != m_cards.end() ) { it.value().scoreEditor->hide(); }
-	if( m_activeScoreSeat == seat ) { m_activeScoreSeat.clear(); }
+	if( m_activeScoreSeat == seat )
+	{
+		m_activeScoreSeat.clear();
+		if( m_scoreFocusButton ) { m_scoreFocusButton->setFocus(); }
+		m_scoreFocusButton.clear();
+	}
 }
 
 
@@ -487,7 +505,40 @@ void ClassroomSeatGrid::resizeEvent( QResizeEvent* event )
 bool ClassroomSeatGrid::eventFilter( QObject* watched, QEvent* event )
 {
 	const auto seat = watched->property( "ikebackSeat" ).toString();
-	if( seat.isEmpty() ) { return QWidget::eventFilter( watched, event ); }
+	if( seat.isEmpty() )
+	{
+		if( watched == this && event->type() == QEvent::KeyPress &&
+			static_cast<QKeyEvent*>( event )->key() == Qt::Key_Escape &&
+			m_keyboardSwapSeat.isEmpty() == false )
+		{
+			cancelKeyboardSwap();
+			return true;
+		}
+		return false;
+	}
+
+	if( event->type() == QEvent::KeyPress )
+	{
+		auto* key = static_cast<QKeyEvent*>( event );
+		if( key->key() == Qt::Key_Escape && m_keyboardSwapSeat.isEmpty() == false )
+		{
+			cancelKeyboardSwap();
+			return true;
+		}
+		if( key->key() != Qt::Key_Return && key->key() != Qt::Key_Enter &&
+			key->key() != Qt::Key_Space ) { return false; }
+		if( m_keyboardSwapSeat.isEmpty() )
+		{
+			m_keyboardSwapSeat = seat;
+			m_summary->setText( tr( "已选择座位 %1。请焦点移到目标座位后按 Enter/空格交换，Esc 取消。" ).arg( seat ) );
+			return true;
+		}
+		if( m_keyboardSwapSeat == seat ) { cancelKeyboardSwap(); return true; }
+		const auto from = m_keyboardSwapSeat;
+		swapSeats( from, seat );
+		m_keyboardSwapSeat.clear();
+		return true;
+	}
 
 	if( event->type() == QEvent::MouseButtonPress )
 	{
@@ -549,6 +600,16 @@ bool ClassroomSeatGrid::eventFilter( QObject* watched, QEvent* event )
 }
 
 
+void ClassroomSeatGrid::cancelKeyboardSwap()
+{
+	const auto selected = m_keyboardSwapSeat;
+	m_keyboardSwapSeat.clear();
+	const auto it = m_cards.find( selected );
+	if( it != m_cards.end() ) { it.value().root->setFocus(); }
+	refresh();
+}
+
+
 void ClassroomSeatGrid::swapSeats( const QString& from, const QString& to )
 {
 	const auto left = m_order.indexOf( from );
@@ -562,4 +623,6 @@ void ClassroomSeatGrid::swapSeats( const QString& from, const QString& to )
 	// "下一次开机不变": persist immediately, not on exit.
 	Classroom::saveSeatOrder( m_className, m_order );
 	rebuild();
+	const auto destination = m_cards.find( to );
+	if( destination != m_cards.end() ) { destination.value().root->setFocus(); }
 }

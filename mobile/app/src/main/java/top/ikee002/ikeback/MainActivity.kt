@@ -25,7 +25,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.text.DateFormat
 import java.util.Date
 import java.util.concurrent.Executors
@@ -56,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     // Debounce for sendCommand: double-taps must not dispatch twice.
     private var lastCommandName: String? = null
     private var lastCommandAt = 0L
+    private var selectedTab = 0
 
     private lateinit var contentHost: FrameLayout
     private lateinit var bottomBar: BottomBar
@@ -104,6 +107,7 @@ class MainActivity : AppCompatActivity() {
         timetableStore = TimetableStore(this)
         cache = cacheStore.load()
         seats = parseSeats(cache.seatsRaw)
+        selectedTab = savedInstanceState?.getInt(STATE_SELECTED_TAB, 0) ?: 0
 
         contentHost = findViewById(R.id.content)
         val barHost = findViewById<FrameLayout>(R.id.bottomBarHost)
@@ -116,6 +120,7 @@ class MainActivity : AppCompatActivity() {
                 BottomBar.Tab(R.drawable.ikeback_tab_config, "配置"),
                 BottomBar.Tab(R.drawable.ikeback_tab_more, "更多"),
             ),
+            initialSelected = selectedTab,
         ) { index -> showTab(index) }
         // Explicit height keeps the docked bar from ever eating the content area.
         // Must match BottomBar.barHeight (62dp) + its 6dp outer padding.
@@ -143,42 +148,46 @@ class MainActivity : AppCompatActivity() {
 
         keyLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             uri ?: return@registerForActivityResult
-            val text = try {
-                contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)
-                    ?.use { it.readText() } ?: ""
-            } catch (_: Exception) {
-                ""
-            }
-            val key = extractKey(text)
-            if (key.isEmpty()) {
-                message("未从文件中读到密钥，请检查 .key 文件内容")
-            } else {
-                keyField.input.setText(key)
-                applyKey(key)
-                message("已从文件导入本堂课密钥")
+            // Content-provider reads may block; never perform imports on the UI thread.
+            background {
+                val text = try {
+                    readImportText(uri)
+                } catch (_: Exception) {
+                    ""
+                }
+                val key = extractKey(text)
+                ui {
+                    if (key.isEmpty()) {
+                        message("未从文件中读到密钥，请检查 .key 文件内容")
+                    } else {
+                        keyField.input.setText(key)
+                        applyKey(key)
+                        message("已从文件导入本堂课密钥")
+                    }
+                }
             }
         }
         timetableLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             uri ?: return@registerForActivityResult
-            val text = try {
-                contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)
-                    ?.use { it.readText() } ?: ""
-            } catch (_: Exception) {
-                ""
-            }
-            if (text.isBlank()) return@registerForActivityResult
-            try {
-                timetableStore.save(TimetableStore.fromJson(text))
-                refreshSchedule()
-                pushTimetableToTeacher()
-                message("作息表已导入（兼容 ClassBoard 全校作息 JSON）")
-            } catch (_: Exception) {
-                message("作息表格式无法识别")
+            background {
+                try {
+                    val text = readImportText(uri)
+                    if (text.isBlank()) throw IllegalArgumentException("empty timetable")
+                    val timetable = TimetableStore.fromJson(text)
+                    timetableStore.save(timetable)
+                    ui {
+                        refreshSchedule()
+                        pushTimetableToTeacher()
+                        message("作息表已导入（兼容 ClassBoard 全校作息 JSON）")
+                    }
+                } catch (_: Exception) {
+                    ui { message("作息表格式无法识别") }
+                }
             }
         }
 
         buildPages()
-        showTab(0)
+        showTab(selectedTab)
         startDiscovery()
     }
 
@@ -430,7 +439,7 @@ class MainActivity : AppCompatActivity() {
             this.text = getString(R.string.app_name)
             textSize = 22f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(getColor(R.color.white))
+            setTextColor(getColor(R.color.ikeback_on_primary))
         }
         val sub = TextView(this).apply {
             this.text = "课堂看得见 · 成长记得下"
@@ -446,8 +455,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTab(index: Int) {
+        val tab = index.coerceIn(pages.indices)
+        selectedTab = tab
         contentHost.removeAllViews()
-        pages[index]?.let {
+        pages[tab]?.let {
             contentHost.addView(
                 it,
                 FrameLayout.LayoutParams(
@@ -456,10 +467,10 @@ class MainActivity : AppCompatActivity() {
                 ),
             )
         }
-        bottomBar.select(index)
-        if (index == 0) refreshConnectionHint()
-        if (index == 1) refreshClassRecords()
-        if (index == 2) refreshSchedule()
+        bottomBar.select(tab)
+        if (tab == 0) refreshConnectionHint()
+        if (tab == 1) refreshClassRecords()
+        if (tab == 2) refreshSchedule()
     }
 
     /** Unconfigured: shrink the status card to a hint, leave the page to control + roster. */
@@ -524,7 +535,9 @@ class MainActivity : AppCompatActivity() {
             port = if (::portField.isInitialized) currentPort() else cache.port,
             sessionKey = if (::keyField.isInitialized) currentKey() else cache.sessionKey,
         )
-        cacheStore.save(cache)
+        cacheStore.saveAsync(cache) {
+            ui { message("本地缓存保存失败，请检查设备存储空间") }
+        }
     }
 
     private fun startDiscovery() {
@@ -579,52 +592,59 @@ class MainActivity : AppCompatActivity() {
                 }
                 val scores = bridge.scores(host)
                 val events = bridge.events(host)
-                val loadedSeats = try { bridge.seats(host) } catch (_: Exception) { emptyList() }
-                val seatsJson = JSONObject().put(
-                    "seats",
-                    JSONArray().apply {
-                        loadedSeats.forEach {
-                            put(
-                                JSONObject()
-                                    .put("seat", it.seat)
-                                    .put("student", it.student)
-                                    .put("ip", it.ip)
-                                    .put("score", it.score)
-                            )
-                        }
-                    },
-                ).toString()
+                val loadedSeats = try {
+                    bridge.seats(host)
+                } catch (e: UnauthorizedException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                val seatsSnapshot = loadedSeats?.let { students ->
+                    SeatSnapshot(
+                        raw = JSONObject().put(
+                            "seats",
+                            JSONArray().apply {
+                                students.forEach {
+                                    put(
+                                        JSONObject()
+                                            .put("seat", it.seat)
+                                            .put("student", it.student)
+                                            .put("ip", it.ip)
+                                            .put("score", it.score)
+                                    )
+                                }
+                            },
+                        ).toString(),
+                        count = students.size,
+                    )
+                }
                 ui {
                     connected = true
                     setStatus(true)
-                    cache = cache.copy(
-                        revision = state.revision,
-                        className = state.className.ifEmpty { scores.className },
-                        baseScore = scores.rules.baseScore,
-                        rulesPublished = scores.rules.published,
-                        lessons = scores.lessons.size,
-                        entries = scores.entries.size,
-                        students = loadedSeats.size,
-                        scoresRaw = scores.raw,
-                        seatsRaw = seatsJson,
-                        events = events,
-                        updatedAt = System.currentTimeMillis(),
-                    )
-                    seats = loadedSeats
+                    cache = cache.mergeSync(state, scores, events, seatsSnapshot, System.currentTimeMillis())
+                    // null means the request failed; an actual empty list is valid.
+                    if (loadedSeats != null) seats = loadedSeats
                     persist()
                     classNames = state.classNames
                     refreshHome()
                     refreshSeatCards()
                     refreshClassRecords()
                     refreshConnectionHint()
-                    message("同步完成 · 版本 ${state.revision} · ${cache.className}")
-                    toast("同步完成 · ${cache.className}")
+                    val seatsNote = if (loadedSeats == null) " · 学生名单读取失败，保留缓存" else ""
+                    message("同步完成 · 版本 ${state.revision} · ${cache.className}$seatsNote")
+                    toast("同步完成 · ${cache.className}$seatsNote")
                 }
             } catch (e: UnauthorizedException) {
                 ui {
                     setStatus(false)
                     message("密钥被拒绝，换新课后请更新密钥")
                     toast("密钥被拒绝，请更新本堂课密钥")
+                }
+            } catch (e: ResponseIntegrityException) {
+                ui {
+                    setStatus(false)
+                    message("教师机响应校验失败：请检查课堂密钥与设备时间，或先在教师端开始新课")
+                    toast("课堂密钥不匹配、时间不准，或教师机尚未开始新课")
                 }
             } catch (e: Exception) {
                 val reason = e.message ?: ""
@@ -1107,7 +1127,7 @@ class MainActivity : AppCompatActivity() {
         message("正在导出课表…")
         background {
             try {
-                val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+                val dir = exportDirectory()
                 val file = File(dir, "ikeback-课表.json")
                 file.writeText(json, Charsets.UTF_8)
                 ui { message("课表已导出：${file.absolutePath}") }
@@ -1142,7 +1162,7 @@ class MainActivity : AppCompatActivity() {
             message("正在导出本地数据…")
             background {
                 try {
-                    val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+                    val dir = exportDirectory()
                     val file = File(dir, "ikeback-本地数据.json")
                     file.writeText(text, Charsets.UTF_8)
                     ui { message("本地数据已导出：${file.absolutePath}") }
@@ -1262,7 +1282,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 bridge.connect(host)
                 val xml = bridge.report(host)
-                val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+                val dir = exportDirectory()
                 val file = File(dir, "ikeback-期末成绩表.xls")
                 file.writeText(xml, Charsets.UTF_8)
                 ui {
@@ -1344,6 +1364,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Both external and internal fallback exports stay inside a shared path. */
+    private fun exportDirectory(): File =
+        getExternalFilesDir(android.os.Environment.DIRECTORY_DOCUMENTS)
+            ?: File(filesDir, "documents").apply { mkdirs() }
+
     /** Hand an exported file to other apps via FileProvider (no file:// URIs). */
     private fun shareFile(file: File, mime: String) {
         try {
@@ -1361,6 +1386,21 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun readImportText(uri: android.net.Uri): String {
+        val input = contentResolver.openInputStream(uri) ?: throw IOException("无法读取文件")
+        val output = ByteArrayOutputStream()
+        input.use { stream ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                val count = stream.read(buffer)
+                if (count < 0) break
+                if (output.size() + count > MAX_IMPORT_BYTES) throw IOException("导入文件超过 2 MiB")
+                output.write(buffer, 0, count)
+            }
+        }
+        return output.toString(Charsets.UTF_8.name())
+    }
+
     private fun extractKey(raw: String): String {
         val text = raw.trim()
         if (text.isEmpty()) return ""
@@ -1376,9 +1416,19 @@ class MainActivity : AppCompatActivity() {
             ?.removePrefix("sessionKey=")?.removePrefix("key=") ?: ""
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt(STATE_SELECTED_TAB, selectedTab)
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onDestroy() {
         discovery?.stop()
         executor.shutdownNow()
         super.onDestroy()
+    }
+
+    private companion object {
+        const val STATE_SELECTED_TAB = "selectedTab"
+        const val MAX_IMPORT_BYTES = 2 * 1024 * 1024
     }
 }

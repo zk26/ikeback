@@ -35,6 +35,8 @@ class VncEvent
 public:
 	virtual ~VncEvent() = default;
 	virtual void fire( rfbClient* client ) = 0;
+	//! Rough memory footprint used to keep the connection's event queue bounded.
+	virtual int memoryUsage() { return 64; }
 
 } ;
 
@@ -74,6 +76,8 @@ public:
 	explicit VncClientCutEvent( const QString& text );
 
 	void fire( rfbClient* client ) override;
+
+	int memoryUsage() override { return 64 + int( m_text.size() ); }
 
 private:
 	QByteArray m_text;

@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version without the v prefix (e.g. 5.2.0)'
+        description: 'Version without the v prefix (e.g. 5.3.0)'
         required: true
-        default: '5.2.1'
+        default: '5.3.0'
       purge_old_releases:
         description: 'After publishing, delete every GitHub release older than 5.2.0'
         required: false
@@ -25,24 +25,81 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  version:
+    name: Resolve canonical release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      name: ${{ steps.resolve.outputs.name }}
+      code: ${{ steps.resolve.outputs.code }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          text = Path('mobile/app/build.gradle.kts').read_text(encoding='utf-8')
+          name = re.search(r'versionName\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"', text)
+          code = re.search(r'versionCode\s*=\s*(\d+)', text)
+          if not name or not code:
+              raise SystemExit('Cannot read canonical Android version from mobile/app/build.gradle.kts')
+          version = name.group(1)
+          requested = os.environ.get('REQUESTED_VERSION', '').strip()
+          tag = os.environ.get('TAG_NAME', '').strip()
+          if requested and requested != version:
+              raise SystemExit(f'Requested version {requested} does not match canonical Android version {version}')
+          if tag and tag != f'v{version}':
+              raise SystemExit(f'Tag {tag} does not match canonical Android version v{version}')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'name={version}\ncode={code.group(1)}\n')
+          PY
+
   # ------------------------------------------------------------------ Android
   android:
     name: Android classroom app
+    needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-java@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      # Fail before spending time on Gradle if release signing is not configured.
+      - name: Validate and decode Android signing key
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/ikeback-release.jks
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required Android signing secret $name is missing"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_FILE"
+          test -s "$ANDROID_KEYSTORE_FILE"
+
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
           distribution: temurin
           java-version: '21'
 
       # Reuse the Gradle dependency cache between release runs.
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.gradle/caches
@@ -58,20 +115,48 @@ jobs:
 
       - name: Build and test
         working-directory: mobile
+        env:
+          IKEBACK_REQUIRE_RELEASE_SIGNING: '1'
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/ikeback-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleDebug :app:testDebugUnitTest --no-daemon
+          ./gradlew :app:assembleRelease :app:testDebugUnitTest --no-daemon
+
+      - name: Remove signing key from runner
+        if: always()
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/ikeback-release.jks
+        run: rm -f "$ANDROID_KEYSTORE_FILE"
 
       - name: Collect APK
         shell: bash
+        env:
+          VERSION_NAME: ${{ needs.version.outputs.name }}
+          VERSION_CODE: ${{ needs.version.outputs.code }}
         run: |
-          set -e
-          APK=$(find mobile/app/build/outputs -name '*.apk' -type f | head -n 1)
-          test -n "$APK" || { echo 'No APK produced'; exit 1; }
+          set -euo pipefail
+          APK=$(find mobile/app/build/outputs -name '*release*.apk' -type f | head -n 1)
+          test -n "$APK" || { echo 'No release APK produced'; exit 1; }
           mkdir -p dist
           cp "$APK" dist/ikeback-Mobile.apk
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          AAPT2="$BUILD_TOOLS/aapt2"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+          # The published APK must be signed, non-debuggable and match 5.3.0.
+          "$APKSIGNER" verify --verbose --print-certs dist/ikeback-Mobile.apk
+          BADGING=$("$AAPT2" dump badging dist/ikeback-Mobile.apk)
+          grep -q "^package: name='top.ikee002.ikeback' versionCode='$VERSION_CODE' versionName='$VERSION_NAME'" <<< "$BADGING" || {
+            echo "::error::APK package/version does not match top.ikee002.ikeback $VERSION_NAME ($VERSION_CODE)"; exit 1;
+          }
+          if grep -q '^application-debuggable' <<< "$BADGING"; then
+            echo '::error::Release APK is debuggable'; exit 1
+          fi
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ikeback-android
           path: dist/ikeback-Mobile.apk
@@ -80,15 +165,16 @@ jobs:
   # ------------------------------------------------------------------ Windows
   windows:
     name: Windows binaries (UCRT64 / Qt6 / MinGW)
+    needs: version
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c
         with:
           msystem: UCRT64
           update: true
@@ -122,7 +208,7 @@ jobs:
       # Restored trees are already patched (the cache is saved at job end);
       # every patch below is idempotent so re-patching is safe.
       - name: Cache Veyon 3rdparty sources
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: desktop/3rdparty
           key: veyon-3rdparty-win-v4.11.4-30860286-479a32b-2002b2c-f80feff-7ad8859
@@ -253,15 +339,6 @@ jobs:
             fi
           done
 
-      - name: Resolve version
-        id: ver
-        shell: pwsh
-        run: |
-          $v = '${{ github.event.inputs.version }}'
-          if ([string]::IsNullOrEmpty($v)) { $v = $env:GITHUB_REF_NAME -replace '^v', '' }
-          if ([string]::IsNullOrEmpty($v)) { $v = '5.2.1' }
-          "value=$v" >> $env:GITHUB_OUTPUT
-
       # A hand-written DLL whitelist produced installs that failed with
       # "libbz2-1.dll / libmd4c.dll not found". ntldd now walks the real PE
       # import closure so every required runtime DLL is shipped.
@@ -291,11 +368,11 @@ jobs:
           set -e
           mkdir -p dist
           { printf '\xEF\xBB\xBF'; cat desktop/scripts/ikeback-installer.nsi; } > installer.nsi
-          makensis -DVERSION='${{ steps.ver.outputs.value }}' -DROLE=teacher installer.nsi
-          makensis -DVERSION='${{ steps.ver.outputs.value }}' -DROLE=student installer.nsi
+          makensis -DVERSION='${{ needs.version.outputs.name }}' -DROLE=teacher installer.nsi
+          makensis -DVERSION='${{ needs.version.outputs.name }}' -DROLE=student installer.nsi
           ls -lh dist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ikeback-windows
           path: dist/*.exe
@@ -304,36 +381,27 @@ jobs:
   # ------------------------------------------------------------------ Package
   package:
     name: Assemble release artifacts
-    needs: [android, windows]
+    needs: [version, android, windows]
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: ikeback-android
           path: artifacts
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: ikeback-windows
           path: windows-setups
-
-      - name: Resolve version
-        id: ver
-        shell: pwsh
-        run: |
-          $v = '${{ github.event.inputs.version }}'
-          if ([string]::IsNullOrEmpty($v)) { $v = $env:GITHUB_REF_NAME -replace '^v', '' }
-          if ([string]::IsNullOrEmpty($v)) { $v = '5.2.1' }
-          "value=$v" >> $env:GITHUB_OUTPUT
 
       - name: Assemble the three artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $v = '${{ steps.ver.outputs.value }}'
+          $v = '${{ needs.version.outputs.name }}'
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
           $apk = Get-ChildItem -LiteralPath 'artifacts' -Filter '*.apk' -File | Select-Object -First 1
@@ -359,12 +427,12 @@ jobs:
       - name: Write release notes
         shell: pwsh
         run: |
-          $v = '${{ steps.ver.outputs.value }}'
+          $v = '${{ needs.version.outputs.name }}'
           $template = [IO.File]::ReadAllText('desktop/scripts/release-notes-template.md', [Text.Encoding]::UTF8)
           $notes = $template.Replace('{VER}', $v)
           [IO.File]::WriteAllText('dist/RELEASE-NOTES.md', $notes, (New-Object Text.UTF8Encoding($false)))
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: ikeback-release-final
           path: dist/*
@@ -373,10 +441,12 @@ jobs:
   # ------------------------------------------------------------------ Release
   release:
     name: Publish GitHub Release
-    needs: package
+    needs: [version, package]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
         with:
           name: ikeback-release-final
           path: dist
@@ -395,10 +465,10 @@ jobs:
             echo "$hash  $file" | sha256sum -c -
           done < SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.version) }}
-          name: ikeback ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.event.inputs.version) }}
+          tag_name: v${{ needs.version.outputs.name }}
+          name: ikeback v${{ needs.version.outputs.name }}
           body_path: dist/RELEASE-NOTES.md
           files: |
             dist/ikeback-teacher-*-win64-setup.exe

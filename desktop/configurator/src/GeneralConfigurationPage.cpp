@@ -37,6 +37,7 @@
 #include "IkebackServiceControl.h"
 #include "IkebackCore.h"
 #include "IkebackConfiguration.h"
+#include "Logger.h"
 #include "UserGroupsBackendManager.h"
 
 #include "ui_GeneralConfigurationPage.h"
@@ -215,7 +216,7 @@ void GeneralConfigurationPage::clearLogFiles()
 	bool success = true;
 	const QStringList logFilesFilter( { QStringLiteral("ikeback*.log") } );
 
-	QDir d( IkebackCore::filesystem().expandPath( IkebackCore::config().logFileDirectory() ) );
+	QDir d( Logger::resolvedLogFileDirectory( IkebackCore::config().logFileDirectory() ) );
 	const auto localLogFiles = d.entryList( logFilesFilter );
 
 	for( const auto& f : localLogFiles )

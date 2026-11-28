@@ -4,6 +4,7 @@
  * This file is part of the Ikeback classroom modification.
  */
 
+#include <algorithm>
 #include <QAbstractSocket>
 #include <QDate>
 #include <QDateTime>
@@ -17,7 +18,10 @@
 #include <QJsonObject>
 #include <QNetworkInterface>
 #include <QFutureWatcher>
+#include <QLockFile>
 #include <QPointer>
+#include <QSaveFile>
+#include <QSet>
 #include <QTcpServer>
 #include <QtConcurrent>
 #include <QTcpSocket>
@@ -55,13 +59,18 @@ ClassroomBridge::ClassroomBridge( const QString& dataDirectory, ClassroomRoster&
 	m_store( store ),
 	m_master( master ),
 	m_settings( settings ),
-	m_book( dataDirectory ),
 	m_teacherId( QUuid::createUuid().toString( QUuid::WithoutBraces ).left( 12 ) ),
 	m_sessionKey( ClassroomSecrets::reveal( settings.value( QStringLiteral("sessionKey") ).toString() ) )
 {
 	rotateNonce();
 	m_server = new QTcpServer( this );
+	m_server->setMaxPendingConnections( MaxPendingConnections );
 	connect( m_server, &QTcpServer::newConnection, this, &ClassroomBridge::acceptConnection );
+
+	auto* readSweep = new QTimer( this );
+	readSweep->setInterval( 1000 );
+	connect( readSweep, &QTimer::timeout, this, &ClassroomBridge::expireRequests );
+	readSweep->start();
 
 	m_udp = new QUdpSocket( this );
 	connect( m_udp, &QUdpSocket::readyRead, this, &ClassroomBridge::readDiscovery );
@@ -135,6 +144,24 @@ void ClassroomBridge::stop()
 	m_broadcastTimer->stop();
 	m_udp->close();
 	m_server->close();
+	// Closing the listener leaves established connections usable: drop them
+	// too, otherwise a phone that already authenticated keeps its access.
+	QSet<QTcpSocket*> sockets;
+	for( auto* socket : m_buffers.keys() ) { sockets.insert( socket ); }
+	for( auto* socket : m_asyncSockets.values() ) { sockets.insert( socket ); }
+	for( auto* socket : m_responseStarted.keys() ) { sockets.insert( socket ); }
+	m_buffers.clear();
+	m_readStarted.clear();
+	m_responseStarted.clear();
+	m_responseContexts.clear();
+	m_connectionsPerPeer.clear();
+	m_issuedNonces.clear();
+	m_nonceIssuedByPeer.clear();
+	m_authFailures.clear();
+	for( auto* socket : sockets )
+	{
+		if( socket ) { socket->abort(); }
+	}
 }
 
 
@@ -181,11 +208,24 @@ void ClassroomBridge::rotateNonce()
 }
 
 
-QString ClassroomBridge::issueNonce()
+QString ClassroomBridge::issueNonce( const QString& peer )
 {
 	purgeStaleNonces();
+	for( auto it = m_nonceIssuedByPeer.begin(); it != m_nonceIssuedByPeer.end(); )
+	{
+		if( it.value().elapsed() >= NonceIssueIntervalMs ) { it = m_nonceIssuedByPeer.erase( it ); }
+		else { ++it; }
+	}
+	// Fail temporarily instead of evicting a younger client's unused nonce.
+	// The public /state route is also throttled so one unauthenticated peer
+	// cannot consume the entire nonce pool with sequential requests.
+	if( m_issuedNonces.size() >= MaxIssuedNonces ||
+		m_nonceIssuedByPeer.contains( peer ) ||
+		m_nonceIssuedByPeer.size() >= MaxAuthFailurePeers ) { return {}; }
 	const auto nonce = ClassroomSecrets::generateNonce();
 	m_issuedNonces.insert( nonce, QDateTime::currentDateTime() );
+	m_nonceIssuedByPeer.insert( peer, QElapsedTimer() );
+	m_nonceIssuedByPeer[peer].start();
 	return nonce;
 }
 
@@ -198,25 +238,45 @@ void ClassroomBridge::purgeStaleNonces()
 		if( it.value().addSecs( NonceLifetimeSeconds ) < now ) { it = m_issuedNonces.erase( it ); }
 		else { ++it; }
 	}
-	// Bound memory even if a peer floods /state without ever authenticating.
-	while( m_issuedNonces.size() > 4096 )
+}
+
+
+void ClassroomBridge::purgeAuthFailures()
+{
+	const auto now = QDateTime::currentDateTime();
+	for( auto it = m_authFailures.begin(); it != m_authFailures.end(); )
 	{
-		auto oldest = m_issuedNonces.constBegin();
-		for( auto it = m_issuedNonces.constBegin(); it != m_issuedNonces.constEnd(); ++it )
+		const auto& failure = it.value();
+		const bool activeLock = failure.lockUntil.isValid() && now < failure.lockUntil;
+		const bool stalePartial = failure.count > 0 &&
+			failure.lastFailure.addSecs( AuthLockSeconds ) < now;
+		const bool expiredLock = failure.count == 0 && failure.lockUntil.isValid() &&
+			failure.lockUntil <= now;
+		if( activeLock == false && ( stalePartial || expiredLock ) )
 		{
-			if( it.value() < oldest.value() ) { oldest = it; }
+			it = m_authFailures.erase( it );
 		}
-		m_issuedNonces.remove( oldest.key() );
+		else { ++it; }
 	}
 }
 
 
 void ClassroomBridge::noteAuthFailure( const QString& peer )
 {
+	const auto now = QDateTime::currentDateTime();
+	purgeAuthFailures();
+	if( m_authFailures.contains( peer ) == false && m_authFailures.size() >= MaxAuthFailurePeers )
+	{
+		// Do not let spoofed source addresses grow the table indefinitely, and
+		// do not evict an active attacker's lock to admit another address.
+		qWarning( "ikeback: bridge authentication failure table is full" );
+		return;
+	}
 	auto& failure = m_authFailures[peer];
+	failure.lastFailure = now;
 	if( ++failure.count < AuthFailureLimit ) { return; }
 	failure.count = 0;
-	failure.lockUntil = QDateTime::currentDateTime().addSecs( AuthLockSeconds );
+	failure.lockUntil = now.addSecs( AuthLockSeconds );
 	qWarning( "ikeback: bridge authentication locked for %s after %d failures",
 			  qPrintable( peer ), AuthFailureLimit );
 }
@@ -228,6 +288,7 @@ bool ClassroomBridge::authorized( const QHostAddress& peer, const QStringList& h
 	// Fail closed: the teacher must have started a lesson and generated a key.
 	const auto peerKey = peer.toString();
 	const auto now = QDateTime::currentDateTime();
+	purgeAuthFailures();
 	if( m_sessionKey.isEmpty() ) { return false; }
 	const auto failure = m_authFailures.value( peerKey );
 	if( failure.lockUntil.isValid() && now < failure.lockUntil ) { return false; }
@@ -282,7 +343,7 @@ qint64 ClassroomBridge::revision() const
 }
 
 
-QJsonObject ClassroomBridge::stateObject()
+QJsonObject ClassroomBridge::stateObject( const QString& peer )
 {
 	return { { QStringLiteral("teacherId"), m_teacherId },
 			 { QStringLiteral("revision"), revision() },
@@ -291,7 +352,7 @@ QJsonObject ClassroomBridge::stateObject()
 			 { QStringLiteral("className"), m_className },
 			 { QStringLiteral("syncEnabled"), m_settings.value( Classroom::SettingKey::syncEnabled() ).toBool( true ) },
 			 // A fresh one-time challenge for exactly one authenticated request.
-			 { QStringLiteral("nonce"), issueNonce() },
+			 { QStringLiteral("nonce"), issueNonce( peer ) },
 			 { QStringLiteral("keyConfigured"), m_sessionKey.isEmpty() == false },
 			 { QStringLiteral("classNames"), QJsonArray::fromStringList( m_roster.classNames() ) } };
 }
@@ -327,9 +388,17 @@ void ClassroomBridge::readDiscovery()
 	while( m_udp->hasPendingDatagrams() )
 	{
 		QByteArray datagram;
-		datagram.resize( static_cast<int>( m_udp->pendingDatagramSize() ) );
+		const auto payloadSize = m_udp->pendingDatagramSize();
+		datagram.resize( static_cast<int>( qMin<qint64>( payloadSize, 2048 ) ) );
 		QHostAddress sender;
 		quint16 senderPort = 0;
+		if( payloadSize > datagram.size() )
+		{
+			// Drain oversized probes into a fixed UDP-sized buffer.
+			QByteArray discard( 65507, Qt::Uninitialized );
+			m_udp->readDatagram( discard.data(), discard.size(), &sender, &senderPort );
+			continue;
+		}
 		m_udp->readDatagram( datagram.data(), datagram.size(), &sender, &senderPort );
 		if( datagram.startsWith( Classroom::discoveryMagic().toUtf8() ) )
 		{
@@ -341,15 +410,71 @@ void ClassroomBridge::readDiscovery()
 }
 
 
+void ClassroomBridge::releaseConnection( QTcpSocket* socket )
+{
+	m_buffers.remove( socket );
+	m_readStarted.remove( socket );
+	m_responseStarted.remove( socket );
+	m_responseContexts.remove( socket );
+	m_asyncSockets.remove( socket );
+	const auto peer = socket->peerAddress().toString();
+	auto count = m_connectionsPerPeer.value( peer, 0 );
+	if( count <= 1 ) { m_connectionsPerPeer.remove( peer ); }
+	else { m_connectionsPerPeer.insert( peer, count - 1 ); }
+}
+
+
+void ClassroomBridge::expireRequests()
+{
+	purgeAuthFailures();
+	const auto readSockets = m_readStarted.keys();
+	for( auto* socket : readSockets )
+	{
+		if( socket == nullptr || m_readStarted.value( socket ).elapsed() < RequestReadTimeoutMs ) { continue; }
+		qWarning( "ikeback: bridge request read timeout for %s", qPrintable( socket->peerAddress().toString() ) );
+		m_buffers.remove( socket );
+		m_readStarted.remove( socket );
+		respondError( socket, 408, QByteArrayLiteral("Request Timeout"), QStringLiteral("request read timeout") );
+	}
+	const auto responseSockets = m_responseStarted.keys();
+	for( auto* socket : responseSockets )
+	{
+		if( socket == nullptr || m_responseStarted.value( socket ).elapsed() < RequestReadTimeoutMs ) { continue; }
+		qWarning( "ikeback: bridge response write timeout for %s", qPrintable( socket->peerAddress().toString() ) );
+		socket->abort();
+	}
+}
+
+
 void ClassroomBridge::acceptConnection()
 {
 	while( m_server->hasPendingConnections() )
 	{
 		auto* socket = m_server->nextPendingConnection();
+		const auto peer = socket->peerAddress().toString();
+		const auto perPeer = m_connectionsPerPeer.value( peer, 0 );
+		int activeConnections = 0;
+		for( const auto count : m_connectionsPerPeer ) { activeConnections += count; }
+		if( activeConnections >= MaxConnections || perPeer >= MaxConnectionsPerIp )
+		{
+			// Reject only the new socket; never evict an established request.
+			connect( socket, &QTcpSocket::disconnected, this, [this, socket]() {
+				// Rejected sockets were never admitted to the per-IP accounting.
+				m_responseStarted.remove( socket );
+				socket->deleteLater();
+			} );
+			writeResponse( socket, 503, QByteArrayLiteral("Service Unavailable"),
+						   jsonResponse( QJsonObject{ { QStringLiteral("error"), QStringLiteral("too many connections") } } ),
+						   QByteArrayLiteral("application/json; charset=utf-8") );
+			continue;
+		}
 		m_buffers.insert( socket, QByteArray() );
+		m_readStarted.insert( socket, QElapsedTimer() );
+		m_readStarted[socket].start();
+		m_connectionsPerPeer.insert( peer, perPeer + 1 );
 		connect( socket, &QTcpSocket::readyRead, this, &ClassroomBridge::readRequest );
 		connect( socket, &QTcpSocket::disconnected, this, [this, socket]() {
-			m_buffers.remove( socket );
+			releaseConnection( socket );
 			socket->deleteLater();
 		} );
 	}
@@ -420,7 +545,25 @@ void ClassroomBridge::writeResponse( QTcpSocket* socket, int statusCode, const Q
 	}
 	header += QByteArrayLiteral("Content-Length: ") + QByteArray::number( body.size() ) + QByteArrayLiteral("\r\n");
 	header += QByteArrayLiteral("Cache-Control: no-store\r\n");
+	if( statusCode == 503 )
+	{
+		header += QByteArrayLiteral("Retry-After: 1\r\n");
+	}
+	const auto context = m_responseContexts.value( socket );
+	if( context.key.isEmpty() == false && context.nonce.isEmpty() == false )
+	{
+		const auto timestamp = QString::number( QDateTime::currentSecsSinceEpoch() );
+		header += QByteArrayLiteral("X-Classroom-Response-Nonce: ") + context.nonce.toUtf8() + QByteArrayLiteral("\r\n");
+		header += QByteArrayLiteral("X-Classroom-Response-Timestamp: ") + timestamp.toUtf8() + QByteArrayLiteral("\r\n");
+		header += QByteArrayLiteral("X-Classroom-Response-Signature: ") +
+				  ClassroomSecrets::responseToken( context.key, context.nonce, timestamp, body ) + QByteArrayLiteral("\r\n");
+	}
 	header += QByteArrayLiteral("Connection: close\r\n\r\n");
+	if( m_responseStarted.contains( socket ) == false )
+	{
+		m_responseStarted.insert( socket, QElapsedTimer() );
+		m_responseStarted[socket].start();
+	}
 	socket->write( header );
 	socket->write( body );
 	socket->disconnectFromHost();
@@ -471,12 +614,33 @@ void ClassroomBridge::readRequest()
 	}
 	if( request.complete == false ) { return; }
 	m_buffers.remove( socket );
+	m_readStarted.remove( socket );
 
 	if( request.method == QStringLiteral("OPTIONS") )
 	{
 		writeResponse( socket, 204, QByteArrayLiteral("No Content"), {}, {} );
 		return;
 	}
+
+	ResponseContext context;
+	for( const auto& line : request.headerLines )
+	{
+		const auto colon = line.indexOf( QLatin1Char(':') );
+		if( colon > 0 && line.left( colon ).trimmed().compare( QLatin1String("X-Classroom-Nonce"), Qt::CaseInsensitive ) == 0 )
+		{
+			context.nonce = line.mid( colon + 1 ).trimmed();
+		}
+	}
+	context.key = m_sessionKey;
+	if( context.nonce.size() == 32 )
+	{
+		const auto hex = context.nonce.toLatin1();
+		const bool validNonce = std::all_of( hex.constBegin(), hex.constEnd(), []( char value ) {
+			return ( value >= '0' && value <= '9' ) || ( value >= 'a' && value <= 'f' );
+		} );
+		if( validNonce == false ) { context.nonce.clear(); }
+	}
+	m_responseContexts.insert( socket, context );
 
 	// Discovery/heartbeat is public metadata only; every data and control route
 	// requires a request-bound HMAC over the lesson key.
@@ -558,16 +722,29 @@ void ClassroomBridge::handleCommand( const QJsonObject& command, bool* handled )
 void ClassroomBridge::serveAsync( QTcpSocket* socket, const std::function<QByteArray()>& work,
 								  const QByteArray& contentType )
 {
+	if( m_asyncJobs >= MaxAsyncRequests )
+	{
+		respondError( socket, 503, QByteArrayLiteral("Service Unavailable"),
+					  QStringLiteral("too many background requests") );
+		return;
+	}
+	m_asyncSockets.insert( socket );
+	++m_asyncJobs;
 	// The socket is a QPointer: if the phone disconnects while the file scan
 	// runs, the (GUI-thread) result slot simply drops the answer. The work
 	// itself captures values only, so it cannot outlive this object's members.
 	QPointer<QTcpSocket> guarded( socket );
 	auto* watcher = new QFutureWatcher<QByteArray>( this );
 	connect( watcher, &QFutureWatcher<QByteArray>::finished, this,
-			 [this, watcher, guarded, contentType]() {
+			 [this, watcher, guarded, socket, contentType]() {
 				 const auto result = watcher->result();
 				 watcher->deleteLater();
-				 if( guarded.isNull() == false ) { respond( guarded.data(), result, contentType ); }
+				 --m_asyncJobs;
+				 m_asyncSockets.remove( socket );
+				 if( guarded.isNull() == false && guarded->state() == QAbstractSocket::ConnectedState )
+				 {
+					 respond( guarded.data(), result, contentType );
+				 }
 			 } );
 	watcher->setFuture( QtConcurrent::run( work ) );
 }
@@ -579,7 +756,16 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 	const auto path = pathAndQuery.section( QLatin1Char('?'), 0, 0 );
 	if( path == QStringLiteral("/api/classroom/state") )
 	{
-		respond( socket, jsonResponse( stateObject() ) );
+		const auto state = stateObject( socket->peerAddress().toString() );
+		if( state.value( QStringLiteral("nonce") ).toString().isEmpty() )
+		{
+			respondError( socket, 503, QByteArrayLiteral("Service Unavailable"),
+						  QStringLiteral("nonce temporarily unavailable") );
+			return;
+		}
+		m_responseContexts[socket].nonce = state.value( QStringLiteral("nonce") ).toString();
+		m_responseContexts[socket].key = m_sessionKey;
+		respond( socket, jsonResponse( state ) );
 		return;
 	}
 	if( path == QStringLiteral("/api/classroom/roster") )
@@ -589,15 +775,25 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 	}
 	if( path == QStringLiteral("/api/classroom/scores") )
 	{
-		m_book.load( m_className );
-		respond( socket, jsonResponse( m_book.syncSnapshot() ) );
+		ClassroomScoreBook book( m_dataDirectory );
+		if( book.load( m_className ) == false )
+		{
+			respondError( socket, 503, QByteArrayLiteral("Service Unavailable"), QStringLiteral("score book unavailable") );
+			return;
+		}
+		respond( socket, jsonResponse( book.syncSnapshot() ) );
 		return;
 	}
 	// The mobile app renders student cards in exactly the order the teacher
 	// dragged them on the seat grid. The order is persisted by ClassroomSeatGrid.
 	if( path == QStringLiteral("/api/classroom/seats") )
 	{
-		m_book.load( m_className );
+		ClassroomScoreBook book( m_dataDirectory );
+		if( book.load( m_className ) == false )
+		{
+			respondError( socket, 503, QByteArrayLiteral("Service Unavailable"), QStringLiteral("score book unavailable") );
+			return;
+		}
 		const auto* classItem = m_roster.findClass( m_className );
 		QVector<ClassroomStudent> ordered;
 		if( classItem != nullptr )
@@ -626,7 +822,7 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 				{ QStringLiteral("seat"), student.seat },
 				{ QStringLiteral("student"), student.name },
 				{ QStringLiteral("ip"), student.ip },
-				{ QStringLiteral("score"), m_book.total( student.seat ) } } );
+				{ QStringLiteral("score"), book.total( student.seat ) } } );
 		}
 		respond( socket, jsonResponse( QJsonObject{
 			{ QStringLiteral("className"), m_className },
@@ -644,37 +840,46 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 		// One-tap scoring is an adjustment, not an arbitrary rewrite of the book.
 		if( seat.isEmpty() == false && validDelta( delta ) && m_className.isEmpty() == false )
 		{
-			m_book.load( m_className );
-			const auto lessonId = m_book.ensureLesson( QDate::currentDate(), tr( "Mobile scoring" ) );
-			QString studentName;
-			if( const auto* classItem = m_roster.findClass( m_className ) )
+			ClassroomScoreBook book( m_dataDirectory );
+			QLockFile lock( book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+			if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) &&
+				lock.tryLock( 1000 ) && book.load( m_className ) )
 			{
-				for( const auto& student : classItem->students )
+				const auto lessonId = book.ensureLesson( QDate::currentDate(), tr( "Mobile scoring" ) );
+				QString studentName;
+				if( const auto* classItem = m_roster.findClass( m_className ) )
 				{
-					if( student.seat == seat ) { studentName = student.name; break; }
+					for( const auto& student : classItem->students )
+					{
+						if( student.seat == seat ) { studentName = student.name; break; }
+					}
 				}
+				ClassroomScoreEntry entry;
+				entry.lessonId = lessonId;
+				entry.className = m_className;
+				entry.seat = seat;
+				entry.student = studentName;
+				entry.delta = delta;
+				entry.label = reason.isEmpty() ? QString::number( delta ) : reason;
+				entry.author = QStringLiteral("Mobile");
+				ok = lessonId.isEmpty() == false && book.addEntry( entry );
 			}
-			ClassroomScoreEntry entry;
-			entry.lessonId = lessonId;
-			entry.className = m_className;
-			entry.seat = seat;
-			entry.student = studentName;
-			entry.delta = delta;
-			entry.label = reason.isEmpty() ? QString::number( delta ) : reason;
-			entry.author = QStringLiteral("Mobile");
-			m_book.addEntry( entry );
-			ok = true;
 		}
 		respond( socket, jsonResponse( QJsonObject{ { QStringLiteral("ok"), ok } } ) );
 		return;
 	}
 	if( path == QStringLiteral("/api/classroom/report") )
 	{
-		m_book.load( m_className );
+		ClassroomScoreBook book( m_dataDirectory );
+		if( book.load( m_className ) == false )
+		{
+			respondError( socket, 503, QByteArrayLiteral("Service Unavailable"), QStringLiteral("score book unavailable") );
+			return;
+		}
 		ClassroomTermReport::Options options;
 		options.className = m_className;
 		options.attendanceColumn = true;
-		respond( socket, ClassroomTermReport::toSpreadsheetMl( m_roster, m_book, options ),
+		respond( socket, ClassroomTermReport::toSpreadsheetMl( m_roster, book, options ),
 				 QByteArrayLiteral("application/vnd.ms-excel; charset=utf-8") );
 		return;
 	}
@@ -742,11 +947,11 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 		if( document.isEmpty() == false )
 		{
 			QDir().mkpath( m_dataDirectory );
-			QFile file( timetableFilePath() );
-			if( file.open( QFile::WriteOnly | QFile::Truncate ) )
+			QSaveFile file( timetableFilePath() );
+			if( file.open( QFile::WriteOnly ) )
 			{
-				ok = file.write( QJsonDocument( document ).toJson( QJsonDocument::Compact ) ) >= 0;
-				file.close();
+				const auto bytes = QJsonDocument( document ).toJson( QJsonDocument::Compact );
+				ok = file.write( bytes ) == bytes.size() && file.commit();
 			}
 		}
 		respond( socket, jsonResponse( QJsonObject{
@@ -758,11 +963,16 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 	// can show a natural per-class record instead of a one-off "query lesson".
 	if( path == QStringLiteral("/api/classroom/classes") )
 	{
+		ClassroomScoreBook book( m_dataDirectory );
+		if( book.load( m_className ) == false )
+		{
+			respondError( socket, 503, QByteArrayLiteral("Service Unavailable"), QStringLiteral("score book unavailable") );
+			return;
+		}
 		QJsonArray classes;
 		const auto* classItem = m_roster.findClass( m_className );
 		if( classItem != nullptr )
 		{
-			m_book.load( m_className );
 			QJsonArray students;
 			for( const auto& student : classItem->students )
 			{
@@ -770,7 +980,7 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 					{ QStringLiteral("seat"), student.seat },
 					{ QStringLiteral("student"), student.name },
 					{ QStringLiteral("ip"), student.ip },
-					{ QStringLiteral("score"), m_book.total( student.seat ) } } );
+					{ QStringLiteral("score"), book.total( student.seat ) } } );
 			}
 			classes.append( QJsonObject{
 				{ QStringLiteral("name"), m_className },
@@ -792,8 +1002,17 @@ void ClassroomBridge::handleRoute( QTcpSocket* socket, const QString& method,
 		const auto snapshot = document.object().value( QStringLiteral("scores") ).toObject();
 		// Append-only: the phone may contribute new entries, but can never
 		// replace the teacher's lessons, rules or existing score entries.
-		m_book.load( m_className );
-		if( snapshot.isEmpty() == false && m_book.appendSnapshot( snapshot ) )
+		bool ok = false;
+		{
+			ClassroomScoreBook book( m_dataDirectory );
+			QLockFile lock( book.filePath( m_className ) + QStringLiteral( ".lock" ) );
+			if( QDir().mkpath( QFileInfo( lock.fileName() ).absolutePath() ) &&
+				lock.tryLock( 1000 ) && book.load( m_className ) && snapshot.isEmpty() == false )
+			{
+				ok = book.appendSnapshot( snapshot );
+			}
+		}
+		if( ok )
 		{
 			Q_EMIT remoteDataApplied();
 			respond( socket, jsonResponse( QJsonObject{ { QStringLiteral("ok"), true },

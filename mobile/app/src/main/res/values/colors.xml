@@ -31,4 +31,14 @@
 
     <color name="ikeback_brand_text">#FFFFFFFF</color>
     <color name="ikeback_brand_subtext">#FFE6EEFF</color>
+    <color name="ikeback_on_primary">#FFFFFFFF</color>
+
+    <!-- Timetable canvas surfaces; night overrides live in values-night. -->
+    <color name="ikeback_grid_header">#FFF7F9FC</color>
+    <color name="ikeback_grid_break">#FFEDEFF5</color>
+    <color name="ikeback_grid_break_text">#FF7A7392</color>
+    <color name="ikeback_grid_line">#FFE8ECF2</color>
+    <color name="ikeback_grid_today_axis">#FFF2EEFF</color>
+    <color name="ikeback_grid_today">#FFF4F0FF</color>
+    <color name="ikeback_grid_today_row">#FFEDE8FF</color>
 </resources>

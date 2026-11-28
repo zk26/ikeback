@@ -110,6 +110,8 @@ object Ui {
             val p = dp(context, 12)
             setPadding(p, dp(context, 11), p, dp(context, 11))
             isSingleLine = true
+            minimumHeight = dp(context, 48)
+            minHeight = dp(context, 48)
             inputType = when {
                 password -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 numeric -> InputType.TYPE_CLASS_NUMBER
@@ -138,11 +140,11 @@ object Ui {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
             ).apply { topMargin = dp(context, 8) }
-            minimumHeight = dp(context, 44)
-            minHeight = dp(context, 44)
+            minimumHeight = dp(context, 48)
+            minHeight = dp(context, 48)
             val normal = if (primary) c(context, R.color.ikeback_primary) else c(context, R.color.ikeback_chip_bg)
             val pressed = if (primary) c(context, R.color.ikeback_primary_dark) else c(context, R.color.ikeback_chip_pressed)
-            val fg = if (primary) c(context, R.color.white) else c(context, R.color.ikeback_primary)
+            val fg = if (primary) c(context, R.color.ikeback_on_primary) else c(context, R.color.ikeback_primary)
             setTextColor(fg)
             background = StateListDrawable().apply {
                 addState(intArrayOf(android.R.attr.state_pressed), shape(context, pressed, 14))

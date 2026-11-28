@@ -54,7 +54,7 @@ endif()
 if(VERSION_STRING STREQUAL "")
 	# ikeback release baseline (the upstream Veyon tree this fork is based on
 	# is 4.11.4). A v* tag or GITHUB_REF_NAME overrides this in CI.
-	# 5.2.0 is the first official ikeback release.
+	# 5.3.0 is the current official ikeback release baseline.
 	set(VERSION_MAJOR 5)
 	set(VERSION_MINOR 3)
 	set(VERSION_PATCH 0)
@@ -217,12 +217,17 @@ if(WITH_BUNDLED_LIBVNC)
 	set(WITH_SASL OFF)
 	set(WITH_SDL OFF)
 	set(WITH_SYSTEMD OFF)
+	# Disable only LibVNC's tests, not the enclosing project's tests.
+	set(IKEBACK_WITH_TESTS ${WITH_TESTS})
 	set(WITH_TESTS OFF)
 	set(WITH_TIGHTVNC_FILETRANSFER OFF)
 	set(WITH_XCB OFF)
 	set(LIBVNCSERVER_INSTALL OFF)
 
 	add_subdirectory(${libvncserver_SOURCE_DIR})
+
+	set(WITH_TESTS ${IKEBACK_WITH_TESTS})
+	unset(IKEBACK_WITH_TESTS)
 
 	set_default_target_properties(vncclient)
 	set_default_target_properties(vncserver)

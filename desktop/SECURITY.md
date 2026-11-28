@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-Usually, only the latest stable release series is provided with security updates. In addition, customers with maintenance contracts are provided with updates for the respective releases in use.
+Only the latest stable ikeback release series receives security fixes. Older releases are not supported.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 4.7.x   | ✔️                 |
-| < 4.7.x | ❌                 |
+| 5.3.x   | ✔️                 |
+| < 5.3.x | ❌                 |
 
 ## Reporting a Vulnerability
 

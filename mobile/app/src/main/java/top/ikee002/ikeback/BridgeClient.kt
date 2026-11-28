@@ -14,6 +14,11 @@ class UnauthorizedException : IOException("课堂密钥被教师机拒绝")
  * every request proves knowledge of it with an HMAC-SHA256 over the method,
  * path, nonce and body hash. /state issues a single-use challenge, so one
  * nonce can never authorize two requests (see IkebackCrypto).
+ *
+ * Responses must carry a nonce, Unix timestamp and HMAC over the exact body.
+ * No body (including an error) is parsed until verification succeeds. This
+ * detects LAN tampering but does not provide TLS confidentiality or resistance
+ * to a lesson-key holder; see the residual transport limitation in the report.
  * Uses only the JDK/Android built-ins - no Retrofit, OkHttp or crypto library.
  */
 class BridgeClient {
@@ -30,28 +35,59 @@ class BridgeClient {
     private fun url(host: String, route: String): URL =
         URL("http://$host:$port/api/classroom/$route")
 
+    private data class HttpResponse(
+        val code: Int,
+        val body: String,
+        val retryAfterMs: Long,
+    )
+
     private fun request(host: String, route: String, method: String, body: String?, auth: Boolean): String {
         // Challenges are single-use on the teacher machine, so every
         // authenticated call obtains a fresh /state nonce first.
-        val challenge = if (auth) {
-            if (lessonKey.isEmpty()) throw UnauthorizedException()
-            val issued = connect(host).nonce
-            if (issued.isEmpty()) throw UnauthorizedException()
-            nonce = issued
-            issued
-        } else {
-            ""
+        val responseKey = lessonKey
+        if (auth && responseKey.isEmpty()) throw UnauthorizedException()
+        var challenge = if (auth) connect(host).nonce else IkebackCrypto.generateNonce()
+        var attempt = 0
+        while (true) {
+            val response = exchange(host, route, method, body, challenge, responseKey)
+            // /state is intentionally rate-limited per peer. Retry only signed
+            // throttle responses, with a fresh challenge and a bounded delay.
+            if (route == "state" && response.code == HttpURLConnection.HTTP_UNAVAILABLE && attempt < 4) {
+                Thread.sleep(response.retryAfterMs)
+                challenge = IkebackCrypto.generateNonce()
+                attempt++
+                continue
+            }
+            if (response.code == HttpURLConnection.HTTP_UNAUTHORIZED) throw UnauthorizedException()
+            if (response.code !in 200..299) {
+                val error = try { JSONObject(response.body).optString("error") } catch (_: Exception) { "" }
+                throw IOException("$route: HTTP ${response.code}${if (error.isNotEmpty()) " ($error)" else ""}")
+            }
+            return response.body
         }
+    }
+
+    private fun exchange(
+        host: String,
+        route: String,
+        method: String,
+        body: String?,
+        challenge: String,
+        responseKey: String,
+    ): HttpResponse {
         val connection = url(host, route).openConnection() as HttpURLConnection
         try {
             connection.connectTimeout = 5_000
             connection.readTimeout = 15_000
             connection.requestMethod = method
             connection.setRequestProperty("Accept", "application/json, */*")
-            if (auth) {
-                connection.setRequestProperty("X-Classroom-Nonce", challenge)
+            // The public /state call uses a fresh nonce too, so its signed
+            // response cannot be replayed. Authenticated calls reuse their
+            // single-use request challenge as the response nonce.
+            connection.setRequestProperty("X-Classroom-Nonce", challenge)
+            if (responseKey.isNotEmpty() && route != "state") {
                 connection.setRequestProperty("X-Classroom-Token",
-                    IkebackCrypto.token(lessonKey, method, "/api/classroom/$route", challenge, body))
+                    IkebackCrypto.token(responseKey, method, "/api/classroom/$route", challenge, body))
             }
             if (body != null) {
                 connection.doOutput = true
@@ -59,12 +95,38 @@ class BridgeClient {
                 connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             }
             val code = connection.responseCode
-            if (code == HttpURLConnection.HTTP_UNAUTHORIZED) throw UnauthorizedException()
-            if (code !in 200..299) throw IOException("$route: HTTP $code")
-            return connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val raw = readResponse(stream)
+            // Missing signatures are a hard failure, never an unsigned fallback.
+            val verified = IkebackCrypto.verifyResponse(
+                lessonKey = responseKey,
+                body = raw,
+                nonce = connection.getHeaderField("X-Classroom-Response-Nonce"),
+                timestamp = connection.getHeaderField("X-Classroom-Response-Timestamp"),
+                signature = connection.getHeaderField("X-Classroom-Response-Signature"),
+                expectedNonce = challenge,
+            ).toString(Charsets.UTF_8)
+            val retryAfter = connection.getHeaderFieldInt("Retry-After", 1)
+                .coerceIn(1, 2).toLong() * 1_000
+            return HttpResponse(code, verified, retryAfter)
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun readResponse(stream: java.io.InputStream?): ByteArray {
+        if (stream == null) return ByteArray(0)
+        val output = java.io.ByteArrayOutputStream()
+        stream.use { input ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (output.size() + count > MAX_RESPONSE_BYTES) throw IOException("教师机响应超过 8 MiB")
+                output.write(buffer, 0, count)
+            }
+        }
+        return output.toByteArray()
     }
 
     /** Public metadata endpoint. Always returns the current challenge. */
@@ -142,4 +204,7 @@ class BridgeClient {
         return request(host, "classes", "GET", null, auth = true)
     }
 
+    private companion object {
+        const val MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+    }
 }

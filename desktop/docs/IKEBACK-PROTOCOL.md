@@ -335,6 +335,32 @@ token = bd41d1e94c8c04a9ae857dce47c9f1d6907b65cfcd5c1bcbd8d08711a7c14e50
 - Bridge 只绑定一个已校验的局域网单播 IPv4 地址（不监听 `0.0.0.0`）；请求头上限 16 KiB、正文上限 1 MiB，超限返回 413；未知路由返回 404。
 - `/sync` 只按条目 id **追加**，不会整本覆盖积分册；`/score` 的 `delta` 只允许 `-5..5`；`teacherIp` 只接受单播 IPv4。
 
+### 7.1 响应认证
+
+每个响应（包括错误响应）在配置课堂密钥后携带：
+
+```
+X-Classroom-Response-Nonce: <请求 nonce，/state 则为本响应新签发的 nonce>
+X-Classroom-Response-Timestamp: <Unix 秒>
+X-Classroom-Response-Signature: <signature>
+```
+
+```
+responseHash = lowercase_hex( SHA-256( 原始响应正文字节 ) )
+message      = nonce + "\n" + timestamp + "\n" + responseHash
+signature    = lowercase_hex( HMAC-SHA256( key = UTF8(sessionKey), msg = UTF8(message) ) )
+```
+
+Android 在 UTF-8 解码和 JSON 解析前校验原始字节，并要求 nonce 与当前请求一致、时间戳偏差不超过 300 秒。基准向量：
+
+```
+sessionKey = "ABC123", nonce = "nonce-0002", timestamp = "1700000000"
+body = {"ok":true}
+signature = b35ec4ba272a86a16ecc54d358f4ff721e7e1e816aabfa55c0f6f631d45483cb
+```
+
+Bridge 仍是**明文 HTTP**；HMAC 提供认证与完整性，不提供传输机密性。端口只能暴露在受控教学网段。
+
 ---
 
 ## 8. UDP 发现协议

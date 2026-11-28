@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ikeback_primary">#FF6E9FFF</color>
+    <color name="ikeback_primary_dark">#FF4777D4</color>
+    <color name="ikeback_on_primary">#FF07111F</color>
+
+    <color name="ikeback_background">#FF0F172A</color>
+    <color name="ikeback_card">#FF182338</color>
+    <color name="ikeback_border">#FF2A3A52</color>
+    <color name="ikeback_secondary">#FF9FB0C7</color>
+    <color name="ikeback_title">#FFEDF3FC</color>
+    <color name="ikeback_body">#FFC2CEDD</color>
+    <color name="ikeback_hint">#FF91A2B9</color>
+    <color name="ikeback_divider">#FF24344A</color>
+
+    <color name="ikeback_badge_ok_bg">#FF173D30</color>
+    <color name="ikeback_badge_ok_fg">#FF7CE0AD</color>
+    <color name="ikeback_badge_off_bg">#FF4A2229</color>
+    <color name="ikeback_badge_off_fg">#FFFF9CA3</color>
+
+    <color name="ikeback_chip_bg">#FF223653</color>
+    <color name="ikeback_chip_pressed">#FF2D4770</color>
+    <color name="ikeback_chip_border">#FF36577F</color>
+    <color name="ikeback_input_bg">#FF111E31</color>
+    <color name="ikeback_brand_subtext">#FF13203A</color>
+
+    <color name="ikeback_grid_header">#FF182338</color>
+    <color name="ikeback_grid_break">#FF202C40</color>
+    <color name="ikeback_grid_break_text">#FFC1B7E8</color>
+    <color name="ikeback_grid_line">#FF2A3A52</color>
+    <color name="ikeback_grid_today_axis">#FF292547</color>
+    <color name="ikeback_grid_today">#FF201E38</color>
+    <color name="ikeback_grid_today_row">#FF312952</color>
+</resources>

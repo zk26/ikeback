@@ -120,8 +120,7 @@ kldap master 的 Qt6-only 符号。
 参数解释：
 
 - `WITH_QT6=ON`：**必须**。`plugins/filetransfer` 等上游插件是 Qt6-only；Windows 平台插件还无条件 `find_package(Qt6 GuiPrivate)`。
-- `WITH_BUNDLED_LIBVNC=ON`：免掉系统 `libvncserver >= 0.9.14`（发行版自带版本偏低）。
-  注意它会连带把 `WITH_TESTS` 置 OFF（`CMakeLists.txt:199`），所以 `ClassroomSelfTest` 在这个配置下不会构建。
+- `WITH_BUNDLED_LIBVNC=ON`：免掉系统 `libvncserver >= 0.9.14`（发行版自带版本偏低）。LibVNC 自带测试会在子目录内关闭，但项目自己的 `WITH_TESTS` 设置会保留，因此仍可构建 `ClassroomSelfTest`。
 - `WITH_WEBAPI=OFF` / `WITH_TRANSLATIONS=OFF`：免 `Qt6::HttpServer` 与 LinguistTools 的额外要求；ikeback Bridge 只用 `QTcpServer/QUdpSocket`，不依赖 WebAPI。
 - `WITH_UNITY_BUILD=OFF`：让每个 `.cpp` 单独编译，最容易暴露真实错误。
 - `WITH_CORE_ONLY=OFF`：**必须**，否则整个 `plugins/`（含ikeback）都不会构建。
@@ -266,7 +265,7 @@ makensis -DVERSION=5.2.0 -DROLE=student installer.nsi
 | `Cannot find source file .../3rdparty/kldap...` | 子模块为空 | 显式 clone（根仓库没有 `.gitmodules`） |
 | `Qt6::GuiPrivate` / `Qt6::HttpServer` 找不到 | Qt6 模块不全 | 装 `qt6-base-private-dev` / `qt6-httpserver-dev`；或 `-DWITH_WEBAPI=OFF`。**不要退回 Qt5** |
 | MSVC 报 `D9002 ignoring unknown option -Wno-attributes` | 用了 Visual Studio 生成器 | 必须 `-G Ninja` + MinGW GCC |
-| `WITH_BUNDLED_LIBVNC=ON` 后 `ClassroomSelfTest` 不构建 | `CMakeLists.txt:199` 会强制 `WITH_TESTS=OFF` | 想跑自检需 `-DWITH_BUNDLED_LIBVNC=OFF` 且系统 LibVNC ≥ 0.9.14 |
+| `ClassroomSelfTest` 目标不存在 | 沿用了旧的 CMake 配置 | 使用 `-DWITH_TESTS=ON` 重新运行 CMake 配置 |
 | `INTERFACE_INCLUDE_DIRECTORIES ... is prefixed in the source directory` | bundled LibVNC 的 include 路径与 Ikeback `install(TARGETS)` 冲突 | 加 `-DCMAKE_SKIP_INSTALL_RULES=ON`（只编译不安装） |
 | `ninja: error: loading 'build.ninja': No such file or directory` | 上一条 CMake 错误导致未生成构建文件 | 看 `configure.log`；同时确认 `tee` 步骤有 `set -o pipefail` |
 | `sdkmanager failed with exit code 1`（Android CI） | `android-actions/setup-android@v3` 覆盖 runner 预装的 cmdline-tools 版本 | 去掉该 action，用 runner 自带 SDK + `sdkmanager --licenses`，让 AGP 自动装 platform |

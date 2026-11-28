@@ -88,7 +88,7 @@ ShowUninstDetails show
   !define MUI_WELCOMEPAGE_TEXT "使用引导：$\r$\n1. 安装教师端，并允许 Windows 服务正常运行。$\r$\n2. 打开 ikee课堂，点击“开始上课”，全班签到会自动开始。$\r$\n3. 在座位页可直接修改考勤、积分和等级；课程、考勤与原因可导出 Excel。$\r$\n4. 商城与竞拍会保留每名学生 80 分，仅使用超出部分。$\r$\n5. 远程装软件请选择绿色软件文件夹，程序会部署到 C:\IkebackApps 并重启两次。"
 !else
   !define MUI_WELCOMEPAGE_TITLE "欢迎使用 ikee课堂学生端"
-  !define MUI_WELCOMEPAGE_TEXT "使用引导：$\r$\n1. 安装后保持学生端运行，等待教师端连接。$\r$\n2. 上课后在悬浮卡输入姓名并签到，即可查看成绩、商城和竞拍。$\r$\n3. 商城仅使用超过 80 分的积分，基础分会保留。$\r$\n4. 默认退出与卸载密码为 Admin@123，教师可在保护设置中修改。$\r$\n5. 保护开启时，断开教师连接也不会自动解锁；需教师解除保护或输入管理员密码。"
+  !define MUI_WELCOMEPAGE_TEXT "使用引导：$\r$\n1. 安装后保持学生端运行，等待教师端连接。$\r$\n2. 上课后在悬浮卡输入姓名并签到，即可查看成绩、商城和竞拍。$\r$\n3. 商城仅使用超过 80 分的积分，基础分会保留。$\r$\n4. 没有默认管理员密码；教师必须先配置并下发管理员密码，受保护退出才能验证。$\r$\n5. 保护开启时，断开教师连接也不会自动解锁；需教师解除保护或输入已配置的管理员密码。"
 !endif
 
 !if "${ROLE}" == "student"
@@ -97,7 +97,32 @@ Var Dialog
 !endif
 
 !if "${ROLE}" == "student"
+Function un.SynchronizeUninstallProtection
+  SetRegView 64
+  nsExec::ExecToStack '"$EXEDIR\ikeback-cli.exe" --admin-key-hash-configured'
+  Pop $0
+  Pop $1
+  ${If} $0 == "error"
+    MessageBox MB_OK|MB_ICONSTOP "无法验证学生端管理员密钥，已取消卸载以避免绕过保护。请修复安装后重试。"
+    Abort
+  ${ElseIf} $0 == 0
+    ReadRegDWORD $2 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
+    ${If} $2 == 1
+      WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 1
+    ${Else}
+      WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 0
+    ${EndIf}
+  ${ElseIf} $0 == 1
+    DeleteRegValue ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash"
+    WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 0
+  ${Else}
+    MessageBox MB_OK|MB_ICONSTOP "无法验证学生端管理员密钥，已取消卸载以避免绕过保护。请修复安装后重试。"
+    Abort
+  ${EndIf}
+FunctionEnd
+
 Function un.ExitPasswordPagePre
+  Call un.SynchronizeUninstallProtection
   SetRegView 64
   ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
   ${If} $0 != 1
@@ -236,6 +261,46 @@ Function RemoveLockedBinaries
     MessageBox MB_OK|MB_ICONSTOP "仍有 ikeback 进程占用安装目录，无法继续。$\r$\n$\r$\n请退出已登录的学生端（或重启电脑后重新安装），然后再次运行本安装程序。"
     Abort
   ck_done:
+FunctionEnd
+
+; Replace inherited standard-user write access before any package is deployed.
+; Every ACL operation is checked: treating a partial failure as success would
+; silently leave the cross-user executable-replacement vulnerability in place.
+Function SecurePortableAppsDirectory
+  CreateDirectory "C:\IkebackApps"
+  nsExec::ExecToStack '"$SYSDIR\takeown.exe" /A /F "C:\IkebackApps" /R /D Y'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "无法取得 C:\IkebackApps 的所有权，安装已取消。"
+    Abort
+  ${EndIf}
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "C:\IkebackApps" /reset /T /C'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "无法重置 C:\IkebackApps 的安全 ACL，安装已取消。"
+    Abort
+  ${EndIf}
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "C:\IkebackApps" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" /T'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "无法限制 C:\IkebackApps 的读取/执行权限，安装已取消。"
+    Abort
+  ${EndIf}
+  ; Add-subdirectory is intentionally not inherited. Deployments create their own
+  ; staging directory in the interactive session and secure it to that account.
+  ; No standard user receives Delete or Delete-child on executable directories.
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "C:\IkebackApps" /grant:r "*S-1-5-32-545:AD"'
+  Pop $0
+  Pop $1
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "无法配置受限部署权限，安装已取消。"
+    Abort
+  ${EndIf}
+  ; Reboot verification metadata lives in the deploying user's private AppData
+  ; directory, so other standard users cannot forge verification results.
 FunctionEnd
 
 ; ---------------------------------------------------------------- Service (RO)
@@ -482,24 +547,34 @@ Section -Post
   ${INSTALL_TYPE}
   SetOutPath "$INSTDIR"
 !if "${ROLE}" == "student"
+  ; Never seed a shared default password. Retire the digest used by vulnerable
+  ; releases so an upgrade cannot silently keep accepting that credential.
   ReadRegStr $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash"
-  ${If} $0 == ""
-    WriteRegStr ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash" "e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7"
+  ${If} $0 == "e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7"
+    DeleteRegValue ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash"
+    StrCpy $0 ""
   ${EndIf}
-  ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
-  ${If} $0 != 1
-    WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 1
+  nsExec::ExecToStack '"$INSTDIR\ikeback-cli.exe" --admin-key-hash-configured'
+  Pop $2
+  Pop $3
+  ${If} $2 != 0
+    ; Without a verifiable configured key, cooperative uninstall must not
+    ; permanently lock the machine out. The teacher may enable it again later.
+    DeleteRegValue ${REG_ROOT} "SOFTWARE\ikeback\Student" "AdminKeyHash"
+    WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 0
+  ${Else}
+    ReadRegDWORD $1 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
+    ${If} $1 == 1
+      WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 1
+    ${Else}
+      WriteRegDWORD ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection" 0
+    ${EndIf}
   ${EndIf}
-  ; Portable software is copied here by the interactive student worker.
-  ; The elevated installer grants the built-in Users group modify access so
-  ; deployment also works when students do not have administrator rights.
-  CreateDirectory "C:\IkebackApps"
-  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "C:\IkebackApps" /grant "*S-1-5-32-545:(OI)(CI)M"'
-  Pop $0
-  Pop $1
-  ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONEXCLAMATION "无法设置 C:\IkebackApps 的写入权限，远程部署可能失败。请手动允许 Users 修改该目录。"
-  ${EndIf}
+  ; ClassroomPlugin creates per-deployment staging directories in the
+  ; interactive session and protects them to that account before activation.
+  ; State metadata is writable separately; deployed executables are not.
+  ; Administrators/SYSTEM retain full control for installer/service operations.
+  Call SecurePortableAppsDirectory
 !endif
   WriteUninstaller "$INSTDIR\uninstall.exe"
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
@@ -518,6 +593,7 @@ SectionEnd
 ; ------------------------------------------------------------------- Uninstall
 Function un.onInit
 !if "${ROLE}" == "student"
+  Call un.SynchronizeUninstallProtection
   SetRegView 64
   ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
   ${If} $0 == 1
@@ -532,6 +608,7 @@ Section Uninstall
   ; The password page verifies interactive uninstalls. Silent uninstalls have
   ; no place to ask for the password, so they must fail closed while protected.
 !if "${ROLE}" == "student"
+  Call un.SynchronizeUninstallProtection
   SetRegView 64
   ReadRegDWORD $0 ${REG_ROOT} "SOFTWARE\ikeback\Student" "UninstallProtection"
   ${If} $0 == 1
@@ -628,4 +705,9 @@ Section Uninstall
   RmDir "$SMPROGRAMS\ikeback"
   Delete "$DESKTOP\ikeback Master.lnk"
   DeleteRegKey ${REG_ROOT} "${UNINST_KEY}"
+  DeleteRegKey ${REG_ROOT} "SOFTWARE\ikeback\Student"
+  DeleteRegKey ${REG_ROOT} "SOFTWARE\ikeback\Classroom"
+  ; This root is product-managed. Remove deployed packages, backups, staging
+  ; files and verification metadata rather than leaving executable residue.
+  RmDir /r "C:\IkebackApps"
 SectionEnd

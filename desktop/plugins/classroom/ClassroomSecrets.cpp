@@ -6,6 +6,8 @@
 
 #include "ClassroomSecrets.h"
 
+#include <algorithm>
+
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QMessageAuthenticationCode>
@@ -159,8 +161,19 @@ QByteArray ClassroomSecrets::requestToken( const QString& key, const QString& me
 }
 
 
-bool ClassroomSecrets::constantTimeEquals( const QByteArray& left, const QByteArray& right )
+QByteArray ClassroomSecrets::responseToken( const QString& key, const QString& nonce,
+											const QString& timestamp, const QByteArray& body )
 {
+	QByteArray message = nonce.toUtf8();
+	message += '\n';
+	message += timestamp.toUtf8();
+	message += '\n';
+	message += QCryptographicHash::hash( body, QCryptographicHash::Sha256 ).toHex();
+	return QMessageAuthenticationCode::hash( message, key.toUtf8(), QCryptographicHash::Sha256 ).toHex();
+}
+
+
+bool ClassroomSecrets::constantTimeEquals( const QByteArray& left, const QByteArray& right ){
 	if( left.size() != right.size() ) { return false; }
 	unsigned char difference = 0;
 	for( int index = 0; index < left.size(); ++index )
@@ -172,28 +185,51 @@ bool ClassroomSecrets::constantTimeEquals( const QByteArray& left, const QByteAr
 }
 
 
+namespace
+{
+// Digest of the credential shipped by vulnerable releases. Keep only the digest
+// so upgrades can reject it without retaining a usable default password.
+const QByteArray retiredDefaultAdminKeyHash =
+	QByteArrayLiteral("e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7");
+}
+
+
 QString ClassroomSecrets::adminKeyHash( const QString& key )
 {
 	if( key.isEmpty() ) { return {}; }
-	return QString::fromLatin1(
-		QCryptographicHash::hash( key.toUtf8(), QCryptographicHash::Sha256 ).toHex() );
+	const auto hash = QCryptographicHash::hash( key.toUtf8(), QCryptographicHash::Sha256 ).toHex();
+	if( constantTimeEquals( hash, retiredDefaultAdminKeyHash ) ) { return {}; }
+	return QString::fromLatin1( hash );
 }
 
 
 QString ClassroomSecrets::defaultAdminKey()
 {
-	return QStringLiteral("Admin@123");
+	// Source compatibility for older callers. There is deliberately no default:
+	// a protected installation must be given a teacher-configured credential.
+	return {};
 }
 
 
 QString ClassroomSecrets::defaultAdminKeyHash()
 {
-	return QStringLiteral("e86f78a8a3caf0b60d8e74e5942aa6d86dc150cd3c03338aef25b7d2d7e3acc7");
+	return {};
+}
+
+
+bool ClassroomSecrets::adminKeyHashConfigured( const QString& storedHash )
+{
+	const auto normalized = storedHash.trimmed().toLatin1().toLower();
+	if( normalized.size() != 64 ) { return false; }
+	if( constantTimeEquals( normalized, retiredDefaultAdminKeyHash ) ) { return false; }
+	return std::all_of( normalized.constBegin(), normalized.constEnd(), []( char value ) {
+		return ( value >= '0' && value <= '9' ) || ( value >= 'a' && value <= 'f' );
+	} );
 }
 
 
 bool ClassroomSecrets::verifyAdminKey( const QString& key, const QString& storedHash )
 {
-	if( storedHash.isEmpty() || key.isEmpty() ) { return false; }
-	return constantTimeEquals( adminKeyHash( key ).toLatin1(), storedHash.trimmed().toLatin1() );
+	if( key.isEmpty() || adminKeyHashConfigured( storedHash ) == false ) { return false; }
+	return constantTimeEquals( adminKeyHash( key ).toLatin1(), storedHash.trimmed().toLatin1().toLower() );
 }
